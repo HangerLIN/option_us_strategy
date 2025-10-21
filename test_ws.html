@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Signal WebSocket Test</title>
+    <style>
+        body { font-family: monospace; padding: 20px; background: #1e1e1e; color: #d4d4d4; }
+        #messages { border: 1px solid #3c3c3c; padding: 10px; height: 400px; overflow-y: auto; background: #252526; }
+        .message { margin: 5px 0; padding: 5px; border-left: 3px solid #007acc; }
+        .connected { border-left-color: #4ec9b0; }
+        .signal { border-left-color: #ce9178; }
+        button { padding: 10px 20px; margin: 5px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h2>🔌 Signal Service WebSocket Test</h2>
+    <button onclick="connect()">Connect to ws://localhost:8000/ws/signals</button>
+    <button onclick="disconnect()">Disconnect</button>
+    <button onclick="clearMessages()">Clear</button>
+    <div id="status">Status: Disconnected</div>
+    <h3>Messages:</h3>
+    <div id="messages"></div>
+
+    <script>
+        let ws = null;
+        const messages = document.getElementById('messages');
+        const status = document.getElementById('status');
+
+        function connect() {
+            if (ws) {
+                addMessage('Already connected', 'connected');
+                return;
+            }
+            ws = new WebSocket('ws://localhost:8000/ws/signals');
+            
+            ws.onopen = () => {
+                status.textContent = 'Status: Connected ✅';
+                status.style.color = '#4ec9b0';
+                addMessage('WebSocket connected', 'connected');
+            };
+            
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                addMessage(JSON.stringify(data, null, 2), 'signal');
+            };
+            
+            ws.onerror = (error) => {
+                addMessage('Error: ' + error, 'error');
+            };
+            
+            ws.onclose = () => {
+                status.textContent = 'Status: Disconnected ❌';
+                status.style.color = '#f48771';
+                addMessage('WebSocket disconnected', 'connected');
+                ws = null;
+            };
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+            }
+        }
+
+        function clearMessages() {
+            messages.innerHTML = '';
+        }
+
+        function addMessage(text, type) {
+            const div = document.createElement('div');
+            div.className = 'message ' + type;
+            div.textContent = new Date().toLocaleTimeString() + ' - ' + text;
+            messages.appendChild(div);
+            messages.scrollTop = messages.scrollHeight;
+        }
+
+        // Auto connect on load
+        setTimeout(connect, 500);
+    </script>
+</body>
+</html>
+
+
+

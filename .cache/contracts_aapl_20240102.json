@@ -1,0 +1,22 @@
+[
+  {
+    "symbol": "AAPL",
+    "option_right": "CALL",
+    "expiry": "20240106",
+    "strike": 180.0,
+    "conid": null,
+    "min_tick": 0.1,
+    "open_interest": 2000,
+    "volume": 500
+  },
+  {
+    "symbol": "AAPL",
+    "option_right": "PUT",
+    "expiry": "20240106",
+    "strike": 175.0,
+    "conid": null,
+    "min_tick": 0.1,
+    "open_interest": 1800,
+    "volume": 450
+  }
+]

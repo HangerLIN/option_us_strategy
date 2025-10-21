@@ -1,0 +1,98 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# Poetry
+poetry.toml
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+test.db
+
+# Backups
+backups/
+
+# Artifacts and temporary files
+artifacts/
+*.dump
+
+# Environment variables
+.env
+.env.local
+
+# Reports
+backtest_report_*.json
+backtest_report_*.txt
+*.md~
+
+# IBKR API large files
+ibkr_api/IBJts/**/*.zip
+ibkr_api/**/*.jar
+ibkr_api/**/*.pdf
+
+# Compiled files
+*.class
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Redis dump
+dump.rdb
+
+# PID files
+*.pid
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Distribution / packaging
+*.whl
