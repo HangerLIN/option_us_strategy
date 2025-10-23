@@ -75,9 +75,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--metrics-mode",
-        default="fixed",
+        default="tfe",
         choices=["fixed", "tfe", "both"],
-        help="Equity metrics aggregation: fixed horizon, entry→first-exit (tfe), or both",
+        help="Equity metrics aggregation mode (deprecated, only tfe is supported)",
     )
     parser.add_argument(
         "--risk-mode",

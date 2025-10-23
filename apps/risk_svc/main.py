@@ -48,8 +48,9 @@ session_factory = get_session_factory(settings)
 redis_bus = RedisBus(settings.redis_url)
 risk_service = RiskService(session_factory, redis_url=settings.redis_url)
 _initial_limits = risk_service.current_limits()
-_risk_notional_cap: Decimal = _initial_limits.notional_cap
-_limits_updated_at = _initial_limits.updated_at
+_limits_snapshot: RiskLimits = _initial_limits.model_copy(deep=True)
+_risk_notional_cap: Decimal = _limits_snapshot.notional_cap
+_limits_updated_at = _limits_snapshot.updated_at
 consumer_manager: Optional[RiskStreamConsumers] = None
 consumer_tasks: list[asyncio.Task[Any]] = []
 
@@ -70,18 +71,19 @@ class RiskEventRecord(BaseModel):
 
 
 def _current_limits() -> RiskLimits:
-    return RiskLimits(notional_cap=_risk_notional_cap, updated_at=_limits_updated_at)
+    return _limits_snapshot.model_copy(deep=True)
 
 
-def _set_limits(value: Decimal, updated_at: datetime | None = None) -> RiskLimits:
-    global _risk_notional_cap, _limits_updated_at
-    _risk_notional_cap = value
-    _limits_updated_at = updated_at or utc_now()
+def _set_limits(limits: RiskLimits) -> RiskLimits:
+    global _limits_snapshot, _risk_notional_cap, _limits_updated_at
+    _limits_snapshot = limits.model_copy(deep=True)
+    _risk_notional_cap = _limits_snapshot.notional_cap
+    _limits_updated_at = _limits_snapshot.updated_at
     return _current_limits()
 
 
 def _handle_limits_reload(limits: RiskLimits) -> None:
-    _set_limits(limits.notional_cap, limits.updated_at)
+    _set_limits(limits)
 
 
 async def verify_dependencies() -> None:
@@ -437,7 +439,7 @@ async def reload_limits() -> ApiResult:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     limits = risk_service.reload_limits(refresh_settings=True)
-    limits = _set_limits(limits.notional_cap, limits.updated_at)
+    limits = _set_limits(limits)
     return ApiResult(ok=True, code="OK", message="限额已刷新", data=limits.model_dump())
 
 

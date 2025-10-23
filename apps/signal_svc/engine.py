@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import statistics
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 from uuid import uuid4
 
@@ -22,6 +23,7 @@ from libs.schemas.events import BarsClosed
 from libs.schemas.signals import SignalEnvelope, SignalPushItem, SignalSide
 
 from .top5_source import PremarketTop5Source, Top5Source
+from apps.risk_svc.limits import LimitsCache
 
 LOGGER = structlog.get_logger(__name__)
 
@@ -43,12 +45,16 @@ BUY_SIGNALS = {
     "SIG_PM_BOTTOM_A2",
     "SIG_PM_BOTTOM_A3",
     "SIG_PM_BOTTOM_A4",
+    "SIG_AM_BOTTOM_A1",
+    "SIG_AM_CONFLUENCE_BUY_A2",
 }
 
 SELL_SIGNALS = {
     "SIG_EXIT_UPPER_TAP_X2",
     "SIG_EXIT_BOX2MID",
     "SIG_TIME_CLEAR_12_14",
+    "SIG_AM_SELL_C1",
+    "SIG_AM_CONFLUENCE_SELL_S2",
 }
 
 
@@ -85,7 +91,6 @@ class SignalEngine:
         self._ttl = self._settings.ttl_buy_seconds
         self._cooldown = self._settings.cooldown_buy_seconds
         self._mfi_stoch_filter = self._settings.feature_mfi_stoch_filter
-        self._vix_gate = Decimal(self._settings.vix_gate)
         self._preearn_days_min = int(self._settings.preearn_days_min)
         self._preearn_days_max = int(self._settings.preearn_days_max)
         self._preearn_atr_pct_max = Decimal(str(self._settings.preearn_atr_pct_max))
@@ -96,6 +101,13 @@ class SignalEngine:
         self._top5_today_cache: Dict[date, set[str]] = {}
         self._top5_source: Top5Source = top5_source or PremarketTop5Source()
         self._vix_cache: Tuple[Optional[Decimal], Optional[datetime]] = (None, None)
+        limits_cache = LimitsCache(session_factory)
+        risk_limits = limits_cache.snapshot
+        self._am_bottom_limits = risk_limits.am_bottom
+        self._am_sell1_limits = risk_limits.am_sell1
+        self._am_conf_limits = risk_limits.am_conf
+        self._vix_gate_mode = risk_limits.gate.vix.mode
+        self._vix_gate = Decimal(str(risk_limits.gate.vix.thresh))
 
         # Resolve bt_run for logging
         session: Session = self._session_factory()
@@ -267,6 +279,313 @@ class SignalEngine:
     # ------------------------------------------------------------------
     # Detectors
     # ------------------------------------------------------------------
+    def _detect_am_bottom_a1(
+        self,
+        event: BarsClosed,
+        df: pd.DataFrame,
+        trade_date: date,
+        vix_value: Optional[Decimal],
+        session: Session,
+    ) -> Optional[SignalEnvelope]:
+        if len(df) < max(20, self._am_bottom_limits.neg_seq_min + 6):
+            return None
+        et_time = _to_eastern(event.bar_end)
+        if et_time.time() < time(9, 30) or et_time.time() >= time(12, 0):
+            return None
+        if not self._top5_today(trade_date, session, event.symbol):
+            return None
+
+        current_idx = len(df) - 1
+        l2_idx = current_idx - 1
+        pivots = self._find_pivot_lows(df, self._am_bottom_limits.pivot_w)
+        if l2_idx not in pivots:
+            return None
+        pos = pivots.index(l2_idx)
+        if pos == 0:
+            return None
+        l1_idx = pivots[pos - 1]
+        low_l1 = df.iloc[l1_idx]["low"]
+        low_l2 = df.iloc[l2_idx]["low"]
+        if None in (low_l1, low_l2) or low_l2 >= low_l1:
+            return None
+        if not self._check_slope_sequences(
+            df,
+            l2_idx,
+            self._am_bottom_limits.neg_seq_min,
+            self._am_bottom_limits.pos_seq_min,
+        ):
+            return None
+        current = df.iloc[current_idx]
+        if (
+            self._am_bottom_limits.allow_mid_filter
+            and (
+                current["close"] is None
+                or current["boll_mid"] is None
+                or current["close"] < current["boll_mid"]
+            )
+        ):
+            return None
+        allowed, addition = self._can_open_position(event.symbol, df, session, event.bar_end)
+        if not allowed:
+            return None
+        reason = {
+            "pivot_l1": df.iloc[l1_idx]["ts_end"].isoformat(),
+            "pivot_l2": df.iloc[l2_idx]["ts_end"].isoformat(),
+            "low_l1": str(low_l1),
+            "low_l2": str(low_l2),
+            "m5_slope": str(df.iloc[l2_idx]["lr_m5_slope"]),
+            "dn_slope": str(df.iloc[l2_idx]["lr_boll_dn_slope"]),
+            "close_vs_mid": (
+                None
+                if current["close"] is None or current["boll_mid"] is None
+                else float(current["close"] - current["boll_mid"])
+            ),
+            "add_position": addition,
+            "option_liquidity": True,
+        }
+        return self._build_signal(
+            symbol=event.symbol,
+            signal_code="SIG_AM_BOTTOM_A1",
+            side=SignalSide.BUY,
+            reason=reason,
+            generated_at=event.bar_end,
+            cooldown_override=self._am_bottom_limits.cooldown_s,
+        )
+
+    def _detect_am_confluence_buy_a2(
+        self,
+        event: BarsClosed,
+        df: pd.DataFrame,
+        trade_date: date,
+        vix_value: Optional[Decimal],
+        session: Session,
+    ) -> Optional[SignalEnvelope]:
+        lookback = max(3, self._am_conf_limits.buy.lookback_n)
+        if len(df) < max(lookback + 5, 30):
+            return None
+        et_time = _to_eastern(event.bar_end)
+        if et_time.time() < time(9, 30) or et_time.time() >= time(12, 0):
+            return None
+        if not self._top5_today(trade_date, session, event.symbol):
+            return None
+        window = df.iloc[-lookback:]
+        current = window.iloc[-1]
+        if current["close"] is None or current["boll_mid"] is None or current["close"] < current["boll_mid"]:
+            return None
+        support_pass = False
+        for _, row in window.iterrows():
+            if None in (row["close"], row["low"], row["boll_mid"]):
+                continue
+            mid_touch = row["low"] <= row["boll_mid"] and row["close"] >= row["boll_mid"]
+            up_band = row.get("boll_up")
+            up_touch = (
+                up_band is not None and row["low"] <= up_band and row["close"] >= up_band
+            )
+            if mid_touch or up_touch:
+                support_pass = True
+                break
+        if not support_pass:
+            return None
+        macd_line, macd_signal, macd_hist = self._macd_components(df["close"])
+        if (
+            macd_line is None
+            or macd_signal is None
+            or macd_hist is None
+            or len(macd_line) < 2
+        ):
+            return None
+        if any(
+            pd.isna(val)
+            for val in (
+                macd_line.iloc[-2],
+                macd_signal.iloc[-2],
+                macd_hist.iloc[-2],
+                macd_line.iloc[-1],
+                macd_signal.iloc[-1],
+                macd_hist.iloc[-1],
+            )
+        ):
+            return None
+        if not (
+            macd_line.iloc[-2] <= macd_signal.iloc[-2]
+            and macd_line.iloc[-1] > macd_signal.iloc[-1]
+            and macd_hist.iloc[-2] <= 0
+            and macd_hist.iloc[-1] > 0
+        ):
+            return None
+        if not self._series_cross_up(window["rsi6"], Decimal("30")):
+            return None
+        if not (
+            self._series_cross_up(window["stoch_rsi_k"], Decimal("20"))
+            or self._series_cross_up(window["stoch_rsi_d"], Decimal("20"))
+        ):
+            return None
+        if (
+            current["lr_obv_slope"] is None
+            or current["lr_obv_slope"] <= 0
+            or current["obv"] is None
+            or current["obv_ma6"] is None
+            or current["obv"] < current["obv_ma6"]
+        ):
+            return None
+        allowed, addition = self._can_open_position(event.symbol, df, session, event.bar_end)
+        if not allowed:
+            return None
+        reason = {
+            "support_touch": support_pass,
+            "macd_cross": True,
+            "rsi_cross_30": True,
+            "stoch_rsi_cross_20": True,
+            "obv_slope": str(current["lr_obv_slope"]),
+            "add_position": addition,
+            "option_liquidity": True,
+        }
+        return self._build_signal(
+            symbol=event.symbol,
+            signal_code="SIG_AM_CONFLUENCE_BUY_A2",
+            side=SignalSide.BUY,
+            reason=reason,
+            generated_at=event.bar_end,
+            cooldown_override=self._am_conf_limits.cooldown_s,
+        )
+
+    def _detect_am_sell_c1(
+        self,
+        event: BarsClosed,
+        df: pd.DataFrame,
+        trade_date: date,
+        vix_value: Optional[Decimal],
+        session: Session,
+    ) -> Optional[SignalEnvelope]:
+        state = self._positions.get(event.symbol)
+        if state is None:
+            return None
+        consecutive = max(2, self._am_sell1_limits.consecutive)
+        if len(df) < consecutive + 5:
+            return None
+        tail = df.iloc[-consecutive:]
+        median_window = df.iloc[-min(len(df), 20):]
+        range_values: List[Decimal] = []
+        for _, row in median_window.iterrows():
+            if None in (row["high"], row["low"]):
+                continue
+            try:
+                range_values.append(Decimal(str(row["high"] - row["low"])))
+            except (InvalidOperation, TypeError):
+                continue
+        if not range_values:
+            return None
+        median_range = statistics.median(range_values)
+        if median_range <= 0:
+            return None
+
+        def _is_big_red(row: pd.Series) -> bool:
+            if None in (row["open"], row["close"], row["high"], row["low"]):
+                return False
+            open_p = Decimal(str(row["open"]))
+            close_p = Decimal(str(row["close"]))
+            if close_p >= open_p:
+                return False
+            high_p = Decimal(str(row["high"]))
+            low_p = Decimal(str(row["low"]))
+            total_range = high_p - low_p
+            if total_range <= 0:
+                return False
+            body_ratio = abs(close_p - open_p) / total_range
+            if body_ratio < Decimal(str(self._am_sell1_limits.body_ratio_min)):
+                return False
+            if total_range < median_range * Decimal(str(self._am_sell1_limits.range_mult_min)):
+                return False
+            return True
+
+        if not all(_is_big_red(row) for _, row in tail.iterrows()):
+            return None
+        current = df.iloc[-1]
+        if current["boll_mid"] is None:
+            return None
+        highest = None
+        for _, row in tail.iterrows():
+            if row["high"] is None:
+                return None
+            high_val = Decimal(str(row["high"]))
+            highest = high_val if highest is None else max(highest, high_val)
+        if highest is None or highest >= Decimal(str(current["boll_mid"])):
+            return None
+        reason = {
+            "consecutive": consecutive,
+            "median_range": str(median_range),
+            "boll_mid": str(current["boll_mid"]),
+        }
+        return self._build_signal(
+            symbol=event.symbol,
+            signal_code="SIG_AM_SELL_C1",
+            side=SignalSide.SELL,
+            reason=reason,
+            generated_at=event.bar_end,
+            cooldown_override=self._am_conf_limits.cooldown_s,
+        )
+
+    def _detect_am_confluence_sell_s2(
+        self,
+        event: BarsClosed,
+        df: pd.DataFrame,
+        trade_date: date,
+        vix_value: Optional[Decimal],
+        session: Session,
+    ) -> Optional[SignalEnvelope]:
+        state = self._positions.get(event.symbol)
+        if state is None:
+            return None
+        lookback = max(3, self._am_conf_limits.sell.lookback_n)
+        if len(df) < lookback + 1:
+            return None
+        window = df.iloc[-lookback:]
+        current = window.iloc[-1]
+        if current["close"] is None or current["boll_mid"] is None or current["close"] >= current["boll_mid"]:
+            return None
+        pressure_pass = False
+        for _, row in window.iterrows():
+            if None in (row["close"], row["high"], row["boll_mid"]):
+                continue
+            failed_mid = row["close"] < row["boll_mid"] and row["high"] >= row["boll_mid"]
+            boll_dn = row.get("boll_dn")
+            broke_dn = boll_dn is not None and row["close"] < boll_dn
+            if failed_mid or broke_dn:
+                pressure_pass = True
+                break
+        if not pressure_pass:
+            return None
+        if not self._series_cross_down(window["rsi6"], Decimal("70")):
+            return None
+        if not (
+            self._series_cross_down(window["stoch_rsi_k"], Decimal("70"))
+            or self._series_cross_down(window["stoch_rsi_d"], Decimal("70"))
+        ):
+            return None
+        if (
+            current["obv"] is None
+            or current["obv_ma6"] is None
+            or current["obv"] >= current["obv_ma6"]
+            or current["lr_obv_slope"] is None
+            or current["lr_obv_slope"] >= 0
+        ):
+            return None
+        reason = {
+            "pressure": pressure_pass,
+            "rsi_cross_70": True,
+            "stoch_rsi_cross_70": True,
+            "obv_below_ma": True,
+            "obv_slope": str(current["lr_obv_slope"]),
+        }
+        return self._build_signal(
+            symbol=event.symbol,
+            signal_code="SIG_AM_CONFLUENCE_SELL_S2",
+            side=SignalSide.SELL,
+            reason=reason,
+            generated_at=event.bar_end,
+            cooldown_override=self._am_conf_limits.cooldown_s,
+        )
+
     def _detect_e1(
         self,
         event: BarsClosed,
@@ -278,7 +597,11 @@ class SignalEngine:
         et_time = _to_eastern(event.bar_end)
         if (et_time.hour, et_time.minute) != (9, 31):
             return None
-        if vix_value is not None and vix_value >= self._vix_gate:
+        if (
+            vix_value is not None
+            and self._vix_gate_mode == "enforce"
+            and vix_value >= self._vix_gate
+        ):
             return None
         if not self._top5_today(trade_date, session, event.symbol):
             return None
@@ -765,14 +1088,18 @@ class SignalEngine:
         vix_value = self._current_vix(session, event.bar_end)
 
         detectors = [
+            self._detect_am_sell_c1,
+            self._detect_am_confluence_sell_s2,
+            self._detect_s2,
+            self._detect_s1,
+            self._detect_time_clear,
             self._detect_e1,
             self._detect_e2,
             self._detect_pm_a2,
             self._detect_pm_a3,
             self._detect_pm_a4,
-            self._detect_s2,
-            self._detect_s1,
-            self._detect_time_clear,
+            self._detect_am_bottom_a1,
+            self._detect_am_confluence_buy_a2,
         ]
 
         detected: List[DetectedSignal] = []
@@ -1029,7 +1356,11 @@ class SignalEngine:
         side: SignalSide,
         reason: Dict[str, Any],
         generated_at: datetime,
+        ttl_override: Optional[int] = None,
+        cooldown_override: Optional[int] = None,
     ) -> SignalEnvelope:
+        ttl_value = int(ttl_override) if ttl_override is not None else self._ttl
+        cooldown_value = int(cooldown_override) if cooldown_override is not None else self._cooldown
         return SignalEnvelope(
             strategy_code=self._strategy_code,
             symbol=symbol,
@@ -1039,10 +1370,126 @@ class SignalEngine:
             reason=reason,
             risk_hint=RISK_HINT,
             option_hint=OPTION_HINT,
-            ttl_seconds=self._ttl,
-            cooldown_seconds=self._cooldown,
+            ttl_seconds=ttl_value,
+            cooldown_seconds=cooldown_value,
             generated_at=generated_at,
         )
+
+    def _find_pivot_lows(self, df: pd.DataFrame, window: int) -> List[int]:
+        if window <= 0 or len(df) < window * 2 + 1:
+            return []
+        pivots: List[int] = []
+        for idx in range(window, len(df) - window):
+            low_value = df.iloc[idx]["low"]
+            if low_value is None:
+                continue
+            neighbourhood = [
+                row_low
+                for row_low in df["low"].iloc[idx - window : idx + window + 1]
+                if row_low is not None
+            ]
+            if not neighbourhood:
+                continue
+            if low_value > min(neighbourhood):
+                continue
+            prev_idx = max(idx - 1, 0)
+            m5_prev = df.iloc[prev_idx]["lr_m5_slope"]
+            dn_prev = df.iloc[prev_idx]["lr_boll_dn_slope"]
+            m5_curr = df.iloc[idx]["lr_m5_slope"]
+            dn_curr = df.iloc[idx]["lr_boll_dn_slope"]
+            if None in (m5_prev, dn_prev, m5_curr, dn_curr):
+                continue
+            if m5_curr > 0 and dn_curr > 0 and (m5_prev < 0 or dn_prev < 0):
+                pivots.append(idx)
+        return pivots
+
+    def _check_slope_sequences(
+        self,
+        df: pd.DataFrame,
+        idx: int,
+        neg_len: int,
+        pos_len: int,
+    ) -> bool:
+        if neg_len <= 0 or idx < neg_len or idx >= len(df):
+            return False
+        neg_slice = df.iloc[idx - neg_len : idx]
+        if len(neg_slice) < neg_len:
+            return False
+        for _, row in neg_slice.iterrows():
+            if row["lr_m5_slope"] is None or row["lr_boll_dn_slope"] is None:
+                return False
+            if row["lr_m5_slope"] > 0 or row["lr_boll_dn_slope"] > 0:
+                return False
+        pos_required = max(pos_len, 2)
+        pos_slice = df.iloc[idx : min(len(df), idx + pos_required)]
+        if len(pos_slice) < 2:
+            return False
+        for _, row in pos_slice.iterrows():
+            if row["lr_m5_slope"] is None or row["lr_boll_dn_slope"] is None:
+                return False
+            if row["lr_m5_slope"] < 0 or row["lr_boll_dn_slope"] < 0:
+                return False
+        return True
+
+    def _macd_components(
+        self, close_series: pd.Series
+    ) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
+        if close_series is None or len(close_series) < 26:
+            return None, None, None
+        values = []
+        for val in close_series:
+            if val is None:
+                values.append(float("nan"))
+            else:
+                try:
+                    values.append(float(val))
+                except (TypeError, ValueError):
+                    values.append(float("nan"))
+        close_float = pd.Series(values, index=close_series.index, dtype="float64")
+        if close_float.isna().all():
+            return None, None, None
+        ema12 = close_float.ewm(span=12, adjust=False).mean()
+        ema26 = close_float.ewm(span=26, adjust=False).mean()
+        macd_line = ema12 - ema26
+        macd_signal = macd_line.ewm(span=9, adjust=False).mean()
+        macd_hist = macd_line - macd_signal
+        return macd_line, macd_signal, macd_hist
+
+    def _series_cross_up(self, series: pd.Series, threshold: Decimal) -> bool:
+        if series is None or len(series) < 2:
+            return False
+        prev_value: Optional[Decimal] = None
+        for val in series:
+            if val is None:
+                prev_value = None
+                continue
+            try:
+                current = Decimal(str(val))
+            except (InvalidOperation, TypeError):
+                prev_value = None
+                continue
+            if prev_value is not None and prev_value < threshold and current >= threshold:
+                return True
+            prev_value = current
+        return False
+
+    def _series_cross_down(self, series: pd.Series, threshold: Decimal) -> bool:
+        if series is None or len(series) < 2:
+            return False
+        prev_value: Optional[Decimal] = None
+        for val in series:
+            if val is None:
+                prev_value = None
+                continue
+            try:
+                current = Decimal(str(val))
+            except (InvalidOperation, TypeError):
+                prev_value = None
+                continue
+            if prev_value is not None and prev_value > threshold and current <= threshold:
+                return True
+            prev_value = current
+        return False
 
     def _e2_second_low_rebound(self, df: pd.DataFrame, trade_date: date) -> Tuple[bool, Decimal]:
         todays = df[df["et"].dt.date == trade_date]
@@ -1087,9 +1534,16 @@ class SignalEngine:
                 i.ao,
                 i.stoch_k,
                 i.stoch_d,
+                i.stoch_rsi_k,
+                i.stoch_rsi_d,
                 i.cci14,
                 i.cci6,
+                i.sma5,
+                i.lr_m5_slope,
+                i.lr_boll_dn_slope,
+                i.lr_obv_slope,
                 i.obv,
+                i.obv_ma6,
                 i.obv_ema20,
                 i.mfi14,
                 i.rvol6
@@ -1124,9 +1578,16 @@ class SignalEngine:
             "ao",
             "stoch_k",
             "stoch_d",
+            "stoch_rsi_k",
+            "stoch_rsi_d",
             "cci14",
             "cci6",
+            "sma5",
+            "lr_m5_slope",
+            "lr_boll_dn_slope",
+            "lr_obv_slope",
             "obv",
+            "obv_ma6",
             "obv_ema20",
             "mfi14",
             "rvol6",

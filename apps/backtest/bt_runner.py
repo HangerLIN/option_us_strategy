@@ -202,7 +202,6 @@ def _run_equity_track(
     top5_source: Top5Source | None,
 ) -> None:
     settings = get_settings()
-    horizons = (5, 15, 30, 60)
 
     signals = load_signals(
         mode=signal_mode,
@@ -229,6 +228,9 @@ def _run_equity_track(
         "low",
         "close",
         "volume",
+        "boll_mid",
+        "boll_up",
+        "boll_dn",
         "rsi6",
         "rsi12",
         "rsi24",
@@ -236,10 +238,17 @@ def _run_equity_track(
         "ao",
         "stoch_k",
         "stoch_d",
+        "stoch_rsi_k",
+        "stoch_rsi_d",
         "cci14",
         "cci6",
         "obv",
+        "obv_ma6",
         "obv_ema20",
+        "sma5",
+        "lr_m5_slope",
+        "lr_boll_dn_slope",
+        "lr_obv_slope",
         "mfi14",
         "rvol6",
     ]
@@ -248,12 +257,41 @@ def _run_equity_track(
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame = frame.set_index("ts_end").sort_index()
 
-    accumulator = _EquityMetricsAccumulator(horizons=horizons)
+    accumulator = _EquityMetricsAccumulator()
     vix_mode = settings.vix_gate_mode.lower()
     vix_threshold = settings.vix_gate
 
+    open_entries: List[Dict[str, Decimal]] = []
+
     for event in signals:
         ts_utc = _ensure_utc(event.ts_end)
+
+        if event.side == SignalSide.SELL:
+            reason_payload = {
+                "track": "equity",
+                "status": "PASS",
+                "side": getattr(event.side, "value", str(event.side)),
+            }
+            dao.record_signal(
+                {
+                    "run_id": run_id,
+                    "ts_end": ts_utc,
+                    "symbol": symbol,
+                    "signal_code": event.signal_code,
+                    "accepted": True,
+                    "reason": json.dumps(reason_payload, default=str),
+                }
+            )
+            exit_bar = _lookup_bar(frame, ts_utc)
+            if exit_bar is not None and not pd.isna(exit_bar.get("close")):
+                exit_price = Decimal(str(exit_bar["close"]))
+                if exit_price > 0:
+                    for entry in open_entries:
+                        tfe_ret = (exit_price - entry["entry_price"]) / entry["entry_price"]
+                        accumulator.add_tfe(entry["signal_code"], tfe_ret)
+                    open_entries.clear()
+            continue
+
         if event.side != SignalSide.BUY:
             reason_payload = {
                 "track": "equity",
@@ -277,7 +315,6 @@ def _run_equity_track(
             raise RuntimeError(f"Missing close price for {symbol} at {ts_utc.isoformat()}")
 
         entry_price = Decimal(str(bar["close"]))
-        returns = _compute_horizon_returns(frame, ts_utc, entry_price, horizons)
 
         vix_decision = _evaluate_vix_gate(
             dao=dao,
@@ -322,14 +359,26 @@ def _run_equity_track(
             }
         )
 
-        accumulator.add(
-            signal_code=event.signal_code,
-            accepted=accepted,
-            returns=returns,
-            block_reason=block_reason,
-            opportunity_reason=opportunity_reason,
-            vix=vix_decision.vix,
-        )
+        if accepted:
+            accumulator.add_execution(signal_code=event.signal_code)
+            open_entries.append(
+                {"signal_code": event.signal_code, "entry_price": entry_price}
+            )
+        else:
+            if block_reason:
+                accumulator.add_block_reason(block_reason)
+            if opportunity_reason:
+                accumulator.add_opportunity(event.signal_code, opportunity_reason)
+
+    if open_entries:
+        tail_close = frame["close"].dropna()
+        if not tail_close.empty:
+            exit_price = Decimal(str(tail_close.iloc[-1]))
+            if exit_price > 0:
+                for entry in open_entries:
+                    tfe_ret = (exit_price - entry["entry_price"]) / entry["entry_price"]
+                    accumulator.add_tfe(entry["signal_code"], tfe_ret)
+        open_entries.clear()
 
     accumulator.flush(dao, run_id)
 
@@ -343,129 +392,92 @@ class _VixGateDecision:
 
 
 class _EquityMetricsAccumulator:
-    def __init__(self, *, horizons: Sequence[int]) -> None:
-        self._horizons = tuple(horizons)
-        self._executed: Dict[str, Dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
-        self._hit_records: Dict[str, Dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
-        self._opportunities: Dict[tuple[str, str], Dict[int, list[float]]] = defaultdict(
-            lambda: defaultdict(list)
-        )
+    def __init__(self) -> None:
+        self._tfe_returns: Dict[str, list[float]] = defaultdict(list)
         self._exec_counts: Counter[str] = Counter()
+        self._opp_counts: Counter[str] = Counter()
+        self._opp_reason_counts: Counter[str] = Counter()
         self._block_counts: Counter[str] = Counter()
-        self._opportunity_counts: Counter[str] = Counter()
-        self._vix_samples: Dict[str, list[float]] = defaultdict(list)
 
-    def add(
-        self,
-        *,
-        signal_code: str,
-        accepted: bool,
-        returns: Mapping[int, Decimal | None],
-        block_reason: str | None,
-        opportunity_reason: str | None,
-        vix: Decimal | None,
-    ) -> None:
-        if accepted:
-            self._exec_counts[signal_code] += 1
-            for minutes, value in returns.items():
-                if value is None:
-                    continue
-                numeric = float(value)
-                self._executed[signal_code][minutes].append(numeric)
-                self._hit_records[signal_code][minutes].append(1.0 if numeric > 0 else 0.0)
-        else:
-            if block_reason:
-                reason_key = _normalise_reason(block_reason)
-                self._block_counts[reason_key] += 1
-                if vix is not None:
-                    self._vix_samples[reason_key].append(float(vix))
+    def add_execution(self, *, signal_code: str) -> None:
+        self._exec_counts[signal_code] += 1
 
-        if opportunity_reason:
-            opp_key = _normalise_reason(opportunity_reason)
-            self._opportunity_counts[opp_key] += 1
-            if vix is not None:
-                self._vix_samples[opp_key].append(float(vix))
-            for minutes, value in returns.items():
-                if value is None:
-                    continue
-                self._opportunities[(signal_code, opp_key)][minutes].append(float(value))
+    def add_opportunity(self, signal_code: str, reason: Optional[str]) -> None:
+        self._opp_counts[signal_code] += 1
+        if reason:
+            self._opp_reason_counts[_normalise_reason(reason)] += 1
+
+    def add_block_reason(self, reason: str) -> None:
+        self._block_counts[_normalise_reason(reason)] += 1
+
+    def add_tfe(self, signal_code: str, value: Decimal) -> None:
+        self._tfe_returns[signal_code].append(float(value))
 
     def flush(self, dao: BacktestDAO, run_id: int) -> None:
         metrics: list[dict[str, object]] = []
 
-        for signal_code, horizon_map in self._executed.items():
-            for minutes, values in horizon_map.items():
-                if not values:
-                    continue
-                avg_return = sum(values) / len(values)
-                metrics.append(
-                    {
-                        "run_id": run_id,
-                        "metric_code": f"RET_{signal_code}_{minutes}M",
-                        "metric_value": avg_return,
-                    }
-                )
-                hits = self._hit_records[signal_code][minutes]
-                if hits:
-                    hit_rate = sum(hits) / len(hits)
-                    metrics.append(
-                        {
-                            "run_id": run_id,
-                            "metric_code": f"HIT_{signal_code}_{minutes}M",
-                            "metric_value": hit_rate,
-                        }
-                    )
+        for signal_code, values in self._tfe_returns.items():
+            if not values:
+                continue
+            values_sorted = sorted(values)
+            mean_val = sum(values_sorted) / len(values_sorted)
+            metrics.append(
+                {
+                    "run_id": run_id,
+                    "metric_code": f"RET_SIG_{signal_code}_TFE_MEAN",
+                    "metric_value": mean_val,
+                }
+            )
+            metrics.append(
+                {
+                    "run_id": run_id,
+                    "metric_code": f"RET_SIG_{signal_code}_TFE_P50",
+                    "metric_value": _percentile(values_sorted, 0.50),
+                }
+            )
+            metrics.append(
+                {
+                    "run_id": run_id,
+                    "metric_code": f"RET_SIG_{signal_code}_TFE_P90",
+                    "metric_value": _percentile(values_sorted, 0.90),
+                }
+            )
 
         for signal_code, count in self._exec_counts.items():
             metrics.append(
                 {
                     "run_id": run_id,
-                    "metric_code": f"COUNT_EXEC_{signal_code}",
+                    "metric_code": f"COUNT_EXEC_SIG_{signal_code}",
                     "metric_value": float(count),
                 }
             )
 
-        for (signal_code, reason), horizon_map in self._opportunities.items():
-            for minutes, values in horizon_map.items():
-                if not values:
-                    continue
-                avg_return = sum(values) / len(values)
-                metrics.append(
-                    {
-                        "run_id": run_id,
-                        "metric_code": f"OPP_{reason}_{signal_code}_{minutes}M",
-                        "metric_value": avg_return,
-                    }
-                )
+        for signal_code, count in self._opp_counts.items():
+            metrics.append(
+                {
+                    "run_id": run_id,
+                    "metric_code": f"COUNT_OPP_SIG_{signal_code}",
+                    "metric_value": float(count),
+                }
+            )
+
+        for reason, count in self._opp_reason_counts.items():
+            metrics.append(
+                {
+                    "run_id": run_id,
+                    "metric_code": f"COUNT_OPP_REASON_{reason}",
+                    "metric_value": float(count),
+                }
+            )
 
         for reason, count in self._block_counts.items():
             metrics.append(
                 {
                     "run_id": run_id,
-                    "metric_code": f"BLOCK_COUNT_{reason}",
+                    "metric_code": f"COUNT_BLOCK_{reason}",
                     "metric_value": float(count),
                 }
             )
-
-        for reason, count in self._opportunity_counts.items():
-            metrics.append(
-                {
-                    "run_id": run_id,
-                    "metric_code": f"OPP_COUNT_{reason}",
-                    "metric_value": float(count),
-                }
-            )
-
-        for reason, samples in self._vix_samples.items():
-            if samples:
-                avg_vix = sum(samples) / len(samples)
-                metrics.append(
-                    {
-                        "run_id": run_id,
-                        "metric_code": f"VIX_AVG_{reason}",
-                        "metric_value": avg_vix,
-                    }
-                )
 
         if metrics:
             dao.record_metrics_total(metrics)
@@ -494,24 +506,6 @@ def _lookup_bar(frame: pd.DataFrame, ts_utc: datetime):
     if isinstance(row, pd.DataFrame):
         return row.iloc[0]
     return row
-
-
-def _compute_horizon_returns(
-    frame: pd.DataFrame,
-    ts_utc: datetime,
-    entry_price: Decimal,
-    horizons: Sequence[int],
-) -> Dict[int, Decimal | None]:
-    results: Dict[int, Decimal | None] = {}
-    for minutes in horizons:
-        future_ts = ts_utc + timedelta(minutes=minutes)
-        bar = _lookup_bar(frame, future_ts)
-        if bar is None or pd.isna(bar.get("close")):
-            results[minutes] = None
-            continue
-        exit_price = Decimal(str(bar["close"]))
-        results[minutes] = (exit_price - entry_price) / entry_price
-    return results
 
 
 def _evaluate_vix_gate(
@@ -544,6 +538,19 @@ def _normalise_reason(reason: str | None) -> str:
     if ":" in value:
         value = value.split(":", 1)[1]
     return value.strip().replace("-", "_").upper()
+
+
+def _percentile(values: Sequence[float], quantile: float) -> float:
+    if not values:
+        return 0.0
+    quantile = min(max(quantile, 0.0), 1.0)
+    if len(values) == 1:
+        return values[0]
+    idx = quantile * (len(values) - 1)
+    lower = int(idx)
+    upper = min(lower + 1, len(values) - 1)
+    weight = idx - lower
+    return values[lower] * (1 - weight) + values[upper] * weight
 
 
 def _prepare_option_feeds(

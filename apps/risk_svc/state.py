@@ -98,6 +98,15 @@ class RiskStateAggregator:
                     redis_bus=self._redis_bus,
                     trace_id=trace_id,
                 )
+            # 在09:31-09:35之间检查一次VIX并锁定当日决策
+            await self._risk_service.check_vix_gate_at_open(
+                session,
+                ts_end,
+                vix_value,
+                redis_bus=self._redis_bus,
+                trace_id=trace_id,
+            )
+            # 兜底：盘中VIX更新（如果未锁定）
             await self._risk_service.update_vix_gate(
                 session,
                 ts_end,
@@ -306,7 +315,7 @@ class RiskStateAggregator:
                 "symbol": "GLOBAL",
                 "metric_code": "REGIME",
                 "metric_value": Decimal("1"),
-                "detail": {"regime": regime},
+                "detail": self._safe_detail({"regime": regime}),
             },
             {
                 "ts": ts_end,
@@ -334,3 +343,16 @@ class RiskStateAggregator:
         if vix_value < Decimal("25"):
             return "MID"
         return "HIGH"
+
+    def _safe_detail(self, detail: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+        if detail is None:
+            return None
+        normalized: Dict[str, Any] = {}
+        for key, value in dict(detail).items():
+            if isinstance(value, Decimal):
+                normalized[key] = str(value)
+            elif isinstance(value, dict):
+                normalized[key] = self._safe_detail(value)
+            else:
+                normalized[key] = value
+        return normalized

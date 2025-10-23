@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     symbol_block_minutes: int = Field(10, validation_alias="SYMBOL_BLOCK_MINUTES")
     risk_unit_value: Decimal = Field(Decimal("1000"), validation_alias="RISK_UNIT_VALUE")
     iv_overnight_call_cap: Decimal = Field(
-        Decimal("1.10"), validation_alias="IV_OVERNIGHT_CALL_CAP"
+        Decimal("1.0"), validation_alias="IV_OVERNIGHT_CALL_CAP"
     )
     preearn_days_min: int = Field(3, validation_alias="PRE_EARN_DAYS_MIN")
     preearn_days_max: int = Field(5, validation_alias="PRE_EARN_DAYS_MAX")

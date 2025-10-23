@@ -81,7 +81,7 @@ class RiskService:
         self._limits_cache = LimitsCache(session_factory)
         self._blocks = RedisBlockStore(self._redis_url, client=self._redis)
         self._stop_loss_pct = Decimal("0.08")
-        self._iv_overnight_call_cap = Decimal("1.10")
+        self._iv_overnight_call_cap = Decimal("1.0")
         self._preearn_days_min = int(settings.preearn_days_min)
         self._preearn_days_max = int(settings.preearn_days_max)
         self._preearn_atr_pct_max = Decimal(str(settings.preearn_atr_pct_max))
@@ -97,12 +97,16 @@ class RiskService:
         self._ibkr_vix_lock = threading.Lock()
         self._last_ibkr_vix_fetch: Optional[datetime] = None
         self._limits_updated_at: datetime = utc_now()
+        self._vix_gate_mode: str = settings.vix_gate_mode
+        # 当日VIX门控检查标志（09:31检查后固定决策）
+        self._vix_checked_today: Optional[date] = None
+        self._vix_gate_locked_today: bool = False
         self._restore_gate_state()
         self.reload_limits()
         set_kill_switch_state(self._kill_switch_active)
 
     def current_limits(self) -> RiskLimits:
-        return RiskLimits(notional_cap=self._risk_notional_cap, updated_at=self._limits_updated_at)
+        return self._limits_cache.snapshot
 
     def reload_limits(self, *, refresh_settings: bool = False) -> RiskLimits:
         snapshot = self._limits_cache.reload(refresh_settings=refresh_settings)
@@ -128,6 +132,10 @@ class RiskService:
     @property
     def vix_gate(self) -> Decimal:
         return self._vix_gate
+
+    @property
+    def vix_gate_mode(self) -> str:
+        return self._vix_gate_mode
 
     @property
     def kill_switch_active(self) -> bool:
@@ -466,11 +474,13 @@ class RiskService:
         self._no_new_from, self._no_new_to = self._limits_cache.no_new_window()
         self._cutoff_open_chase = self._limits_cache.get_time("CUTOFF_OPEN_CHASE", time(14, 0))
         self._cutoff_overnight = self._limits_cache.get_time("CUTOFF_OVERNIGHT", time(12, 0))
+        gate_vix_cfg = self._limits_cache.gate_vix_limits()
+        self._vix_gate_mode = gate_vix_cfg.mode
         self._vix_gate = self._limits_cache.get_decimal(
-            symbol=None, key="VIX_GATE", default=Decimal("20")
+            symbol=None, key="VIX_GATE", default=gate_vix_cfg.thresh
         )
         self._iv_overnight_call_cap = self._limits_cache.get_decimal(
-            symbol=None, key="IV_OVERNIGHT_CALL_CAP", default=Decimal("1.10")
+            symbol=None, key="IV_OVERNIGHT_CALL_CAP", default=Decimal("1.0")
         )
         self._limits_updated_at = self._limits_cache.updated_at
 
@@ -955,6 +965,93 @@ class RiskService:
         self._vix_cache = (record.metric_value, record.ts)
         return record.metric_value
 
+    async def check_vix_gate_at_open(
+        self,
+        session: Session,
+        now_utc: datetime,
+        vix_value: Optional[Decimal],
+        *,
+        redis_bus,
+        trace_id: Optional[str] = None,
+    ) -> None:
+        """
+        在09:31-09:35之间检查一次VIX并锁定当日决策
+        
+        如果VIX>=20，则当天剩余时间都禁止开盘追高信号。
+        这样避免盘中VIX波动导致策略反复调整。
+        """
+        if vix_value is None:
+            return
+        
+        now_et = now_utc.astimezone(EASTERN)
+        today = now_et.date()
+        
+        # 检查是否已经在今天检查过VIX
+        if self._vix_checked_today == today:
+            return
+        
+        # 只在09:31-09:35之间检查
+        opening_window_start = time(9, 31)
+        opening_window_end = time(9, 35)
+        if not (opening_window_start <= now_et.time() <= opening_window_end):
+            return
+        
+        # 标记今天已检查
+        self._vix_checked_today = today
+        self._vix_gate_locked_today = vix_value >= self._vix_gate
+        
+        # 更新门控状态
+        gate_open = vix_value < self._vix_gate
+        if gate_open != self._vix_gate_open:
+            self._vix_gate_open = gate_open
+            self._store_gate_state(gate_open, now_utc, vix_value)
+            
+            event_code = "VIX_GATE_OFF" if gate_open else "VIX_GATE_ON"
+            dao = RiskEventDAO(session)
+            dao.create_event(
+                event_ts=now_utc,
+                event_code=event_code,
+                severity="INFO" if gate_open else "WARN",
+                message=f"{event_code.lower()}_at_open (VIX={vix_value}, threshold={self._vix_gate})",
+                symbol="GLOBAL",
+                payload={
+                    "vix": str(vix_value),
+                    "threshold": str(self._vix_gate),
+                    "locked_for_day": True,
+                },
+            )
+            await publish_risk_alert(
+                redis_bus,
+                {
+                    "symbol": "GLOBAL",
+                    "event_code": event_code,
+                    "vix": str(vix_value),
+                    "locked_for_day": True,
+                },
+                trace_id=trace_id or f"{event_code}_OPEN",
+            )
+            
+            if gate_open:
+                await publish_risk_unblock(
+                    redis_bus,
+                    {
+                        "strategy_code": "core-vol",
+                        "symbol": "GLOBAL",
+                        "reason": "VIX_GATE_OFF",
+                    },
+                    trace_id=trace_id or f"vix-gate-unblock-open-{now_utc.isoformat()}",
+                )
+            else:
+                record_risk_block("VIX_GATE_ON")
+        
+        LOGGER.info(
+            "vix_gate.checked_at_open",
+            vix=str(vix_value),
+            gate_open=gate_open,
+            locked_for_day=True,
+            trade_date=today.isoformat(),
+        )
+
     async def update_vix_gate(
         self,
         session: Session,
@@ -966,6 +1063,12 @@ class RiskService:
     ) -> None:
         if vix_value is None:
             return
+        
+        # 如果今天已经锁定决策（通过check_vix_gate_at_open），则不再更新
+        now_et = now_utc.astimezone(EASTERN)
+        if self._vix_checked_today == now_et.date() and self._vix_gate_locked_today:
+            return
+        
         gate_open = vix_value < self._vix_gate
         if gate_open == self._vix_gate_open:
             return

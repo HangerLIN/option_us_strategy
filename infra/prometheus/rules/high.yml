@@ -1,0 +1,207 @@
+groups:
+  - name: high_priority_alerts
+    interval: 15s
+    rules:
+      # ============================================================
+      # P1 - High 告警
+      # ============================================================
+
+      # 1. 订单转化率过低
+      - alert: LowOrderConversionRate
+        expr: orders_conversion_rate < 0.7 and orders_conversion_rate > 0
+        for: 5m
+        labels:
+          severity: high
+          service: exec_svc
+          category: execution
+        annotations:
+          summary: "⚠️ 订单转化率过低"
+          description: "当前转化率: {{ $value | humanizePercentage }}，大量订单被拒绝"
+          runbook: "1) 检查风控规则是否过于严格 2) 检查订单拒绝原因分布 3) 检查市场流动性"
+
+      # 2. Bar延迟过高
+      - alert: HighBarLatency
+        expr: histogram_quantile(0.95, rate(bars_latency_seconds_bucket[3m])) > 5
+        for: 3m
+        labels:
+          severity: high
+          service: rt_engine
+          category: performance
+        annotations:
+          summary: "⚠️ 数据延迟过高"
+          description: "P95延迟: {{ $value | humanize }}s，可能影响信号时效性"
+          runbook: "1) 检查系统CPU/内存 2) 检查网络延迟 3) 考虑优化处理逻辑"
+
+      # 3. Redis Stream积压
+      - alert: RedisStreamBacklog
+        expr: redis_stream_length{stream=~"bars_closed|signals|execution_fills"} > 100
+        for: 2m
+        labels:
+          severity: high
+          service: infrastructure
+          category: message_queue
+        annotations:
+          summary: "⚠️ 消息队列积压"
+          description: "Stream {{ $labels.stream }} 积压: {{ $value }} 条消息"
+          runbook: "1) 检查消费者服务状态 2) 检查处理速度 3) 评估是否需要扩容"
+
+      # 4. 强平频繁触发
+      - alert: FrequentForceClose
+        expr: rate(risk_force_close_total[5m]) > 0.5
+        for: 5m
+        labels:
+          severity: high
+          service: risk_svc
+          category: risk
+        annotations:
+          summary: "⚠️ 频繁触发强平"
+          description: "过去5分钟强平速率: {{ $value | humanize }}/s"
+          runbook: "1) 检查强平原因分布 2) 评估止损策略 3) 检查市场波动性"
+
+      # 5. 滑点过大
+      - alert: HighSlippage
+        expr: histogram_quantile(0.95, rate(order_slippage_bps_bucket[5m])) > 50
+        for: 5m
+        labels:
+          severity: high
+          service: exec_svc
+          category: execution
+        annotations:
+          summary: "⚠️ 滑点过大"
+          description: "P95滑点: {{ $value | humanize }}bps，执行成本过高"
+          runbook: "1) 检查限价策略 2) 评估市场流动性 3) 考虑调整订单类型"
+
+      # 6. 盈亏大幅波动
+      - alert: HighPnLVolatility
+        expr: |
+          abs(
+            (pnl_realized_today_usd + pnl_unrealized_today_usd) -
+            ((pnl_realized_today_usd + pnl_unrealized_today_usd) offset 10m)
+          ) > 5000
+        for: 2m
+        labels:
+          severity: high
+          service: pnl_svc
+          category: financial
+        annotations:
+          summary: "⚠️ 盈亏大幅波动"
+          description: "10分钟内盈亏变动超过$5000"
+          runbook: "1) 检查持仓变化 2) 检查市场波动 3) 评估风险敞口"
+
+      # 7. 数据库慢查询增多
+      - alert: DatabaseSlowQueries
+        expr: rate(pg_stat_statements_calls{query=~".*"}[5m]) > 10
+        for: 5m
+        labels:
+          severity: high
+          service: infrastructure
+          category: database
+        annotations:
+          summary: "⚠️ 数据库慢查询增多"
+          description: "慢查询速率: {{ $value | humanize }}/s"
+          runbook: "1) 检查慢查询日志 2) 分析查询计划 3) 考虑添加索引"
+
+      # 8. 服务内存使用率高
+      - alert: HighMemoryUsage
+        expr: |
+          (
+            (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) 
+            / node_memory_MemTotal_bytes
+          ) * 100 > 85
+        for: 10m
+        labels:
+          severity: high
+          service: infrastructure
+          category: resources
+        annotations:
+          summary: "⚠️ 内存使用率高"
+          description: "内存使用率: {{ $value | humanize }}%"
+          runbook: "1) 检查内存占用最高的进程 2) 检查是否有内存泄漏 3) 考虑优化或扩容"
+
+      # 9. VIX高位
+      - alert: HighVIXLevel
+        expr: risk_vix_last > 30
+        for: 5m
+        labels:
+          severity: high
+          service: risk_svc
+          category: market
+        annotations:
+          summary: "⚠️ VIX处于高位"
+          description: "当前VIX: {{ $value | humanize }}，市场波动性极高"
+          runbook: "1) 考虑降低仓位 2) 收紧风控参数 3) 密切监控持仓"
+
+      # 10. 期权链获取失败率高
+      - alert: OptionChainFetchFailures
+        expr: rate(option_chain_fetch_failures_total[5m]) > 0.2
+        for: 5m
+        labels:
+          severity: high
+          service: exec_svc
+          category: data
+        annotations:
+          summary: "⚠️ 期权链获取失败率高"
+          description: "失败率: {{ $value | humanize }}/s"
+          runbook: "1) 检查IBKR连接 2) 检查请求频率限制 3) 查看失败原因"
+
+      # 11. 信号生成停滞
+      - alert: SignalGenerationStalled
+        expr: rate(signals_emitted_total[10m]) == 0 and hour() >= 9 and hour() < 16
+        for: 10m
+        labels:
+          severity: high
+          service: signal_svc
+          category: business_logic
+        annotations:
+          summary: "⚠️ 信号生成停滞"
+          description: "过去10分钟未生成任何信号"
+          runbook: "1) 检查signal_svc状态 2) 检查数据输入 3) 检查选股条件"
+
+      # 12. 持仓数接近上限
+      - alert: PositionLimitApproaching
+        expr: risk_position_count >= 12 and risk_limit_usage_pct{limit_type="max_positions"} > 80
+        for: 5m
+        labels:
+          severity: high
+          service: risk_svc
+          category: risk
+        annotations:
+          summary: "⚠️ 持仓数接近上限"
+          description: "当前持仓: {{ $value }}，接近最大限额15"
+          runbook: "1) 评估是否需要清理低质量持仓 2) 收紧入场条件"
+
+      # 13. 数据库连接池使用率高
+      - alert: DatabaseConnectionPoolHigh
+        expr: sum(pg_stat_activity_count) / pg_settings_max_connections * 100 > 80
+        for: 10m
+        labels:
+          severity: high
+          service: infrastructure
+          category: database
+        annotations:
+          summary: "⚠️ 数据库连接池使用率高"
+          description: "连接池使用率: {{ $value | humanize }}%"
+          runbook: "1) 检查是否有连接泄漏 2) 优化连接使用 3) 考虑增加连接数上限"
+
+      # 14. CPU使用率持续过高
+      - alert: HighCPUUsage
+        expr: |
+          100 - (
+            avg by (instance) (
+              irate(node_cpu_seconds_total{mode="idle"}[5m])
+            ) * 100
+          ) > 80
+        for: 15m
+        labels:
+          severity: high
+          service: infrastructure
+          category: resources
+        annotations:
+          summary: "⚠️ CPU使用率持续过高"
+          description: "CPU使用率: {{ $value | humanize }}%"
+          runbook: "1) 检查CPU占用最高的进程 2) 检查是否有死循环 3) 考虑优化或扩容"
+
+
+
+
+

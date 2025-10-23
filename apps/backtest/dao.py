@@ -21,13 +21,23 @@ _EQ_INDICATOR_COLUMNS = [
     "rsi6",
     "rsi12",
     "rsi24",
+    "boll_mid",
+    "boll_up",
+    "boll_dn",
     "atr14",
     "ao",
     "stoch_k",
     "stoch_d",
+    "stoch_rsi_k",
+    "stoch_rsi_d",
     "cci14",
     "cci6",
+    "sma5",
+    "lr_m5_slope",
+    "lr_boll_dn_slope",
+    "lr_obv_slope",
     "obv",
+    "obv_ma6",
     "obv_ema20",
     "mfi14",
     "rvol6",
@@ -46,13 +56,23 @@ class EquityBarRow:
     rsi6: Decimal | None = None
     rsi12: Decimal | None = None
     rsi24: Decimal | None = None
+    boll_mid: Decimal | None = None
+    boll_up: Decimal | None = None
+    boll_dn: Decimal | None = None
     atr14: Decimal | None = None
     ao: Decimal | None = None
     stoch_k: Decimal | None = None
     stoch_d: Decimal | None = None
+    stoch_rsi_k: Decimal | None = None
+    stoch_rsi_d: Decimal | None = None
     cci14: Decimal | None = None
     cci6: Decimal | None = None
+    sma5: Decimal | None = None
+    lr_m5_slope: Decimal | None = None
+    lr_boll_dn_slope: Decimal | None = None
+    lr_obv_slope: Decimal | None = None
     obv: Decimal | None = None
+    obv_ma6: Decimal | None = None
     obv_ema20: Decimal | None = None
     mfi14: Decimal | None = None
     rvol6: Decimal | None = None
@@ -207,10 +227,14 @@ def _to_bool_or_none(value: Any) -> bool | None:
 
 
 def _ensure_datetime(value: Any) -> datetime:
+    from libs.core import EASTERN
     if isinstance(value, datetime):
+        # 如果是naive datetime，假定为东部时间
+        if value.tzinfo is None:
+            return value.replace(tzinfo=EASTERN)
         return value
     if isinstance(value, date):
-        return datetime.combine(value, datetime.min.time())
+        return datetime.combine(value, datetime.min.time(), tzinfo=EASTERN)
     raise TypeError(f"Expected datetime-compatible value, got {type(value)!r}")
 
 
@@ -280,6 +304,21 @@ class BacktestDAO:
     # Reads
     # ------------------------------------------------------------------
     def fetch_equity_bars(self, *, symbol: str, start_ts, end_ts) -> list[EquityBarRow]:
+        from datetime import timezone as tz
+        from libs.core import EASTERN
+        
+        # 确保start_ts和end_ts都带时区信息
+        if isinstance(start_ts, datetime) and start_ts.tzinfo is None:
+            start_ts = start_ts.replace(tzinfo=EASTERN)
+        if isinstance(end_ts, datetime) and end_ts.tzinfo is None:
+            end_ts = end_ts.replace(tzinfo=EASTERN)
+        
+        # 转换为UTC进行查询（因为数据库实际存的是UTC）
+        if isinstance(start_ts, datetime) and start_ts.tzinfo is not None:
+            start_ts = start_ts.astimezone(tz.utc)
+        if isinstance(end_ts, datetime) and end_ts.tzinfo is not None:
+            end_ts = end_ts.astimezone(tz.utc)
+        
         sql = text(self._sql("select_equity_bars"))
         result = self._session.execute(
             sql,
@@ -291,6 +330,21 @@ class BacktestDAO:
     def fetch_option_bars_by_conid(
         self, *, conid: int, start_ts, end_ts
     ) -> list[OptionBarRow]:
+        from datetime import timezone as tz
+        from libs.core import EASTERN
+        
+        # 确保start_ts和end_ts都带时区信息
+        if isinstance(start_ts, datetime) and start_ts.tzinfo is None:
+            start_ts = start_ts.replace(tzinfo=EASTERN)
+        if isinstance(end_ts, datetime) and end_ts.tzinfo is None:
+            end_ts = end_ts.replace(tzinfo=EASTERN)
+        
+        # 转换为UTC进行查询
+        if isinstance(start_ts, datetime) and start_ts.tzinfo is not None:
+            start_ts = start_ts.astimezone(tz.utc)
+        if isinstance(end_ts, datetime) and end_ts.tzinfo is not None:
+            end_ts = end_ts.astimezone(tz.utc)
+        
         sql = text(self._sql("select_option_bars"))
         result = self._session.execute(
             sql,
@@ -309,6 +363,21 @@ class BacktestDAO:
         start_ts,
         end_ts,
     ) -> list[OptionBarRow]:
+        from datetime import timezone as tz
+        from libs.core import EASTERN
+        
+        # 确保start_ts和end_ts都带时区信息
+        if isinstance(start_ts, datetime) and start_ts.tzinfo is None:
+            start_ts = start_ts.replace(tzinfo=EASTERN)
+        if isinstance(end_ts, datetime) and end_ts.tzinfo is None:
+            end_ts = end_ts.replace(tzinfo=EASTERN)
+        
+        # 转换为UTC进行查询
+        if isinstance(start_ts, datetime) and start_ts.tzinfo is not None:
+            start_ts = start_ts.astimezone(tz.utc)
+        if isinstance(end_ts, datetime) and end_ts.tzinfo is not None:
+            end_ts = end_ts.astimezone(tz.utc)
+        
         sql = text(self._sql("select_option_bars_by_attributes"))
         result = self._session.execute(
             sql,
@@ -660,13 +729,23 @@ class BacktestDAO:
             rsi6=_to_decimal_or_none(row.get("rsi6")),
             rsi12=_to_decimal_or_none(row.get("rsi12")),
             rsi24=_to_decimal_or_none(row.get("rsi24")),
+            boll_mid=_to_decimal_or_none(row.get("boll_mid")),
+            boll_up=_to_decimal_or_none(row.get("boll_up")),
+            boll_dn=_to_decimal_or_none(row.get("boll_dn")),
             atr14=_to_decimal_or_none(row.get("atr14")),
             ao=_to_decimal_or_none(row.get("ao")),
             stoch_k=_to_decimal_or_none(row.get("stoch_k")),
             stoch_d=_to_decimal_or_none(row.get("stoch_d")),
+            stoch_rsi_k=_to_decimal_or_none(row.get("stoch_rsi_k")),
+            stoch_rsi_d=_to_decimal_or_none(row.get("stoch_rsi_d")),
             cci14=_to_decimal_or_none(row.get("cci14")),
             cci6=_to_decimal_or_none(row.get("cci6")),
+            sma5=_to_decimal_or_none(row.get("sma5")),
+            lr_m5_slope=_to_decimal_or_none(row.get("lr_m5_slope")),
+            lr_boll_dn_slope=_to_decimal_or_none(row.get("lr_boll_dn_slope")),
+            lr_obv_slope=_to_decimal_or_none(row.get("lr_obv_slope")),
             obv=_to_decimal_or_none(row.get("obv")),
+            obv_ma6=_to_decimal_or_none(row.get("obv_ma6")),
             obv_ema20=_to_decimal_or_none(row.get("obv_ema20")),
             mfi14=_to_decimal_or_none(row.get("mfi14")),
             rvol6=_to_decimal_or_none(row.get("rvol6")),
@@ -853,7 +932,11 @@ class BacktestDAO:
 
     def record_signal(self, payload: Mapping[str, Any]) -> None:
         sql = text(self._sql("insert_bt_signal"))
-        self._session.execute(sql, payload)
+        values = dict(payload)
+        reason = values.get("reason")
+        if isinstance(reason, (dict, list)):
+            values["reason"] = json.dumps(reason, default=_json_default)
+        self._session.execute(sql, values)
 
     def record_metrics_daily(self, rows: Iterable[Mapping[str, Any]]) -> None:
         sql = text(self._sql("insert_bt_metric_daily"))

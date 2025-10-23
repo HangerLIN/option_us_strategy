@@ -20,6 +20,14 @@ class MetricsResult:
 class MetricsWriter(bt.Analyzer):
     params = dict(dao=None, run_id=None)
 
+    _SPECIAL_SIGNALS = [
+        "AM_BOTTOM_A1",
+        "AM_SELL_C1",
+        "AM_CONFLUENCE_BUY_A2",
+        "AM_CONFLUENCE_SELL_S2",
+    ]
+    _RET_SUFFIXES = ["TFE_MEAN", "TFE_P50", "TFE_P90"]
+
     def __init__(self) -> None:
         if self.p.dao is None or self.p.run_id is None:
             raise ValueError("MetricsWriter requires dao and run_id parameters")
@@ -76,6 +84,16 @@ class MetricsWriter(bt.Analyzer):
             total_metrics.append(
                 {"run_id": self.run_id, "metric_code": "max_drawdown", "metric_value": max_drawdown}
             )
+
+        existing_codes = {entry["metric_code"] for entry in total_metrics}
+        for signal in self._SPECIAL_SIGNALS:
+            for suffix in self._RET_SUFFIXES:
+                metric_code = f"RET_SIG_{signal}_{suffix}"
+                if metric_code not in existing_codes:
+                    total_metrics.append(
+                        {"run_id": self.run_id, "metric_code": metric_code, "metric_value": 0.0}
+                    )
+                    existing_codes.add(metric_code)
 
         self.dao.record_metrics_total(total_metrics)
 

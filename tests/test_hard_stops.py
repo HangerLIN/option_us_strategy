@@ -11,13 +11,47 @@ from sqlalchemy.orm import Session, sessionmaker
 from apps.risk_svc.rules.hard_stops import HardStopRules
 from libs.db import Base
 from libs.db.models import RiskEvent, StrategyPosition
+from libs.schemas.risk import (
+    RiskLimits,
+    AmBottomLimits,
+    AmSell1Limits,
+    AmConfluenceLimits,
+    AmConfluenceBuyLimits,
+    AmConfluenceSellLimits,
+    OvernightLimits,
+    OvernightBandwidthLimits,
+    OvernightReboundLimits,
+    GateLimits,
+    GateVixLimits,
+)
 
 
 class StubRiskService:
     stop_loss_pct = Decimal("0.08")
     cutoff_open_chase = time_cls(14, 0)
     cutoff_overnight = time_cls(12, 0)
-    iv_overnight_cap = Decimal("1.10")
+    iv_overnight_cap = Decimal("1.0")
+    vix_gate = Decimal("20")
+    vix_gate_mode = "enforce"
+
+    def current_limits(self) -> RiskLimits:
+        updated = datetime.now(timezone.utc)
+        return RiskLimits(
+            notional_cap=Decimal("5000000"),
+            updated_at=updated,
+            am_bottom=AmBottomLimits(),
+            am_sell1=AmSell1Limits(),
+            am_conf=AmConfluenceLimits(
+                buy=AmConfluenceBuyLimits(),
+                sell=AmConfluenceSellLimits(),
+            ),
+            overnight=OvernightLimits(
+                iv_max=float(self.iv_overnight_cap),
+                bw=OvernightBandwidthLimits(),
+                rebound=OvernightReboundLimits(),
+            ),
+            gate=GateLimits(vix=GateVixLimits(mode=self.vix_gate_mode, thresh=self.vix_gate)),
+        )
 
 
 class StubRedisBus:
@@ -41,7 +75,26 @@ def hard_stop_env() -> Iterable[Tuple[Session, HardStopRules, StubRedisBus]]:
             CREATE TABLE indicators_eq_1m (
                 symbol TEXT NOT NULL,
                 ts_end TIMESTAMP NOT NULL,
-                atr14 NUMERIC
+                atr14 NUMERIC,
+                boll_mid NUMERIC,
+                boll_up NUMERIC,
+                boll_dn NUMERIC,
+                ao NUMERIC,
+                stoch_k NUMERIC,
+                stoch_d NUMERIC,
+                stoch_rsi_k NUMERIC,
+                stoch_rsi_d NUMERIC,
+                cci14 NUMERIC,
+                cci6 NUMERIC,
+                sma5 NUMERIC,
+                lr_m5_slope NUMERIC,
+                lr_boll_dn_slope NUMERIC,
+                lr_obv_slope NUMERIC,
+                obv NUMERIC,
+                obv_ma6 NUMERIC,
+                obv_ema20 NUMERIC,
+                mfi14 NUMERIC,
+                rvol6 NUMERIC
             )
             """
         )
@@ -141,6 +194,30 @@ async def test_atr_delta_tighter_triggers_force_close(
     events = session.execute(select(RiskEvent)).scalars().all()
     assert any(event.event_code == "ATR_DELTA" for event in events)
     assert any(payload["reason"] == "ATR_DELTA" for _, payload, _ in bus.published)
+
+
+@pytest.mark.asyncio
+async def test_overnight_rejects_vix_gate(
+    hard_stop_env: Tuple[Session, HardStopRules, StubRedisBus], monkeypatch
+) -> None:
+    session, rules, bus = hard_stop_env
+    position = _add_position(
+        session,
+        symbol="AAPL",
+        option_right="CALL",
+        avg_price=Decimal("2"),
+        mark_price=Decimal("2.1"),
+        opened_at=datetime(2025, 1, 2, 14, 30, tzinfo=timezone.utc),
+    )
+    ts_end = datetime(2025, 1, 2, 19, 55, tzinfo=timezone.utc)  # 14:55 ET
+
+    monkeypatch.setattr(rules, "_current_vix_value", lambda session: Decimal("35"))
+
+    await rules._evaluate_overnight(session, ts_end, [position], trace_id="test-overnight")
+
+    events = session.execute(select(RiskEvent)).scalars().all()
+    assert any(event.event_code == "OVERNIGHT_REJECT_VIX" for event in events)
+    assert any(evt[0] == "force_close" for evt in bus.published)
 
 
 @pytest.mark.asyncio

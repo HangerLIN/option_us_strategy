@@ -75,7 +75,10 @@ def _normalise(entry: Mapping[str, object]) -> Mapping[str, object]:
     raw_value = data.pop("value", data.pop("limit_value", None))
     if raw_value is None:
         raise ValueError(f"{key_str} 缺少 value")
-    value_str = str(raw_value)
+    if isinstance(raw_value, (dict, list, bool)):
+        value_str = json.dumps(raw_value, default=str)
+    else:
+        value_str = str(raw_value)
 
     symbol = data.pop("symbol", None)
     bucket = data.pop("bucket", None)

@@ -1,0 +1,541 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "PostgreSQL"
+      },hi
+      "description": "最近完成的回测运行记录",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "状态"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "options": {
+                      "COMPLETED": {
+                        "color": "green",
+                        "index": 0,
+                        "text": "✅ 完成"
+                      },
+                      "FAILED": {
+                        "color": "red",
+                        "index": 1,
+                        "text": "❌ 失败"
+                      },
+                      "RUNNING": {
+                        "color": "yellow",
+                        "index": 2,
+                        "text": "⏳ 运行中"
+                      }
+                    },
+                    "type": "value"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": ["sum"],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": []
+      },
+      "pluginVersion": "12.2.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "PostgreSQL"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT \n  run_id as \"回测ID\",\n  strategy_code as \"策略\",\n  parameters->>'symbol' as \"股票\",\n  status as \"状态\",\n  TO_CHAR(started_at, 'YYYY-MM-DD HH24:MI') as \"开始时间\",\n  TO_CHAR(completed_at, 'YYYY-MM-DD HH24:MI') as \"完成时间\",\n  EXTRACT(EPOCH FROM (completed_at - started_at)) as \"耗时(秒)\"\nFROM bt_runs\nWHERE status = 'COMPLETED'\nORDER BY run_id DESC\nLIMIT 20;",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "📊 最近完成的回测记录",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "PostgreSQL"
+      },
+      "description": "Run #126 (TSLA) 的详细回测指标",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "值"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 6
+              },
+              {
+                "id": "custom.width",
+                "value": 150
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "id": 2,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": ["sum"],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "12.2.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "PostgreSQL"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT \n  metric_code as \"指标名称\", \n  ROUND(metric_value::numeric, 6) as \"值\",\n  CASE \n    WHEN metric_code LIKE 'RET_%' THEN ROUND(metric_value::numeric * 100, 2) || '%'\n    WHEN metric_code LIKE 'HIT_%' THEN ROUND(metric_value::numeric * 100, 0) || '%'\n    ELSE ROUND(metric_value::numeric, 2)::text\n  END as \"格式化\"\nFROM bt_metrics_total\nWHERE run_id = 126\nORDER BY metric_code;",
+          "refId": "A"
+        }
+      ],
+      "title": "📈 Run #126 (TSLA) - 详细指标",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "PostgreSQL"
+      },
+      "description": "所有回测的60分钟收益率对比",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "color-background"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0
+              },
+              {
+                "color": "green",
+                "value": 0.001
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "id": 3,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": ["sum"],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "收益率(%)"
+          }
+        ]
+      },
+      "pluginVersion": "12.2.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "PostgreSQL"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT \n  r.run_id as \"Run ID\",\n  r.parameters->>'symbol' as \"股票\",\n  ROUND(m.metric_value::numeric * 100, 2) as \"收益率(%)\",\n  TO_CHAR(r.started_at, 'MM-DD HH24:MI') as \"执行时间\"\nFROM bt_runs r\nJOIN bt_metrics_total m ON r.run_id = m.run_id\nWHERE m.metric_code = 'RET_SIG_OPEN_CHASE_BUY_60M'\n  AND r.status = 'COMPLETED'\nORDER BY m.metric_value DESC\nLIMIT 20;",
+          "refId": "A"
+        }
+      ],
+      "title": "🏆 回测收益排行榜 (60分钟)",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "PostgreSQL"
+      },
+      "description": "回测收益率时间序列",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "收益率",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 8,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "always",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 19
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max", "min"],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "PostgreSQL"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT \n  r.started_at as time,\n  r.parameters->>'symbol' as metric,\n  m.metric_value as value\nFROM bt_runs r\nJOIN bt_metrics_total m ON r.run_id = m.run_id\nWHERE m.metric_code = 'RET_SIG_OPEN_CHASE_BUY_60M'\n  AND r.status = 'COMPLETED'\nORDER BY time;",
+          "refId": "A"
+        }
+      ],
+      "title": "📈 回测收益趋势图 (60分钟持有)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "PostgreSQL"
+      },
+      "description": "信号命中率统计",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
+                "color": "green",
+                "value": 0.8
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 28
+      },
+      "id": 5,
+      "options": {
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true,
+        "sizing": "auto"
+      },
+      "pluginVersion": "12.2.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "PostgreSQL"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT \n  '5分钟' as metric,\n  AVG(metric_value) as value\nFROM bt_metrics_total\nWHERE metric_code = 'HIT_SIG_OPEN_CHASE_BUY_5M'\n  AND run_id IN (SELECT run_id FROM bt_runs WHERE status = 'COMPLETED' ORDER BY run_id DESC LIMIT 10)\nUNION ALL\nSELECT \n  '15分钟' as metric,\n  AVG(metric_value) as value\nFROM bt_metrics_total\nWHERE metric_code = 'HIT_SIG_OPEN_CHASE_BUY_15M'\n  AND run_id IN (SELECT run_id FROM bt_runs WHERE status = 'COMPLETED' ORDER BY run_id DESC LIMIT 10)\nUNION ALL\nSELECT \n  '60分钟' as metric,\n  AVG(metric_value) as value\nFROM bt_metrics_total\nWHERE metric_code = 'HIT_SIG_OPEN_CHASE_BUY_60M'\n  AND run_id IN (SELECT run_id FROM bt_runs WHERE status = 'COMPLETED' ORDER BY run_id DESC LIMIT 10);",
+          "refId": "A"
+        }
+      ],
+      "title": "🎯 平均信号命中率 (最近10次回测)",
+      "type": "gauge"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "PostgreSQL"
+      },
+      "description": "不同持有时长的平均收益对比",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "mappings": [],
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 28
+      },
+      "id": 6,
+      "options": {
+        "displayLabels": ["name", "percent"],
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "values": ["value", "percent"]
+        },
+        "pieType": "donut",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.2.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "PostgreSQL"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT \n  '5分钟' as metric,\n  AVG(metric_value) as value\nFROM bt_metrics_total\nWHERE metric_code = 'RET_SIG_OPEN_CHASE_BUY_5M'\n  AND run_id IN (SELECT run_id FROM bt_runs WHERE status = 'COMPLETED' ORDER BY run_id DESC LIMIT 10)\nUNION ALL\nSELECT \n  '15分钟' as metric,\n  AVG(metric_value) as value\nFROM bt_metrics_total\nWHERE metric_code = 'RET_SIG_OPEN_CHASE_BUY_15M'\n  AND run_id IN (SELECT run_id FROM bt_runs WHERE status = 'COMPLETED' ORDER BY run_id DESC LIMIT 10)\nUNION ALL\nSELECT \n  '30分钟' as metric,\n  AVG(metric_value) as value\nFROM bt_metrics_total\nWHERE metric_code = 'RET_SIG_OPEN_CHASE_BUY_30M'\n  AND run_id IN (SELECT run_id FROM bt_runs WHERE status = 'COMPLETED' ORDER BY run_id DESC LIMIT 10)\nUNION ALL\nSELECT \n  '60分钟' as metric,\n  AVG(metric_value) as value\nFROM bt_metrics_total\nWHERE metric_code = 'RET_SIG_OPEN_CHASE_BUY_60M'\n  AND run_id IN (SELECT run_id FROM bt_runs WHERE status = 'COMPLETED' ORDER BY run_id DESC LIMIT 10);",
+          "refId": "A"
+        }
+      ],
+      "title": "⏱️ 不同持有时长的平均收益 (最近10次)",
+      "type": "piechart"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["backtest", "真实数据"],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-30d",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "回测数据看板 - 真实结果",
+  "uid": "backtest_real_data",
+  "version": 1,
+  "weekStart": ""
+}
+
+
+
+
+

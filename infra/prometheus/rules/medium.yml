@@ -1,0 +1,228 @@
+groups:
+  - name: medium_priority_alerts
+    interval: 30s
+    rules:
+      # ============================================================
+      # P2 - Medium 告警
+      # ============================================================
+
+      # 1. 信号过滤率高
+      - alert: HighSignalFilterRate
+        expr: |
+          sum(rate(signals_filtered_total[10m])) 
+          / 
+          (sum(rate(signals_emitted_total[10m])) + sum(rate(signals_filtered_total[10m]))) 
+          > 0.7
+        for: 10m
+        labels:
+          severity: medium
+          service: signal_svc
+          category: business_logic
+        annotations:
+          summary: "信号过滤率偏高"
+          description: "70%以上的候选信号被过滤，当前: {{ $value | humanizePercentage }}"
+          runbook: "1) 检查过滤条件是否过严 2) 分析过滤原因分布"
+
+      # 2. 指标计算失败
+      - alert: IndicatorCalculationFailures
+        expr: rate(rt_indicator_failures_total[10m]) > 0.1
+        for: 10m
+        labels:
+          severity: medium
+          service: rt_engine
+          category: data_quality
+        annotations:
+          summary: "指标计算频繁失败"
+          description: "指标{{ $labels.indicator }}失败率: {{ $value | humanize }}/s"
+          runbook: "1) 检查数据完整性 2) 检查计算逻辑 3) 查看失败原因"
+
+      # 3. Top5选股失败
+      - alert: Top5SelectionFailures
+        expr: increase(rt_top5_selection_failures_total[15m]) > 2
+        for: 0s
+        labels:
+          severity: medium
+          service: rt_engine
+          category: business_logic
+        annotations:
+          summary: "Top5选股失败"
+          description: "最近15分钟失败{{ $value }}次"
+          runbook: "1) 检查选股条件 2) 检查数据可用性 3) 查看rt_engine日志"
+
+      # 4. WebSocket推送失败
+      - alert: WebSocketPushFailures
+        expr: rate(signals_websocket_push_failures_total[10m]) > 0.1
+        for: 10m
+        labels:
+          severity: medium
+          service: signal_svc
+          category: connectivity
+        annotations:
+          summary: "WebSocket推送失败"
+          description: "推送失败率: {{ $value | humanize }}/s"
+          runbook: "1) 检查客户端连接状态 2) 检查网络连接"
+
+      # 5. 订单超时
+      - alert: OrderTimeouts
+        expr: rate(orders_timeout_total[10m]) > 0.05
+        for: 10m
+        labels:
+          severity: medium
+          service: exec_svc
+          category: execution
+        annotations:
+          summary: "订单超时频繁发生"
+          description: "超时类型: {{ $labels.timeout_type }}，速率: {{ $value | humanize }}/s"
+          runbook: "1) 检查IBKR响应速度 2) 调整超时阈值 3) 检查网络状况"
+
+      # 6. 未找到合适期权合约
+      - alert: NoSuitableOptionContract
+        expr: rate(option_no_suitable_contract_total[15m]) > 0.1
+        for: 15m
+        labels:
+          severity: medium
+          service: exec_svc
+          category: execution
+        annotations:
+          summary: "频繁找不到合适期权合约"
+          description: "发生率: {{ $value | humanize }}/s"
+          runbook: "1) 检查Delta目标是否合理 2) 检查期权链数据质量 3) 考虑放宽选择条件"
+
+      # 7. 磁盘空间告警
+      - alert: DiskSpaceLow
+        expr: |
+          (
+            node_filesystem_avail_bytes{mountpoint="/"} 
+            / node_filesystem_size_bytes{mountpoint="/"}
+          ) * 100 < 20
+        for: 30m
+        labels:
+          severity: medium
+          service: infrastructure
+          category: storage
+        annotations:
+          summary: "磁盘空间不足"
+          description: "可用空间: {{ $value | humanize }}%"
+          runbook: "1) 清理日志文件 2) 清理旧数据 3) 考虑扩容"
+
+      # 8. 数据库缓存命中率低
+      - alert: LowDatabaseCacheHitRate
+        expr: |
+          (
+            sum(pg_stat_database_blks_hit) 
+            / (sum(pg_stat_database_blks_hit) + sum(pg_stat_database_blks_read))
+          ) < 0.90
+        for: 30m
+        labels:
+          severity: medium
+          service: infrastructure
+          category: database
+        annotations:
+          summary: "数据库缓存命中率低"
+          description: "缓存命中率: {{ $value | humanizePercentage }}"
+          runbook: "1) 考虑增加shared_buffers 2) 优化查询 3) 检查工作负载"
+
+      # 9. Redis内存使用率高
+      - alert: RedisMemoryHigh
+        expr: redis_memory_used_bytes / redis_memory_max_bytes * 100 > 80
+        for: 30m
+        labels:
+          severity: medium
+          service: infrastructure
+          category: memory
+        annotations:
+          summary: "Redis内存使用率高"
+          description: "内存使用率: {{ $value | humanize }}%"
+          runbook: "1) 检查是否有内存泄漏 2) 清理过期数据 3) 考虑调整maxmemory-policy"
+
+      # 10. 订单执行延迟增加
+      - alert: OrderExecutionLatencyIncreased
+        expr: |
+          histogram_quantile(0.95, 
+            rate(order_execution_latency_seconds_bucket{stage="signal_to_submit"}[10m])
+          ) > 5
+        for: 10m
+        labels:
+          severity: medium
+          service: exec_svc
+          category: performance
+        annotations:
+          summary: "订单执行延迟增加"
+          description: "P95延迟: {{ $value | humanize }}s"
+          runbook: "1) 检查系统负载 2) 检查网络延迟 3) 优化处理逻辑"
+
+      # 11. 胜率下降
+      - alert: WinRateDeclining
+        expr: pnl_win_rate_pct < 40 and pnl_trades_count_today > 10
+        for: 30m
+        labels:
+          severity: medium
+          service: pnl_svc
+          category: performance
+        annotations:
+          summary: "胜率下降"
+          description: "当前胜率: {{ $value | humanize }}%"
+          runbook: "1) 分析失败交易原因 2) 评估策略有效性 3) 检查市场环境"
+
+      # 12. 平均持仓时长异常
+      - alert: AbnormalHoldingDuration
+        expr: pnl_avg_holding_duration_minutes > 180 or pnl_avg_holding_duration_minutes < 5
+        for: 30m
+        labels:
+          severity: medium
+          service: pnl_svc
+          category: business_logic
+        annotations:
+          summary: "平均持仓时长异常"
+          description: "当前平均持仓: {{ $value | humanize }}分钟"
+          runbook: "1) 检查出场逻辑 2) 检查止损/止盈设置"
+
+      # 13. Prometheus存储增长过快
+      - alert: PrometheusStorageGrowthHigh
+        expr: |
+          predict_linear(
+            prometheus_tsdb_storage_blocks_bytes[4h], 7 * 24 * 3600
+          ) > 50e9
+        for: 1h
+        labels:
+          severity: medium
+          service: monitoring
+          category: storage
+        annotations:
+          summary: "Prometheus存储增长过快"
+          description: "预计7天后将达到{{ $value | humanize1024 }}B"
+          runbook: "1) 调整retention 2) 减少不必要的指标 3) 增加存储空间"
+
+      # 14. 服务重启频繁
+      - alert: FrequentServiceRestarts
+        expr: changes(process_start_time_seconds[1h]) > 3
+        for: 0s
+        labels:
+          severity: medium
+          service: "{{ $labels.job }}"
+          category: stability
+        annotations:
+          summary: "服务频繁重启"
+          description: "服务{{ $labels.job }}在过去1小时重启{{ $value }}次"
+          runbook: "1) 检查服务日志 2) 检查是否有内存溢出 3) 检查依赖服务状态"
+
+      # 15. 指标计算延迟增加
+      - alert: IndicatorCalculationSlow
+        expr: |
+          histogram_quantile(0.95,
+            rate(rt_indicator_calculation_seconds_bucket[10m])
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: medium
+          service: rt_engine
+          category: performance
+        annotations:
+          summary: "指标计算延迟增加"
+          description: "指标{{ $labels.indicator }}的P95延迟: {{ $value | humanize }}s"
+          runbook: "1) 检查计算复杂度 2) 考虑优化算法 3) 检查数据量"
+
+
+
+
+

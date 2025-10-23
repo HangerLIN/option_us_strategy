@@ -1,0 +1,147 @@
+groups:
+  - name: critical_alerts
+    interval: 10s
+    rules:
+      # ============================================================
+      # P0 - Critical 告警
+      # ============================================================
+
+      # 1. Kill Switch激活
+      - alert: KillSwitchActivated
+        expr: risk_kill_switch_state == 1
+        for: 0s
+        labels:
+          severity: critical
+          service: risk_svc
+          category: risk
+        annotations:
+          summary: "🚨 紧急: Kill Switch已激活"
+          description: "风控Kill Switch已触发，所有交易已暂停。请立即检查风险状态。"
+          runbook: "检查risk_svc日志，确认触发原因（VIX/回撤/手动触发），评估是否可以解除"
+
+      # 2. 回撤超限
+      - alert: DrawdownExceeded
+        expr: risk_drawdown_r > 5
+        for: 1m
+        labels:
+          severity: critical
+          service: risk_svc
+          category: risk
+        annotations:
+          summary: "🚨 紧急: 回撤超过5R"
+          description: "当前回撤: {{ $value | humanize }}R，已达到风险上限，需要立即停止交易"
+          runbook: "1) 检查所有持仓 2) 评估是否需要手动强平 3) 暂停新订单"
+
+      # 3. IBKR连接断开
+      - alert: IBKRDisconnected
+        expr: rt_ibkr_connection_status == 0
+        for: 30s
+        labels:
+          severity: critical
+          service: rt_engine
+          category: connectivity
+        annotations:
+          summary: "🚨 紧急: IBKR连接断开"
+          description: "无法接收实时行情，交易已中断。请立即检查TWS/Gateway连接状态。"
+          runbook: "1) 检查TWS/Gateway是否运行 2) 检查网络连接 3) 查看rt_engine日志 4) 必要时重启服务"
+
+      # 4. 数据库连接失败
+      - alert: DatabaseDown
+        expr: up{job="postgres_exporter"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          service: infrastructure
+          category: database
+        annotations:
+          summary: "🚨 紧急: 数据库连接失败"
+          description: "TimescaleDB无法访问，所有服务将受影响"
+          runbook: "1) 检查数据库容器状态 2) 检查磁盘空间 3) 查看数据库日志"
+
+      # 5. Redis连接失败
+      - alert: RedisDown
+        expr: up{job="redis_exporter"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          service: infrastructure
+          category: message_queue
+        annotations:
+          summary: "🚨 紧急: Redis连接失败"
+          description: "消息队列不可用，事件流转已中断"
+          runbook: "1) 检查Redis容器状态 2) 检查内存使用 3) 查看Redis日志"
+
+      # 6. 核心服务Down
+      - alert: CoreServiceDown
+        expr: up{job=~"rt_engine|signal_svc|risk_svc|exec_svc"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: "{{ $labels.job }}"
+          category: service_health
+        annotations:
+          summary: "🚨 紧急: 核心服务{{ $labels.job }}宕机"
+          description: "服务{{ $labels.job }}已停止响应超过1分钟，交易链路已中断"
+          runbook: "1) 检查服务进程 2) 查看服务日志 3) 检查依赖服务状态 4) 尝试重启服务"
+
+      # 7. 账户权益异常下降
+      - alert: AccountEquityDrop
+        expr: (risk_account_equity_usd - risk_account_equity_usd offset 5m) / risk_account_equity_usd offset 5m < -0.05
+        for: 1m
+        labels:
+          severity: critical
+          service: risk_svc
+          category: financial
+        annotations:
+          summary: "🚨 紧急: 账户权益快速下降"
+          description: "5分钟内账户权益下降超过5%，当前权益: ${{ $value | humanize }}"
+          runbook: "1) 检查所有持仓的盈亏 2) 评估是否需要强平 3) 检查是否有异常交易"
+
+      # 8. 大量订单被拒绝
+      - alert: HighOrderRejectionRate
+        expr: |
+          (
+            sum(rate(orders_blocked_total[2m])) 
+            / 
+            (sum(rate(orders_submitted_total[2m])) > 0)
+          ) > 0.5
+        for: 2m
+        labels:
+          severity: critical
+          service: exec_svc
+          category: execution
+        annotations:
+          summary: "🚨 紧急: 订单拒绝率过高"
+          description: "过去2分钟订单拒绝率达到{{ $value | humanizePercentage }}，交易执行受阻"
+          runbook: "1) 检查风控限额 2) 检查IBKR账户状态 3) 查看exec_svc日志"
+
+      # 9. 极端延迟
+      - alert: ExtremeBarLatency
+        expr: histogram_quantile(0.95, rate(bars_latency_seconds_bucket[2m])) > 30
+        for: 2m
+        labels:
+          severity: critical
+          service: rt_engine
+          category: performance
+        annotations:
+          summary: "🚨 紧急: 数据延迟极端异常"
+          description: "P95延迟超过30秒 (当前: {{ $value | humanize }}s)，信号生成将严重滞后"
+          runbook: "1) 检查IBKR连接状态 2) 检查系统资源 3) 检查网络连接"
+
+      # 10. 资金使用率超限
+      - alert: CapitalUtilizationExceeded
+        expr: risk_capital_utilization_pct > 95
+        for: 2m
+        labels:
+          severity: critical
+          service: risk_svc
+          category: risk
+        annotations:
+          summary: "🚨 紧急: 资金使用率超限"
+          description: "资金使用率达到{{ $value | humanize }}%，已接近上限"
+          runbook: "1) 检查持仓明细 2) 评估是否需要减仓 3) 暂停新信号"
+
+
+
+
+

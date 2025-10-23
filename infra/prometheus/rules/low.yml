@@ -1,0 +1,217 @@
+groups:
+  - name: low_priority_alerts
+    interval: 60s
+    rules:
+      # ============================================================
+      # P3 - Low 告警 (信息性质，不需要立即响应)
+      # ============================================================
+
+      # 1. 交易日无交易
+      - alert: NoTradesExecutedToday
+        expr: pnl_trades_count_today == 0 and hour() > 12
+        for: 1h
+        labels:
+          severity: low
+          service: pnl_svc
+          category: business_activity
+        annotations:
+          summary: "今日尚无交易"
+          description: "已过12点但今日未执行任何交易"
+          runbook: "1) 检查市场是否开盘 2) 检查信号生成 3) 检查风控限制"
+
+      # 2. 订阅股票数量变化
+      - alert: SubscribedSymbolsChanged
+        expr: abs(delta(rt_subscribed_symbols_count[30m])) > 10
+        for: 5m
+        labels:
+          severity: low
+          service: rt_engine
+          category: configuration
+        annotations:
+          summary: "订阅股票数量变化"
+          description: "订阅数量变化: {{ $value }}"
+          runbook: "这是正常的Top5更新，仅供信息参考"
+
+      # 3. 信号生成速率异常低
+      - alert: LowSignalGenerationRate
+        expr: rate(signals_emitted_total[1h]) < 0.01 and hour() >= 10 and hour() < 15
+        for: 1h
+        labels:
+          severity: low
+          service: signal_svc
+          category: business_activity
+        annotations:
+          summary: "信号生成速率低"
+          description: "当前速率: {{ $value | humanize }}/s"
+          runbook: "1) 检查市场活跃度 2) 检查选股条件 3) 评估策略参数"
+
+      # 4. 缓存数据量异常
+      - alert: CachedBarsCountLow
+        expr: rt_cached_bars_count < 50
+        for: 30m
+        labels:
+          severity: low
+          service: rt_engine
+          category: data_quality
+        annotations:
+          summary: "缓存K线数据量偏少"
+          description: "{{ $labels.symbol }}缓存仅有{{ $value }}根K线"
+          runbook: "1) 检查数据采集 2) 检查缓存逻辑"
+
+      # 5. Tick数据接收速率低
+      - alert: LowTickReceptionRate
+        expr: rate(rt_ticks_received_total[10m]) < 0.1 and hour() >= 9 and hour() < 16
+        for: 15m
+        labels:
+          severity: low
+          service: rt_engine
+          category: data_quality
+        annotations:
+          summary: "Tick数据接收速率低"
+          description: "{{ $labels.symbol }}的Tick速率: {{ $value | humanize }}/s"
+          runbook: "1) 检查市场活跃度 2) 检查IBKR数据订阅"
+
+      # 6. Top5候选数量少
+      - alert: LowTop5Candidates
+        expr: rt_top5_candidates_count < 5 and hour() >= 9 and hour() < 16
+        for: 30m
+        labels:
+          severity: low
+          service: rt_engine
+          category: business_logic
+        annotations:
+          summary: "Top5候选股票数量少"
+          description: "仅有{{ $value }}只股票符合条件"
+          runbook: "1) 检查选股条件 2) 检查市场环境 3) 考虑放宽条件"
+
+      # 7. Delta偏差较大
+      - alert: HighDeltaDeviation
+        expr: histogram_quantile(0.90, rate(option_delta_deviation_bucket[30m])) > 0.1
+        for: 30m
+        labels:
+          severity: low
+          service: exec_svc
+          category: execution
+        annotations:
+          summary: "期权Delta偏差较大"
+          description: "P90偏差: {{ $value | humanize }}"
+          runbook: "1) 评估是否需要调整目标Delta 2) 检查期权链数据"
+
+      # 8. 日志文件增长较快
+      - alert: LogFileGrowthHigh
+        expr: |
+          predict_linear(
+            node_filesystem_size_bytes{mountpoint="/var/log"}[2h], 
+            24 * 3600
+          ) - node_filesystem_size_bytes{mountpoint="/var/log"} > 5e9
+        for: 2h
+        labels:
+          severity: low
+          service: infrastructure
+          category: storage
+        annotations:
+          summary: "日志文件增长较快"
+          description: "预计24小时增长{{ $value | humanize1024 }}B"
+          runbook: "1) 检查是否有错误日志大量输出 2) 考虑配置日志轮转"
+
+      # 9. Grafana查询延迟增加
+      - alert: GrafanaQuerySlow
+        expr: grafana_http_request_duration_seconds{quantile="0.95"} > 5
+        for: 30m
+        labels:
+          severity: low
+          service: monitoring
+          category: performance
+        annotations:
+          summary: "Grafana查询延迟增加"
+          description: "P95查询延迟: {{ $value | humanize }}s"
+          runbook: "1) 优化看板查询 2) 检查Prometheus性能 3) 考虑增加时间范围限制"
+
+      # 10. 告警规则评估延迟
+      - alert: AlertRuleEvaluationSlow
+        expr: prometheus_rule_group_last_duration_seconds > 30
+        for: 30m
+        labels:
+          severity: low
+          service: monitoring
+          category: performance
+        annotations:
+          summary: "告警规则评估延迟"
+          description: "规则组{{ $labels.rule_group }}评估耗时: {{ $value | humanize }}s"
+          runbook: "1) 简化规则查询 2) 增加评估间隔 3) 检查Prometheus负载"
+
+      # 11. Redis键数量增长
+      - alert: RedisKeyCountGrowing
+        expr: |
+          predict_linear(redis_db_keys[4h], 24 * 3600) 
+          - redis_db_keys > 10000
+        for: 2h
+        labels:
+          severity: low
+          service: infrastructure
+          category: data_management
+        annotations:
+          summary: "Redis键数量快速增长"
+          description: "预计24小时增长{{ $value }}个键"
+          runbook: "1) 检查是否有键泄漏 2) 配置过期策略 3) 清理无用数据"
+
+      # 12. 数据库事务提交延迟
+      - alert: DatabaseTransactionSlow
+        expr: rate(pg_stat_database_xact_commit[5m]) / rate(pg_stat_database_xact_commit[5m] offset 1h) < 0.7
+        for: 30m
+        labels:
+          severity: low
+          service: infrastructure
+          category: database
+        annotations:
+          summary: "数据库事务速率下降"
+          description: "相比1小时前下降{{ $value | humanizePercentage }}"
+          runbook: "1) 检查数据库负载 2) 检查是否有长事务 3) 分析慢查询"
+
+      # 13. 网络带宽使用率上升
+      - alert: NetworkBandwidthIncreased
+        expr: |
+          (
+            rate(node_network_transmit_bytes_total[10m]) 
+            + rate(node_network_receive_bytes_total[10m])
+          ) > 100e6
+        for: 30m
+        labels:
+          severity: low
+          service: infrastructure
+          category: network
+        annotations:
+          summary: "网络带宽使用率上升"
+          description: "当前速率: {{ $value | humanize1024 }}Bps"
+          runbook: "1) 检查网络流量来源 2) 评估是否正常"
+
+      # 14. 进程文件描述符使用率
+      - alert: HighFileDescriptorUsage
+        expr: process_open_fds / process_max_fds > 0.7
+        for: 1h
+        labels:
+          severity: low
+          service: "{{ $labels.job }}"
+          category: resources
+        annotations:
+          summary: "文件描述符使用率较高"
+          description: "{{ $labels.job }}使用率: {{ $value | humanizePercentage }}"
+          runbook: "1) 检查是否有文件泄漏 2) 考虑增加ulimit"
+
+      # 15. Prometheus数据块压缩延迟
+      - alert: PrometheusCompactionSlow
+        expr: prometheus_tsdb_compactions_total - prometheus_tsdb_compactions_total offset 4h < 1
+        for: 4h
+        labels:
+          severity: low
+          service: monitoring
+          category: maintenance
+        annotations:
+          summary: "Prometheus数据压缩延迟"
+          description: "过去4小时未进行数据压缩"
+          runbook: "1) 检查Prometheus状态 2) 检查磁盘IO 3) 评估是否需要手动压缩"
+
+
+
+
+

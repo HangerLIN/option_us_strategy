@@ -319,6 +319,12 @@ class OptionSignalStrategy(bt.Strategy):
                     self._pending_orders[new_order.ref] = managed
                     del self._pending_orders[ref]
                 else:
+                    self._record_block(
+                        managed.signal,
+                        managed.contract,
+                        managed.trace_id,
+                        "BLOCK:TTL_EXPIRED",
+                    )
                     del self._pending_orders[ref]
 
     def _resubmit(self, managed: ManagedOrder, price: Decimal) -> bt.Order:

@@ -1,0 +1,156 @@
+global:
+  resolve_timeout: 5m
+  # SMTP配置 (可选)
+  # smtp_smarthost: 'smtp.gmail.com:587'
+  # smtp_from: 'alerts@yourdomain.com'
+  # smtp_auth_username: 'your-email@gmail.com'
+  # smtp_auth_password: 'your-app-password'
+
+# 模板配置
+templates:
+  - '/etc/alertmanager/*.tmpl'
+
+# 告警路由
+route:
+  receiver: 'default'
+  group_by: ['alertname', 'service', 'severity']
+  group_wait: 10s        # 等待相同组的告警聚合
+  group_interval: 10s    # 相同组的告警发送间隔
+  repeat_interval: 12h   # 重复告警的间隔
+  
+  routes:
+    # Critical告警 - 立即通知所有渠道
+    - matchers:
+        - severity = "critical"
+      receiver: 'critical-alerts'
+      group_wait: 0s
+      repeat_interval: 5m
+      continue: false  # 不再匹配后续路由
+    
+    # High告警 - 快速通知
+    - matchers:
+        - severity = "high"
+      receiver: 'high-alerts'
+      group_wait: 30s
+      repeat_interval: 30m
+      continue: false
+    
+    # Medium告警 - 汇总通知
+    - matchers:
+        - severity = "medium"
+      receiver: 'medium-alerts'
+      group_interval: 5m
+      repeat_interval: 3h
+      continue: false
+    
+    # Low告警 - 低频通知
+    - matchers:
+        - severity = "low"
+      receiver: 'low-alerts'
+      group_interval: 10m
+      repeat_interval: 24h
+      continue: false
+
+# 抑制规则
+inhibit_rules:
+  # 服务Down时抑制该服务的其他告警
+  - source_matchers:
+      - alertname = "CoreServiceDown"
+    target_matchers:
+      - service != ""
+    equal: ['service']
+  
+  # 数据库Down时抑制数据库相关告警
+  - source_matchers:
+      - alertname = "DatabaseDown"
+    target_matchers:
+      - category = "database"
+  
+  # Redis Down时抑制Redis相关告警
+  - source_matchers:
+      - alertname = "RedisDown"
+    target_matchers:
+      - category = "message_queue"
+  
+  # Kill Switch激活时抑制订单相关告警
+  - source_matchers:
+      - alertname = "KillSwitchActivated"
+    target_matchers:
+      - alertname =~ "LowOrderConversionRate|HighOrderRejectionRate|OrderTimeouts"
+  
+  # IBKR断开时抑制数据相关告警
+  - source_matchers:
+      - alertname = "IBKRDisconnected"
+    target_matchers:
+      - alertname =~ "HighBarLatency|ExtremeBarLatency|LowTickReceptionRate"
+
+# 通知接收器
+receivers:
+  # 默认接收器
+  - name: 'default'
+    webhook_configs:
+      - url: 'http://host.docker.internal:5000/alerts/webhook'
+        send_resolved: true
+
+  # Critical级别告警
+  - name: 'critical-alerts'
+    # Webhook通知 (可以自己实现一个webhook服务)
+    webhook_configs:
+      - url: 'http://host.docker.internal:5000/alerts/critical'
+        send_resolved: true
+        http_config:
+          follow_redirects: true
+    
+    # 钉钉机器人 (需要配置token)
+    # webhook_configs:
+    #   - url: 'https://oapi.dingtalk.com/robot/send?access_token=YOUR_DINGTALK_TOKEN'
+    #     send_resolved: true
+    
+    # 企业微信 (需要配置)
+    # wechat_configs:
+    #   - corp_id: 'YOUR_CORP_ID'
+    #     to_party: '1'
+    #     agent_id: 'YOUR_AGENT_ID'
+    #     api_secret: 'YOUR_API_SECRET'
+    
+    # Email通知
+    # email_configs:
+    #   - to: 'oncall@yourdomain.com'
+    #     headers:
+    #       Subject: '🚨 Critical Alert: {{ .GroupLabels.alertname }}'
+
+  # High级别告警
+  - name: 'high-alerts'
+    webhook_configs:
+      - url: 'http://host.docker.internal:5000/alerts/high'
+        send_resolved: true
+    
+    # 钉钉通知
+    # webhook_configs:
+    #   - url: 'https://oapi.dingtalk.com/robot/send?access_token=YOUR_DINGTALK_TOKEN'
+
+  # Medium级别告警
+  - name: 'medium-alerts'
+    webhook_configs:
+      - url: 'http://host.docker.internal:5000/alerts/medium'
+        send_resolved: true
+
+  # Low级别告警
+  - name: 'low-alerts'
+    webhook_configs:
+      - url: 'http://host.docker.internal:5000/alerts/low'
+        send_resolved: true
+
+# 静默规则 (可选，用于维护期间)
+# silences:
+#   - matchers:
+#       - alertname =~ ".*"
+#     starts_at: '2025-10-22T00:00:00Z'
+#     ends_at: '2025-10-22T02:00:00Z'
+#     created_by: 'admin'
+#     comment: 'Scheduled maintenance'
+
+
+
+
+

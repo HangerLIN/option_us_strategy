@@ -1,15 +1,37 @@
 from __future__ import annotations
 
+import copy
+import json
+import logging
 from datetime import datetime, time
 from decimal import Decimal, InvalidOperation
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
+from pydantic import BaseModel, ValidationError
 
 from libs.core import get_settings, utc_now
 from libs.db.models import RiskLimit
-from libs.schemas.risk import RiskLimits
+from libs.schemas.risk import (
+    AmBottomLimits,
+    AmConfluenceLimits,
+    AmSell1Limits,
+    GateLimits,
+    GateVixLimits,
+    OvernightLimits,
+    RiskLimits,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+_STRUCTURED_KEYS = {
+    "AM_BOTTOM",
+    "AM_SELL1",
+    "AM_CONF",
+    "OVERNIGHT",
+    "GATE.VIX",
+}
 
 
 class LimitsCache:
@@ -21,7 +43,12 @@ class LimitsCache:
         self._global: Dict[str, Decimal] = {}
         self._bucket_limits: Dict[str, Dict[str, Decimal]] = {}
         self._symbol_limits: Dict[str, Dict[str, Decimal]] = {}
+        self._structured_global: Dict[str, Any] = {}
+        self._structured_bucket: Dict[str, Dict[str, Any]] = {}
+        self._structured_symbol: Dict[str, Dict[str, Any]] = {}
+        self._structured_defaults: Dict[str, Any] = {}
         self._updated_at: datetime = utc_now()
+        self._snapshot: RiskLimits | None = None
         self.reload()
 
     # ------------------------------------------------------------------
@@ -35,8 +62,12 @@ class LimitsCache:
             self._settings = get_settings()
 
         self._global = self._default_global_limits()
+        self._structured_defaults = self._default_structured_limits()
+        self._structured_global = copy.deepcopy(self._structured_defaults)
         self._bucket_limits.clear()
         self._symbol_limits.clear()
+        self._structured_bucket.clear()
+        self._structured_symbol.clear()
 
         session: Session = self._session_factory()
         now_utc = utc_now()
@@ -77,8 +108,40 @@ class LimitsCache:
                 continue
             seen.add(identity)
 
+            if self._is_structured_key(key_upper):
+                structured_value = self._parse_structured_value(value, key_upper)
+                if structured_value is None:
+                    LOGGER.warning(
+                        "limits_cache.invalid_structured_value",
+                        key=key_upper,
+                        scope=scope_key,
+                        value=value,
+                    )
+                    continue
+                target_struct: Dict[str, Any]
+                if scope_key == "global":
+                    target_struct = self._structured_global
+                elif scope_key == "symbol":
+                    if not symbol_key:
+                        continue
+                    target_struct = self._structured_symbol.setdefault(symbol_key, {})
+                elif scope_key == "symbol_bucket":
+                    if not bucket_key:
+                        continue
+                    target_struct = self._structured_bucket.setdefault(bucket_key, {})
+                else:
+                    continue
+                target_struct[key_upper] = structured_value
+                continue
+
             decimal_value = self._parse_decimal(value)
             if decimal_value is None:
+                LOGGER.warning(
+                    "limits_cache.invalid_decimal_value",
+                    key=key_upper,
+                    scope=scope_key,
+                    value=value,
+                )
                 continue
 
             if scope_key == "global":
@@ -92,11 +155,49 @@ class LimitsCache:
 
         self._updated_at = now_utc
 
-        return RiskLimits(
-            notional_cap=self.get_decimal(
-                None, "RISK_NOTIONAL_CAP", self._settings.risk_notional_cap
-            ),
-            updated_at=self._updated_at,
+        snapshot = self._build_snapshot()
+        self._snapshot = snapshot
+        return snapshot.model_copy(deep=True)
+
+    @property
+    def snapshot(self) -> RiskLimits:
+        if self._snapshot is None:
+            self._snapshot = self._build_snapshot()
+        return self._snapshot.model_copy(deep=True)
+
+    def am_bottom_limits(
+        self, *, symbol: Optional[str] = None, bucket: Optional[str] = None
+    ) -> AmBottomLimits:
+        return self._coerce_structured(
+            "AM_BOTTOM", AmBottomLimits, symbol=symbol, bucket=bucket
+        )
+
+    def am_sell1_limits(
+        self, *, symbol: Optional[str] = None, bucket: Optional[str] = None
+    ) -> AmSell1Limits:
+        return self._coerce_structured(
+            "AM_SELL1", AmSell1Limits, symbol=symbol, bucket=bucket
+        )
+
+    def am_confluence_limits(
+        self, *, symbol: Optional[str] = None, bucket: Optional[str] = None
+    ) -> AmConfluenceLimits:
+        return self._coerce_structured(
+            "AM_CONF", AmConfluenceLimits, symbol=symbol, bucket=bucket
+        )
+
+    def overnight_limits(
+        self, *, symbol: Optional[str] = None, bucket: Optional[str] = None
+    ) -> OvernightLimits:
+        return self._coerce_structured(
+            "OVERNIGHT", OvernightLimits, symbol=symbol, bucket=bucket
+        )
+
+    def gate_vix_limits(
+        self, *, symbol: Optional[str] = None, bucket: Optional[str] = None
+    ) -> GateVixLimits:
+        return self._coerce_structured(
+            "GATE.VIX", GateVixLimits, symbol=symbol, bucket=bucket
         )
 
     # ------------------------------------------------------------------
@@ -158,6 +259,121 @@ class LimitsCache:
             return start <= now_time < end
         # Window passes midnight
         return now_time >= start or now_time < end
+
+    # ------------------------------------------------------------------
+    def _build_snapshot(self) -> RiskLimits:
+        notional_cap = self.get_decimal(
+            None, "RISK_NOTIONAL_CAP", self._settings.risk_notional_cap
+        )
+        am_bottom = self._coerce_structured("AM_BOTTOM", AmBottomLimits)
+        am_sell1 = self._coerce_structured("AM_SELL1", AmSell1Limits)
+        am_conf = self._coerce_structured("AM_CONF", AmConfluenceLimits)
+        overnight = self._coerce_structured("OVERNIGHT", OvernightLimits)
+        gate_vix = self._coerce_structured("GATE.VIX", GateVixLimits)
+        return RiskLimits(
+            notional_cap=notional_cap,
+            updated_at=self._updated_at,
+            am_bottom=am_bottom,
+            am_sell1=am_sell1,
+            am_conf=am_conf,
+            overnight=overnight,
+            gate=GateLimits(vix=gate_vix),
+        )
+
+    def _coerce_structured(
+        self,
+        key: str,
+        model: type[BaseModel],
+        *,
+        symbol: Optional[str] = None,
+        bucket: Optional[str] = None,
+    ):
+        raw = self._structured_lookup(key, symbol=symbol, bucket=bucket)
+        if raw is None:
+            raw = self._structured_defaults.get(key.upper())
+        if raw is None:
+            raw = {}
+        try:
+            return model.model_validate(raw)
+        except ValidationError:
+            LOGGER.warning("limits_cache.validation_failed", key=key.upper(), payload=raw)
+            fallback = self._structured_defaults.get(key.upper(), {})
+            return model.model_validate(fallback)
+
+    def _structured_lookup(
+        self,
+        key: str,
+        *,
+        symbol: Optional[str] = None,
+        bucket: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        key_upper = key.upper()
+        if symbol:
+            symbol_data = self._structured_symbol.get(symbol.upper(), {}).get(key_upper)
+            if symbol_data is not None:
+                return copy.deepcopy(symbol_data)
+        if bucket:
+            bucket_data = self._structured_bucket.get(bucket.upper(), {}).get(key_upper)
+            if bucket_data is not None:
+                return copy.deepcopy(bucket_data)
+        base = self._structured_global.get(key_upper)
+        if base is None:
+            return None
+        return copy.deepcopy(base)
+
+    def _default_structured_limits(self) -> Dict[str, Any]:
+        return {
+            "AM_BOTTOM": {
+                "pivot_w": 3,
+                "neg_seq_min": 6,
+                "pos_seq_min": 3,
+                "allow_mid_filter": True,
+                "top_n": 3,
+                "cooldown_s": 600,
+            },
+            "AM_SELL1": {
+                "body_ratio_min": 0.6,
+                "range_mult_min": 1.5,
+                "consecutive": 2,
+            },
+            "AM_CONF": {
+                "buy": {"lookback_n": 5, "obv_slope_w": 5},
+                "sell": {"lookback_n": 5},
+                "cooldown_s": 600,
+            },
+            "OVERNIGHT": {
+                "iv_max": float(self._settings.iv_overnight_call_cap),
+                "bw": {"lookback": 120, "ma": 5, "ratio": 0.5, "hold_min": 10},
+                "rebound": {"max_pct": 0.005},
+            },
+            "GATE.VIX": {
+                "mode": self._settings.vix_gate_mode,
+                "thresh": str(self._settings.vix_gate),
+            },
+        }
+
+    @staticmethod
+    def _is_structured_key(key: str) -> bool:
+        return key in _STRUCTURED_KEYS
+
+    @staticmethod
+    def _parse_structured_value(value: object, key: str) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return None
+        if isinstance(value, Mapping):
+            return copy.deepcopy(dict(value))
+        raw_str = str(value).strip()
+        if not raw_str:
+            return None
+        try:
+            parsed = json.loads(raw_str)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            LOGGER.warning("limits_cache.json_parse_failed", key=key, raw=value)
+            return None
+        if not isinstance(parsed, Mapping):
+            LOGGER.warning("limits_cache.json_not_mapping", key=key, raw=parsed)
+            return None
+        return dict(parsed)
 
     # ------------------------------------------------------------------
     def _default_global_limits(self) -> Dict[str, Decimal]:

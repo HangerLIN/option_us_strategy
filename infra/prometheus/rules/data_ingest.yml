@@ -1,0 +1,225 @@
+groups:
+  - name: data_ingest_alerts
+    interval: 30s
+    rules:
+      # ============================================================
+      # Critical 级别告警
+      # ============================================================
+      
+      # IBKR 连接断开
+      - alert: DataIngestIBKRDisconnected
+        expr: data_ingest_ibkr_connected == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: data_ingest
+          service: ingest_equity_1m_ibkr
+        annotations:
+          summary: "🔴 IBKR连接断开"
+          description: "数据拉取进程失去IBKR连接，所有数据拉取已停止"
+          action: "检查IBKR Gateway是否运行，检查网络连接"
+      
+      # 任务失败
+      - alert: DataIngestTaskFailed
+        expr: data_ingest_task_status == 3
+        for: 30s
+        labels:
+          severity: critical
+          component: data_ingest
+          service: ingest_equity_1m_ibkr
+        annotations:
+          summary: "🔴 数据拉取任务失败"
+          description: "数据拉取任务异常终止，需要人工介入"
+          action: "查看日志 /tmp/ingest_data.log，检查错误原因"
+      
+      # ============================================================
+      # Warning 级别告警
+      # ============================================================
+      
+      # 任务卡住
+      - alert: DataIngestStalled
+        expr: |
+          (time() - data_ingest_task_start_timestamp) > 1800
+          and data_ingest_task_status == 1
+          and rate(data_ingest_bars_stored_total[5m]) == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: data_ingest
+          service: ingest_equity_1m_ibkr
+        annotations:
+          summary: "⚠️ 数据拉取任务可能卡住"
+          description: |
+            任务已运行{{ (time() - data_ingest_task_start_timestamp) | humanizeDuration }}
+            但最近5分钟无数据写入
+          action: "检查IBKR连接状态，查看进程CPU占用，检查数据库连接"
+      
+      # Pacing violations 频繁
+      - alert: DataIngestPacingViolations
+        expr: rate(data_ingest_ibkr_pacing_violations_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          component: data_ingest
+          service: ingest_equity_1m_ibkr
+        annotations:
+          summary: "⚠️ IBKR频率限制触发过多"
+          description: "最近5分钟内发生了{{ $value | humanize }}次/秒 pacing violations"
+          action: "增加请求延迟时间，或减小batch_size"
+      
+      # 指标计算失败率高
+      - alert: DataIngestIndicatorFailureRate
+        expr: |
+          (
+            sum(rate(data_ingest_indicators_failed_total[5m])) /
+            sum(rate(data_ingest_indicators_computed_total[5m]))
+          ) > 0.1
+        for: 3m
+        labels:
+          severity: warning
+          component: data_ingest
+          service: ingest_equity_1m_ibkr
+        annotations:
+          summary: "⚠️ 指标计算失败率过高"
+          description: "指标计算失败率达到{{ $value | humanizePercentage }}"
+          action: "检查数据库连接，检查K线数据完整性，查看indicator计算日志"
+      
+      # 股票失败过多
+      - alert: DataIngestSymbolFailures
+        expr: rate(data_ingest_symbols_failed_total[10m]) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          component: data_ingest
+          service: ingest_equity_1m_ibkr
+        annotations:
+          summary: "⚠️ 股票处理失败率过高"
+          description: "最近10分钟内{{ $value }}个股票/分钟失败"
+          action: "检查失败的股票列表，查看错误类型分布"
+      
+      # IBKR 错误率高
+      - alert: DataIngestIBKRErrorRate
+        expr: rate(data_ingest_ibkr_errors_total[5m]) > 1
+        for: 3m
+        labels:
+          severity: warning
+          component: data_ingest
+          service: ingest_equity_1m_ibkr
+        annotations:
+          summary: "⚠️ IBKR API错误率过高"
+          description: "最近5分钟内发生{{ $value }}个IBKR错误/秒"
+          action: "检查IBKR Gateway状态，查看错误代码分布"
+      
+      # 数据完整性：K线数不一致
+      - alert: DataIngestBarsCountMismatch
+        expr: |
+          (
+            sum(data_ingest_bars_received_total) - 
+            sum(data_ingest_bars_stored_total)
+          ) > 100
+        for: 2m
+        labels:
+          severity: warning
+          component: data_ingest
+          service: ingest_equity_1m_ibkr
+        annotations:
+          summary: "⚠️ K线接收与存储数量不一致"
+          description: "接收了{{ sum(data_ingest_bars_received_total) }}根K线，但只存储了{{ sum(data_ingest_bars_stored_total) }}根，差异{{ $value }}根"
+          action: "检查数据库写入，检查是否有数据过滤逻辑导致数据丢失"
+      
+      # 数据完整性：指标计算不完整
+      - alert: DataIngestIndicatorsIncomplete
+        expr: |
+          (
+            sum(data_ingest_bars_stored_total) - 
+            sum(data_ingest_indicators_computed_total)
+          ) > 100
+        for: 2m
+        labels:
+          severity: warning
+          component: data_ingest
+          service: ingest_equity_1m_ibkr
+        annotations:
+          summary: "⚠️ 指标计算不完整"
+          description: "存储了{{ sum(data_ingest_bars_stored_total) }}根K线，但只计算了{{ sum(data_ingest_indicators_computed_total) }}个指标，差异{{ $value }}"
+          action: "检查指标计算逻辑，查看indicators_failed_total计数器"
+      
+      # 数据完整性：单个股票日期K线数不足
+      - alert: DataIngestInsufficientBarsPerSymbolDate
+        expr: |
+          data_ingest_bars_per_symbol_date < 390
+          and data_ingest_bars_per_symbol_date > 0
+        for: 1m
+        labels:
+          severity: warning
+          component: data_ingest
+          service: ingest_equity_1m_ibkr
+        annotations:
+          summary: "⚠️ 股票{{ $labels.symbol }}在{{ $labels.trade_date }}的K线数不足"
+          description: "预期至少390根K线（RTH），实际只有{{ $value }}根"
+          action: "检查该股票在该日期是否有特殊情况（停牌、半日交易等）"
+      
+      # ============================================================
+      # Info 级别告警
+      # ============================================================
+      
+      # ETA 过长
+      - alert: DataIngestETATooLong
+        expr: data_ingest_eta_seconds > 7200
+        for: 5m
+        labels:
+          severity: info
+          component: data_ingest
+          service: ingest_equity_1m_ibkr
+        annotations:
+          summary: "ℹ️ 数据拉取预计完成时间过长"
+          description: "预计还需{{ $value | humanizeDuration }}完成（超过2小时）"
+          action: "考虑增加batch_size或减少符号数量以分批处理"
+      
+      # 拉取速率过慢
+      - alert: DataIngestSlowIngestionRate
+        expr: data_ingest_rate_bars_per_second < 5
+        for: 10m
+        labels:
+          severity: info
+          component: data_ingest
+          service: ingest_equity_1m_ibkr
+        annotations:
+          summary: "ℹ️ 数据拉取速率较慢"
+          description: "当前拉取速率为{{ $value | humanize }} bars/秒，低于正常水平(~10 bars/s)"
+          action: "检查网络延迟，检查IBKR Gateway负载，检查数据库写入性能"
+      
+      # ============================================================
+      # 进度里程碑通知（可选）
+      # ============================================================
+      
+      # 50% 完成通知
+      - alert: DataIngestHalfwayComplete
+        expr: |
+          data_ingest_completion_percentage >= 50
+          and data_ingest_completion_percentage < 51
+          and data_ingest_task_status == 1
+        for: 30s
+        labels:
+          severity: info
+          component: data_ingest
+          milestone: "50%"
+        annotations:
+          summary: "🎯 数据拉取已完成50%"
+          description: "当前进度: {{ $value }}%, 预计剩余时间: {{ with query \"data_ingest_eta_seconds\" }}{{ . | first | value | humanizeDuration }}{{ end }}"
+      
+      # 90% 完成通知
+      - alert: DataIngestNearlyComplete
+        expr: |
+          data_ingest_completion_percentage >= 90
+          and data_ingest_completion_percentage < 100
+          and data_ingest_task_status == 1
+        for: 30s
+        labels:
+          severity: info
+          component: data_ingest
+          milestone: "90%"
+        annotations:
+          summary: "🏁 数据拉取即将完成"
+          description: "当前进度: {{ $value }}%, 即将完成！"
+

@@ -281,18 +281,20 @@ def _upsert_indicator_row(
                 rsi6, rsi12, rsi24,
                 boll_mid, boll_up, boll_dn,
                 atr14, ao,
-                stoch_k, stoch_d,
+                stoch_k, stoch_d, stoch_rsi_k, stoch_rsi_d,
                 cci14, cci6,
-                obv, obv_ema20,
+                sma5, lr_m5_slope, lr_boll_dn_slope, lr_obv_slope,
+                obv, obv_ma6, obv_ema20,
                 mfi14, rvol6
             ) VALUES (
                 :ts_end, :symbol,
                 :rsi6, :rsi12, :rsi24,
                 :boll_mid, :boll_up, :boll_dn,
                 :atr14, :ao,
-                :stoch_k, :stoch_d,
+                :stoch_k, :stoch_d, :stoch_rsi_k, :stoch_rsi_d,
                 :cci14, :cci6,
-                :obv, :obv_ema20,
+                :sma5, :lr_m5_slope, :lr_boll_dn_slope, :lr_obv_slope,
+                :obv, :obv_ma6, :obv_ema20,
                 :mfi14, :rvol6
             )
             ON CONFLICT (symbol, ts_end) DO UPDATE SET
@@ -306,9 +308,16 @@ def _upsert_indicator_row(
                 ao = EXCLUDED.ao,
                 stoch_k = EXCLUDED.stoch_k,
                 stoch_d = EXCLUDED.stoch_d,
+                stoch_rsi_k = EXCLUDED.stoch_rsi_k,
+                stoch_rsi_d = EXCLUDED.stoch_rsi_d,
                 cci14 = EXCLUDED.cci14,
                 cci6 = EXCLUDED.cci6,
+                sma5 = EXCLUDED.sma5,
+                lr_m5_slope = EXCLUDED.lr_m5_slope,
+                lr_boll_dn_slope = EXCLUDED.lr_boll_dn_slope,
+                lr_obv_slope = EXCLUDED.lr_obv_slope,
                 obv = EXCLUDED.obv,
+                obv_ma6 = EXCLUDED.obv_ma6,
                 obv_ema20 = EXCLUDED.obv_ema20,
                 mfi14 = EXCLUDED.mfi14,
                 rvol6 = EXCLUDED.rvol6

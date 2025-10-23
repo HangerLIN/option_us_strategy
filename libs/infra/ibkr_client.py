@@ -835,7 +835,9 @@ class IBClient(EWrapper, EClient):
         duration_seconds = duration_minutes * 60
         duration_str = f"{duration_seconds} S"
         # IBKR要求时区格式为 xx/xxxx（如US/Eastern），不接受America/New_York
-        end_str = end.strftime("%Y%m%d %H:%M:%S US/Eastern")
+        # 将end时间转换为Eastern时区，然后格式化
+        end_et = end.astimezone(EASTERN)
+        end_str = end_et.strftime("%Y%m%d %H:%M:%S US/Eastern")
 
         req_id = next(self._req_id_counter)
         future = HistoricalRequest()
@@ -933,6 +935,107 @@ class IBClient(EWrapper, EClient):
             exchange=exchange,
             currency=currency,
         )
+
+    def req_historical_daily_vix(
+        self,
+        trade_date: date,
+    ) -> Optional[Decimal]:
+        """
+        获取VIX指数在指定交易日的收盘价
+        
+        由于IBKR不支持直接指定单个交易日，我们请求包含该日期的一段时间（10天），
+        然后从返回的数据中找到对应日期的收盘价。
+        
+        Args:
+            trade_date: 交易日期
+            
+        Returns:
+            VIX收盘价，如果获取失败则返回None
+        """
+        contract = self.index_contract("VIX", "CBOE", "USD")
+        
+        self._historical_bucket.consume()
+        detail = self.req_contract_details(contract)
+        resolved = detail.contract
+        
+        # 计算从trade_date到今天的天数
+        today = date.today()
+        days_ago = (today - trade_date).days
+        
+        # 如果trade_date是未来日期，使用空字符串（当前时间）并拉取最近的数据
+        if days_ago < 0:
+            end_str = ""
+            duration_str = "1 M"  # 拉取最近一个月
+        else:
+            # 使用空字符串表示当前时间，然后通过duration回溯到目标日期
+            end_str = ""
+            # 增加一些buffer确保包含目标日期
+            duration_str = f"{days_ago + 5} D"
+        
+        req_id = next(self._req_id_counter)
+        future = HistoricalRequest()
+        self._historical_requests[req_id] = future
+        
+        LOGGER.info("Requesting VIX daily data reqId=%s target_date=%s duration=%s", 
+                   req_id, trade_date.isoformat(), duration_str)
+        
+        self.reqHistoricalData(
+            req_id,
+            resolved,
+            end_str,  # 空字符串表示当前时间
+            duration_str,  # 回溯到目标日期
+            "1 day",  # 日级别K线
+            "TRADES",
+            1,  # use_rth=True
+            2,  # formatDate=2: Unix timestamp
+            False,
+            [],
+        )
+        
+        if not future.done.wait(timeout=30):
+            self._historical_requests.pop(req_id, None)
+            LOGGER.warning("VIX daily data request timeout for date=%s", trade_date.isoformat())
+            return None
+        
+        if future.error:
+            LOGGER.error("VIX daily data error: %s", future.error)
+            return None
+        
+        if not future.bars or len(future.bars) == 0:
+            LOGGER.warning("No VIX daily data returned for date=%s", trade_date.isoformat())
+            return None
+        
+        # 从返回的bars中找到对应日期的数据
+        # future.bars中的bar是字典，键为"time"
+        # 日线数据的"time"是字符串格式（yyyymmdd），而不是Unix timestamp
+        for bar in future.bars:
+            bar_time = bar.get("time")
+            bar_close = bar.get("close")
+            
+            if bar_time is None or bar_close is None:
+                continue
+                
+            # 日线数据的time是字符串（yyyymmdd），需要解析
+            try:
+                if isinstance(bar_time, str):
+                    # 格式：yyyymmdd
+                    bar_date = datetime.strptime(bar_time, "%Y%m%d").date()
+                else:
+                    # Unix timestamp（分钟数据会是这种格式）
+                    bar_date = datetime.fromtimestamp(bar_time, tz=EASTERN).date()
+                    
+                if bar_date == trade_date:
+                    vix_close = Decimal(str(bar_close))
+                    LOGGER.info("VIX close price for %s: %s (from %d bars)", 
+                               trade_date.isoformat(), vix_close, len(future.bars))
+                    return vix_close
+            except (ValueError, TypeError, OSError) as e:
+                LOGGER.warning("Failed to parse bar time: %s, error: %s", bar_time, e)
+                continue
+        
+        LOGGER.warning("VIX data for date=%s not found in returned %d bars", 
+                      trade_date.isoformat(), len(future.bars))
+        return None
 
     def req_option_bid_ask_1m(
         self,

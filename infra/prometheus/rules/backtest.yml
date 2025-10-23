@@ -1,0 +1,131 @@
+groups:
+  - name: backtest_alerts
+    interval: 60s
+    rules:
+      # ============================================================
+      # 回测系统告警规则
+      # ============================================================
+
+      # 1. 回测API服务Down
+      - alert: BacktestAPIDown
+        expr: up{job="backtest_api"} == 0
+        for: 2m
+        labels:
+          severity: high
+          service: backtest_api
+          category: service_health
+        annotations:
+          summary: "回测API服务不可用"
+          description: "回测API服务已停止响应超过2分钟"
+          runbook: "1) 检查回测服务进程 2) 查看服务日志 3) 检查端口8006是否被占用"
+
+      # 2. 回测API响应慢
+      - alert: BacktestAPIResponseSlow
+        expr: |
+          histogram_quantile(0.95,
+            rate(backtest_api_latency_seconds_bucket[10m])
+          ) > 5
+        for: 10m
+        labels:
+          severity: medium
+          service: backtest_api
+          category: performance
+        annotations:
+          summary: "回测API响应缓慢"
+          description: "P95延迟: {{ $value | humanize }}s，超过5秒阈值"
+          runbook: "1) 检查数据库查询性能 2) 检查是否有慢查询 3) 考虑添加索引"
+
+      # 3. 回测API错误率高
+      - alert: HighBacktestAPIErrorRate
+        expr: |
+          (
+            sum(rate(backtest_api_requests_total{status_code=~"5.."}[5m]))
+            /
+            sum(rate(backtest_api_requests_total[5m]))
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: high
+          service: backtest_api
+          category: reliability
+        annotations:
+          summary: "回测API错误率高"
+          description: "错误率: {{ $value | humanizePercentage }}，超过10%阈值"
+          runbook: "1) 查看应用日志 2) 检查数据库连接 3) 检查内存使用情况"
+
+      # 4. 回测数据库查询慢
+      - alert: SlowBacktestDatabaseQueries
+        expr: |
+          histogram_quantile(0.95,
+            rate(backtest_db_query_seconds_bucket[10m])
+          ) > 2
+        for: 10m
+        labels:
+          severity: medium
+          service: backtest_api
+          category: performance
+        annotations:
+          summary: "回测数据库查询缓慢"
+          description: "P95查询延迟: {{ $value | humanize }}s，超过2秒"
+          runbook: "1) 检查数据库负载 2) 分析慢查询日志 3) 优化查询或添加索引"
+
+      # 5. 回测指标查询失败率高
+      - alert: HighBacktestMetricsQueryFailureRate
+        expr: |
+          (
+            rate(backtest_metrics_queried_total{found="false"}[10m])
+            /
+            rate(backtest_metrics_queried_total[10m])
+          ) > 0.3
+        for: 10m
+        labels:
+          severity: low
+          service: backtest_api
+          category: data_quality
+        annotations:
+          summary: "回测指标查询失败率高"
+          description: "30%以上的查询找不到回测数据"
+          runbook: "1) 检查回测数据完整性 2) 确认run_id是否有效"
+
+      # 6. 回测API流量异常低（工作时间）
+      - alert: LowBacktestAPITraffic
+        expr: |
+          (
+            rate(backtest_api_requests_total[30m]) < 0.01
+            and
+            hour() >= 9
+            and
+            hour() < 18
+          )
+        for: 1h
+        labels:
+          severity: low
+          service: backtest_api
+          category: activity
+        annotations:
+          summary: "回测API流量异常低"
+          description: "工作时间内30分钟内几乎无请求"
+          runbook: "这可能是正常的，仅供信息参考。如果期望有流量，检查客户端连接"
+
+      # 7. 回测API请求量激增
+      - alert: BacktestAPITrafficSpike
+        expr: |
+          (
+            rate(backtest_api_requests_total[5m])
+            >
+            4 * rate(backtest_api_requests_total[1h] offset 1h)
+          )
+        for: 10m
+        labels:
+          severity: medium
+          service: backtest_api
+          category: traffic
+        annotations:
+          summary: "回测API请求量激增"
+          description: "当前请求量是1小时前的4倍以上"
+          runbook: "1) 检查是否有批量查询 2) 确认是否是正常业务 3) 监控系统资源"
+
+
+
+
+

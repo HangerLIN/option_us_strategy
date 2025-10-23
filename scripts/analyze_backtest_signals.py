@@ -21,6 +21,9 @@ def analyze_signal_performance(batch_id: str):
     settings = get_settings()
     engine = create_engine(settings.database_url)
     
+    def _strip_metric_code(metric_code: str, prefix: str) -> str:
+        return metric_code[len(prefix):]
+
     print(f"\n{'='*100}")
     print(f"📊 回测信号表现分析")
     print(f"批次: {batch_id}")
@@ -127,55 +130,98 @@ def analyze_signal_performance(batch_id: str):
         signal_metrics = defaultdict(lambda: defaultdict(dict))
         
         for m in metrics:
-            # 解析 metric_code: RET_SIG_OPEN_CHASE_BUY_5M
-            parts = m.metric_code.split('_')
-            if 'SIG_SIG' in m.metric_code:
-                # RET_SIG_SIG_OPEN_CHASE_BUY_TFE_MEAN
-                sig_name = '_'.join(parts[3:-2])  # OPEN_CHASE_BUY
-                time_window = parts[-2] + '_' + parts[-1]  # TFE_MEAN
+            metric_code = m.metric_code
+            if not metric_code.startswith("RET_SIG_"):
+                continue
+            body = metric_code[len("RET_SIG_") :]
+            parts = body.split("_")
+            if len(parts) < 2:
+                continue
+            if len(parts) >= 3 and parts[-2] == "TFE":
+                sig_name = "_".join(parts[:-2])
+                time_window = "_".join(parts[-2:])
             else:
-                # RET_SIG_OPEN_CHASE_BUY_5M
-                sig_name = '_'.join(parts[2:-1])  # OPEN_CHASE_BUY
-                time_window = parts[-1]  # 5M
-            
-            signal_metrics[sig_name][time_window] = {
-                'avg': float(m.avg_val) if m.avg_val else 0,
-                'min': float(m.min_val) if m.min_val else 0,
-                'max': float(m.max_val) if m.max_val else 0,
-                'std': float(m.std_val) if m.std_val else 0,
-                'count': m.sample_count
-            }
-        
-        # 获取命中率数据
-        hit_rate_query = text("""
-            SELECT 
-                metric_code,
-                AVG(metric_value) as avg_val,
-                COUNT(*) as sample_count
-            FROM bt_metrics_total
-            WHERE run_id = ANY(:run_ids)
-              AND metric_code LIKE '%HIT_SIG_%'
-            GROUP BY metric_code
-            ORDER BY metric_code
-        """)
-        
-        hit_rates = conn.execute(hit_rate_query, {"run_ids": run_ids}).fetchall()
-        
-        for h in hit_rates:
-            parts = h.metric_code.split('_')
-            if 'SIG_SIG' in h.metric_code:
-                sig_name = '_'.join(parts[3:-2])
-                time_window = parts[-2] + '_' + parts[-1]
-            else:
-                sig_name = '_'.join(parts[2:-1])
+                sig_name = "_".join(parts[:-1])
                 time_window = parts[-1]
             
-            if time_window not in signal_metrics[sig_name]:
-                signal_metrics[sig_name][time_window] = {}
-            signal_metrics[sig_name][time_window]['hit_rate'] = float(h.avg_val) if h.avg_val else 0
-            signal_metrics[sig_name][time_window]['hit_count'] = h.sample_count
+            signal_metrics[sig_name][time_window] = {
+                "avg": float(m.avg_val) if m.avg_val is not None else 0.0,
+                "min": float(m.min_val) if m.min_val is not None else 0.0,
+                "max": float(m.max_val) if m.max_val is not None else 0.0,
+                "std": float(m.std_val) if m.std_val is not None else 0.0,
+                "count": m.sample_count,
+            }
         
         # 显示各信号类型的表现
+        exec_rows = conn.execute(
+            text(
+                """
+                SELECT metric_code, AVG(metric_value) AS avg_val
+                FROM bt_metrics_total
+                WHERE run_id = ANY(:run_ids)
+                  AND metric_code LIKE 'COUNT_EXEC_SIG_%'
+                GROUP BY metric_code
+                """
+            ),
+            {"run_ids": run_ids},
+        ).fetchall()
+        exec_counts = {
+            _strip_metric_code(row.metric_code, "COUNT_EXEC_SIG_"): float(row.avg_val or 0.0)
+            for row in exec_rows
+        }
+
+        opp_rows = conn.execute(
+            text(
+                """
+                SELECT metric_code, AVG(metric_value) AS avg_val
+                FROM bt_metrics_total
+                WHERE run_id = ANY(:run_ids)
+                  AND metric_code LIKE 'COUNT_OPP_SIG_%'
+                GROUP BY metric_code
+                """
+            ),
+            {"run_ids": run_ids},
+        ).fetchall()
+        opp_counts = {
+            _strip_metric_code(row.metric_code, "COUNT_OPP_SIG_"): float(row.avg_val or 0.0)
+            for row in opp_rows
+        }
+
+
+        opp_reason_rows = conn.execute(
+            text(
+                """
+                SELECT metric_code, SUM(metric_value) AS total_val
+                FROM bt_metrics_total
+                WHERE run_id = ANY(:run_ids)
+                  AND metric_code LIKE 'COUNT_OPP_REASON_%'
+                GROUP BY metric_code
+                """
+            ),
+            {"run_ids": run_ids},
+        ).fetchall()
+        opp_reason_counts = {
+            _strip_metric_code(row.metric_code, "COUNT_OPP_REASON_"): float(row.total_val or 0.0)
+            for row in opp_reason_rows
+        }
+
+        block_rows = conn.execute(
+            text(
+                """
+                SELECT metric_code, SUM(metric_value) AS total_val
+                FROM bt_metrics_total
+                WHERE run_id = ANY(:run_ids)
+                  AND metric_code LIKE 'COUNT_BLOCK_%'
+                GROUP BY metric_code
+                """
+            ),
+            {"run_ids": run_ids},
+        ).fetchall()
+        block_counts = {
+            _strip_metric_code(row.metric_code, "COUNT_BLOCK_"): float(row.total_val or 0.0)
+            for row in block_rows
+        }
+
         for sig_name in sorted(signal_metrics.keys()):
             print(f"{'─'*100}")
             print(f"🎯 {sig_name} 信号表现")
@@ -184,40 +230,32 @@ def analyze_signal_performance(batch_id: str):
             metrics_data = signal_metrics[sig_name]
             
             # 获取信号数量
-            count_metric = f"COUNT_EXEC_SIG_{sig_name}"
-            count_query = text("""
-                SELECT AVG(metric_value) as avg_count
-                FROM bt_metrics_total
-                WHERE run_id = ANY(:run_ids)
-                  AND metric_code = :metric_code
-            """)
-            count_result = conn.execute(count_query, {
-                "run_ids": run_ids,
-                "metric_code": count_metric
-            }).fetchone()
-            
-            if count_result and count_result.avg_count:
-                print(f"📊 平均信号数: {float(count_result.avg_count):.1f} 个/标的\n")
+            exec_count = exec_counts.get(sig_name, 0.0)
+            opp_count = opp_counts.get(sig_name, 0.0)
+            print(f"📊 平均执行次数: {exec_count:.1f} 次/标的")
+            if opp_count:
+                print(f"📈 平均机会次数: {opp_count:.1f} 次/标的")
+            print()
             
             # 时间窗口表现表格
             time_windows = ['5M', '15M', '30M', '60M']
             
-            print(f"{'时间窗口':<10} {'平均收益率':>12} {'胜率':>10} {'最大收益':>12} {'最小收益':>12} {'标准差':>10}")
-            print(f"{'-'*80}")
+            print(f"{'时间窗口':<10} {'平均收益率':>12} {'最大收益':>12} {'最小收益':>12} {'标准差':>10} {'样本数':>8}")
+            print(f"{'-'*60}")
             
             for tw in time_windows:
                 if tw in metrics_data:
                     data = metrics_data[tw]
                     avg_ret = data.get('avg', 0)
-                    hit = data.get('hit_rate', 0)
                     max_ret = data.get('max', 0)
                     min_ret = data.get('min', 0)
                     std = data.get('std', 0)
+                    samples = data.get('count', 0)
                     
                     # 用颜色标记正负收益
                     ret_symbol = '🟢' if avg_ret > 0 else '🔴' if avg_ret < 0 else '⚪'
                     
-                    print(f"{tw:<10} {ret_symbol} {avg_ret:>10.2%} {hit:>10.1%} {max_ret:>11.2%} {min_ret:>11.2%} {std:>10.2%}")
+                    print(f"{tw:<10} {ret_symbol} {avg_ret:>10.2%} {max_ret:>11.2%} {min_ret:>11.2%} {std:>10.2%} {samples:>8}")
             
             # 信号到平仓（TFE）表现
             tfe_metrics = ['TFE_MEAN', 'TFE_P50', 'TFE_P90']
@@ -225,36 +263,31 @@ def analyze_signal_performance(batch_id: str):
             
             if has_tfe:
                 print(f"\n💰 信号持有期表现 (从买入到卖出):")
-                print(f"{'指标':<15} {'收益率':>12} {'胜率':>10}")
-                print(f"{'-'*40}")
+                print(f"{'指标':<15} {'收益率':>12} {'样本数':>8}")
+                print(f"{'-'*30}")
                 
                 for tm in tfe_metrics:
                     if tm in metrics_data:
                         data = metrics_data[tm]
                         avg_ret = data.get('avg', 0)
-                        hit = data.get('hit_rate', 0)
+                        samples = data.get('count', 0)
                         ret_symbol = '🟢' if avg_ret > 0 else '🔴' if avg_ret < 0 else '⚪'
-                        print(f"{tm:<15} {ret_symbol} {avg_ret:>10.2%} {hit:>10.1%}")
-                
-                # 显示持有时长
-                dur_metric = f"DUR_SIG_SIG_{sig_name}_TFE_MIN_MEAN"
-                dur_query = text("""
-                    SELECT AVG(metric_value) as avg_dur
-                    FROM bt_metrics_total
-                    WHERE run_id = ANY(:run_ids)
-                      AND metric_code = :metric_code
-                """)
-                dur_result = conn.execute(dur_query, {
-                    "run_ids": run_ids,
-                    "metric_code": dur_metric
-                }).fetchone()
-                
-                if dur_result and dur_result.avg_dur:
-                    avg_dur = float(dur_result.avg_dur)
-                    hours = int(avg_dur // 60)
-                    mins = int(avg_dur % 60)
-                    print(f"\n⏱️  平均持有时长: {avg_dur:.0f} 分钟 ({hours}小时{mins}分钟)")
+                        print(f"{tm:<15} {ret_symbol} {avg_ret:>10.2%} {samples:>8}")
             
+            print()
+        
+        if block_counts or opp_reason_counts:
+            print(f"{'='*100}")
+            print("机会与拒绝统计")
+            print(f"{'='*100}\n")
+            if block_counts:
+                print("🚫 拒绝原因计数：")
+                for reason, count in sorted(block_counts.items(), key=lambda x: x[0]):
+                    print(f"   • {reason:<30s} {count:>8.1f}")
+            if opp_reason_counts:
+                print("\n🔍 机会原因计数：")
+                for reason, count in sorted(opp_reason_counts.items(), key=lambda x: x[0]):
+                    print(f"   • {reason:<30s} {count:>8.1f}")
             print()
         
         # =================================================================
@@ -412,4 +445,3 @@ if __name__ == "__main__":
         batch_id = "bt-20251002-20251007-3d379d"
     
     analyze_signal_performance(batch_id)
-
