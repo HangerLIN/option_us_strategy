@@ -3,14 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Dict, Iterable, List, Mapping, Sequence
+from typing import Dict, Iterable, List, Mapping, Sequence, Set
 
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from libs.core import EASTERN
-from libs.db.dao import BacktestTop5DAO
+from libs.db.dao import BacktestTop5DAO, PremarketLeadersLaggedDAO
 from libs.db.preearn import evaluate_preearn_guard
 
 PRICE_QUANT = Decimal("0.000001")
@@ -30,7 +30,7 @@ class DailySnapshot:
 @dataclass(frozen=True, slots=True)
 class PriceSample:
     symbol: str
-    price_0925: Decimal
+    price_preopen: Decimal
     close: Decimal | None
     open: Decimal | None
     ts_end_et: datetime
@@ -39,7 +39,7 @@ class PriceSample:
 @dataclass(frozen=True, slots=True)
 class CandidateRow:
     symbol: str
-    ret_0925_0930: Decimal
+    ret_preopen: Decimal
     prev_close: Decimal
     price_sample: PriceSample
     snapshot: DailySnapshot
@@ -49,6 +49,8 @@ class CandidateRow:
 
 class PremarketTop5Builder:
     """Compute and persist premarket Top5 data for backtests."""
+
+    MIN_RTH_VOLUME = 800_000
 
     def __init__(
         self,
@@ -60,9 +62,11 @@ class PremarketTop5Builder:
     ) -> None:
         self._session = session
         self._top5_dao = BacktestTop5DAO(session)
+        self._lagged_dao = PremarketLeadersLaggedDAO(session)
         self._preearn_days_min = preearn_days_min
         self._preearn_days_max = preearn_days_max
         self._preearn_atr_pct_max = Decimal(str(preearn_atr_pct_max))
+        self._lagged_cache: Dict[date, Set[str]] = {}
 
     # ------------------------------------------------------------------
     def build_for_date(
@@ -73,15 +77,22 @@ class PremarketTop5Builder:
         symbols: Sequence[str],
         universe_code: str,
     ) -> List[Mapping[str, object]]:
-        if not symbols:
+        universe_symbols = [s.strip().upper() for s in symbols if s.strip()]
+        if not universe_symbols:
             self._top5_dao.replace(batch_id, trade_date, [])
             return []
 
-        snapshots = self._load_daily_snapshot(trade_date, symbols)
-        prices = self._load_premarket_prices(trade_date, symbols)
+        lagged_symbols = self._lagged_symbol_pool(trade_date, universe_symbols)
+        active_symbols = [s for s in universe_symbols if s in lagged_symbols] if lagged_symbols else universe_symbols
+        if not active_symbols:
+            self._top5_dao.replace(batch_id, trade_date, [])
+            return []
+
+        snapshots = self._load_daily_snapshot(trade_date, active_symbols)
+        prices = self._load_premarket_prices(trade_date, active_symbols)
         candidates: list[CandidateRow] = []
 
-        for symbol in symbols:
+        for symbol in active_symbols:
             key = symbol.upper()
             snapshot = snapshots.get(key)
             price = prices.get(key)
@@ -91,7 +102,7 @@ class PremarketTop5Builder:
             if prev_close is None or prev_close <= Decimal("0"):
                 continue
 
-            price_value = price.price_0925
+            price_value = price.price_preopen
             if price_value <= Decimal("0"):
                 continue
 
@@ -118,7 +129,7 @@ class PremarketTop5Builder:
 
             candidate = CandidateRow(
                 symbol=key,
-                ret_0925_0930=ret,
+                ret_preopen=ret,
                 prev_close=prev_close,
                 price_sample=price,
                 snapshot=snapshot,
@@ -131,8 +142,8 @@ class PremarketTop5Builder:
             self._top5_dao.replace(batch_id, trade_date, [])
             return []
 
-        candidates.sort(key=lambda row: row.ret_0925_0930, reverse=True)
-        top_rows = candidates[:5]
+        candidates.sort(key=lambda row: row.ret_preopen, reverse=True)
+        top_rows = candidates[:10]
 
         payload: list[dict[str, object]] = []
         for rank, candidate in enumerate(top_rows, start=1):
@@ -140,8 +151,8 @@ class PremarketTop5Builder:
                 {
                     "rank": rank,
                     "symbol": candidate.symbol,
-                    "ret_0925_0930": candidate.ret_0925_0930,
-                    "price_0925": candidate.price_sample.price_0925,
+                    "ret_0925_0930": candidate.ret_preopen,
+                    "price_0925": candidate.price_sample.price_preopen,
                     "prev_close": candidate.prev_close,
                     "market_cap_usd": candidate.snapshot.market_cap,
                     "m60_up": True,
@@ -155,11 +166,28 @@ class PremarketTop5Builder:
         return payload
 
     # ------------------------------------------------------------------
+    def _lagged_symbol_pool(self, trade_date: date, symbols: Sequence[str]) -> Set[str]:
+        cached = self._lagged_cache.get(trade_date)
+        if cached is not None:
+            return cached
+        rows = self._lagged_dao.ensure(trade_date, symbols)
+        if not rows:
+            self._lagged_cache[trade_date] = set()
+            return set()
+        threshold = self.MIN_RTH_VOLUME
+        selected = {
+            row.symbol.upper()
+            for row in rows
+            if (row.volume_rth or 0) >= threshold
+        }
+        self._lagged_cache[trade_date] = selected
+        return selected
+
     def _load_premarket_prices(
         self, trade_date: date, symbols: Sequence[str]
     ) -> Dict[str, PriceSample]:
-        start_et = datetime.combine(trade_date, time(9, 25), EASTERN)
-        end_et = datetime.combine(trade_date, time(9, 31), EASTERN)
+        start_et = datetime.combine(trade_date, time(9, 27), EASTERN)
+        end_et = datetime.combine(trade_date, time(9, 30), EASTERN)
         start_utc = start_et.astimezone(timezone.utc)
         end_utc = end_et.astimezone(timezone.utc)
 
@@ -192,7 +220,7 @@ class PremarketTop5Builder:
 
         prices: Dict[str, PriceSample] = {}
         for symbol, samples in bucket.items():
-            target = _select_0925_bar(samples)
+            target = _select_preopen_bar(samples)
             if target is None:
                 continue
             ts_et, open_, close_ = target
@@ -203,7 +231,7 @@ class PremarketTop5Builder:
                 continue
             prices[symbol] = PriceSample(
                 symbol=symbol,
-                price_0925=price,
+                price_preopen=price,
                 close=close_dec,
                 open=open_dec,
                 ts_end_et=ts_et,
@@ -302,11 +330,11 @@ class PremarketTop5Builder:
         return caps
 
 
-def _select_0925_bar(
+def _select_preopen_bar(
     items: Iterable[tuple[datetime, float | None, float | None]]
 ) -> tuple[datetime, float | None, float | None] | None:
     for ts_et, open_, close_ in items:
-        if ts_et.hour == 9 and ts_et.minute == 25:
+        if ts_et.hour == 9 and ts_et.minute == 28:
             return ts_et, open_, close_
     return None
 

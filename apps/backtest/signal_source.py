@@ -96,6 +96,17 @@ def _generate_signals_recompute(
                 ts_end = ts_end.replace(tzinfo=start.tzinfo)
             bar_end = ts_end
             bar_start = bar_end - timedelta(minutes=1)
+            
+            # 过滤盘前时段（RTH = Regular Trading Hours: 9:30-16:00）
+            from libs.core import EASTERN
+            bar_et = bar_end.astimezone(EASTERN) if bar_end.tzinfo else bar_end.replace(tzinfo=EASTERN)
+            hour = bar_et.hour
+            minute = bar_et.minute
+            
+            # 只处理9:30-16:00的K线，排除盘前时段（8:00-9:30）
+            if hour < 9 or (hour == 9 and minute < 30) or hour >= 16:
+                continue
+            
             event = BarsClosed(
                 trace_id=str(uuid4()),
                 symbol=symbol,

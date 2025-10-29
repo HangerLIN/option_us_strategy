@@ -10,6 +10,7 @@ from queue import Empty, Queue
 from typing import Any, Awaitable, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Literal, cast
 from uuid import uuid4
 import json
+import os
 
 import structlog
 import pandas as pd
@@ -18,9 +19,24 @@ from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from libs.core import EASTERN, attach_trace_metadata, configure_logging, get_settings, utc_now
+from libs.core.timeutil import trading_session_window
+from libs.db.calendar_refresher import ensure_future_calendar, schedule_daily_refresh
+from prometheus_client import start_http_server
+from libs.infra.metrics import (
+    observe_bar_latency,
+    observe_indicator_calculation,
+    record_indicator_failure,
+    record_top5_selection,
+    set_cached_bars_count,
+    observe_top5_calculation,
+    set_last_bar_ts_diff_seconds,
+    set_top5_candidates_count,
+)
 from libs.core.config import Settings
 from libs.db import Base, PremarketTop5, StrategyPosition
+from libs.db.validation import ensure_indicator_columns
 from libs.db.dao import RiskStateDAO
+from libs.db.dim_trading_calendar import get_trading_session
 from libs.infra import IBClient, RedisBus, build_ibkr_client
 from libs.schemas.events import BarsClosed
 from .top5_service import Top5Service
@@ -188,11 +204,12 @@ class MinuteAggregator:
         refresh = max(watchlist_refresh_seconds, 5)  # 最小5秒
         self._watchlist_refresh = timedelta(seconds=refresh)
         self._next_watchlist_refresh: Optional[datetime] = None
-        
+
         # ========== 运行状态 ==========
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._running = True
         self._logger = structlog.get_logger(__name__)
+        self._metrics_enabled = bool(settings.monitoring_enabled)
         
         # ========== 订阅元数据 ==========
         # _symbol_meta: {alias: SymbolMeta}
@@ -261,6 +278,9 @@ class MinuteAggregator:
         """
         self._loop = asyncio.get_running_loop()
         vix_started = False
+        freshness_task: Optional[asyncio.Task] = None
+        if self._metrics_enabled:
+            freshness_task = asyncio.create_task(self._monitor_freshness())
         
         # ========== 1. 启动VIX订阅 ==========
         try:
@@ -307,16 +327,23 @@ class MinuteAggregator:
             # 停止VIX订阅
             if vix_started:
                 self._stop_vix_subscription()
-            
+
             # 停止所有symbol订阅
             self._teardown_subscriptions()
-            
+
             # 关闭Redis连接
             if self._redis_bus is not None:
                 try:
                     await self._redis_bus.close()
                 except Exception:  # pragma: no cover - best-effort close
                     self._logger.warning("aggregator.redis_bus_close_failed")
+
+            if freshness_task is not None:
+                freshness_task.cancel()
+                try:
+                    await freshness_task
+                except asyncio.CancelledError:  # pragma: no cover - cooperative shutdown
+                    pass
 
     # ------------------------------------------------------------------
     # Tick数据消费与处理
@@ -473,6 +500,28 @@ class MinuteAggregator:
 
             if record:
                 self._buffers[symbol].append((tick_time, record))
+
+    async def _monitor_freshness(self) -> None:
+        """Periodic task to update freshness gauge for downstream monitoring."""
+
+        try:
+            while self._running:
+                if self._metrics_enabled:
+                    latest = None
+                    for ts in self._last_persisted.values():
+                        if ts is None:
+                            continue
+                        if latest is None or ts > latest:
+                            latest = ts
+                    if latest is not None:
+                        try:
+                            delta = max(0.0, (utc_now() - latest).total_seconds())
+                            set_last_bar_ts_diff_seconds(delta)
+                        except Exception:  # pragma: no cover - metrics best-effort
+                            pass
+                await asyncio.sleep(15)
+        except asyncio.CancelledError:  # pragma: no cover - cooperative shutdown
+            raise
 
     def _ensure_equity_meta(self, symbol: str) -> SymbolMeta:
         """
@@ -722,10 +771,19 @@ class MinuteAggregator:
             for alias, meta, bucket in equity_payloads:
                 # 5.1 聚合OHLCV
                 bar = self._aggregate(meta, bucket, ts_end)
-                
+
                 # 5.2 写入bars1m_equity表
                 self._persist_equity_bar(session, bar)
-                
+
+                if self._metrics_enabled:
+                    try:
+                        latency_seconds = max(0.0, (utc_now() - bar.ts_end).total_seconds())
+                        observe_bar_latency(latency_seconds)
+                        backlog = max(0, int(latency_seconds // 60))
+                        set_cached_bars_count(meta.underlying, "1m", backlog)
+                    except Exception:  # pragma: no cover - metrics best-effort
+                        pass
+
                 # 5.3 缓存最新收盘价（用于期权Greeks的underlying_price回填）
                 self._last_equity_close[meta.underlying] = bar.close
                 
@@ -744,10 +802,19 @@ class MinuteAggregator:
             for alias, meta, bucket in option_payloads:
                 # 6.1 聚合OHLCV
                 bar = self._aggregate(meta, bucket, ts_end)
-                
+
                 # 6.2 写入bars1m_option表（包含bid/ask/Greeks/OI等）
                 self._persist_option_bar(session, meta, bar)
-                
+
+                if self._metrics_enabled:
+                    try:
+                        latency_seconds = max(0.0, (utc_now() - bar.ts_end).total_seconds())
+                        observe_bar_latency(latency_seconds)
+                        backlog = max(0, int(latency_seconds // 60))
+                        set_cached_bars_count(meta.alias, "1m", backlog)
+                    except Exception:  # pragma: no cover - metrics best-effort
+                        pass
+
                 # 6.3 更新持久化时间
                 self._last_persisted[alias] = bar.ts_end
             
@@ -779,9 +846,13 @@ class MinuteAggregator:
 
     def _maybe_refresh_rvol_baseline(self, ts_end: datetime) -> None:
         et = ts_end.astimezone(EASTERN)
-        if et.hour < 16 or (et.hour == 16 and et.minute < 10):
-            return
         trade_date = et.date()
+        try:
+            _, close_et = trading_session_window(trade_date, tz=EASTERN)
+        except KeyError:
+            return
+        if et < (close_et + timedelta(minutes=10)):
+            return
         if self._last_rvol_refresh == trade_date:
             return
         try:
@@ -807,7 +878,17 @@ class MinuteAggregator:
             )
             return
 
-        end_et = datetime.combine(trade_date, time(16, 0), EASTERN)
+        try:
+            _, close_et = trading_session_window(trade_date, tz=EASTERN)
+        except KeyError:
+            self._logger.warning(
+                "aggregator.rvol_refresh_skipped",
+                trade_date=str(trade_date),
+                reason="no_calendar_entry",
+            )
+            return
+
+        end_et = close_et
         lookback_days = max(self._settings.rvol_baseline_days * 2, 30)
         start_et = end_et - timedelta(days=lookback_days)
 
@@ -1341,7 +1422,24 @@ class MinuteAggregator:
         # ========== 4. 调用指标计算引擎 ==========
         # compute_indicator_row来自apps/rt_engine/indicators.py
         # 返回: {"rsi6": 45.3, "atr14": 2.15, "rvol6": 1.8, ...}
-        indicators = compute_indicator_row(df, baseline_map)
+        try:
+            if self._metrics_enabled:
+                with observe_indicator_calculation("equity"):
+                    indicators = compute_indicator_row(df, baseline_map)
+            else:
+                indicators = compute_indicator_row(df, baseline_map)
+        except Exception as exc:
+            if self._metrics_enabled:
+                try:
+                    record_indicator_failure("equity", exc.__class__.__name__)
+                except Exception:  # pragma: no cover - metrics best-effort
+                    pass
+            self._logger.exception(
+                "aggregator.indicator_calculation_failed",
+                symbol=symbol,
+                ts_end=str(ts_end),
+            )
+            return
         if not indicators:
             return
 
@@ -1704,14 +1802,16 @@ async def _top5_schedule_loop(top5_service: Top5Service) -> None:
     try:
         while True:
             now_et = utc_now().astimezone(EASTERN)
-            
-            # 周末跳过（周六日不计算）
-            if now_et.weekday() >= 5:
-                await asyncio.sleep(1800)  # 休眠30分钟
+            try:
+                session = get_trading_session(now_et.date())
+            except KeyError:
+                await asyncio.sleep(1800)
                 continue
-            
-            # 目标触发时间：09:30:01（盘前窗口关闭后立即计算）
-            target = datetime.combine(now_et.date(), time(9, 30, 1), tzinfo=EASTERN)
+
+            target = (
+                datetime.combine(now_et.date(), session.open_time, tzinfo=EASTERN)
+                + timedelta(seconds=1)
+            )
             
             if now_et >= target:
                 # 已过触发时间，检查今天是否已运行
@@ -1738,16 +1838,26 @@ async def _top5_schedule_loop(top5_service: Top5Service) -> None:
         raise
 
 
-async def _run_services(aggregator: MinuteAggregator, top5_service: Top5Service) -> None:
+async def _run_services(
+    aggregator: MinuteAggregator,
+    top5_service: Top5Service,
+    *,
+    calendar_days: int = 90,
+    refresh_minute: int = 5,
+) -> None:
     scheduler_task = asyncio.create_task(_top5_schedule_loop(top5_service))
+    refresher_task = asyncio.create_task(
+        schedule_daily_refresh(days_ahead=calendar_days, at_minute=refresh_minute)
+    )
     try:
         await aggregator.run()
     finally:
-        scheduler_task.cancel()
-        try:
-            await scheduler_task
-        except asyncio.CancelledError:
-            pass
+        for task in (scheduler_task, refresher_task):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -1804,6 +1914,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     # ========== 2. 初始化配置和日志 ==========
+    if args.database_url:
+        os.environ["DATABASE_URL"] = args.database_url
+        get_settings.cache_clear()
     settings = get_settings()
     configure_logging(settings)
 
@@ -1811,13 +1924,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     database_url = args.database_url or settings.database_url
     engine = create_engine(database_url, future=True)
     Base.metadata.create_all(engine)  # 确保表结构存在
+    ensure_indicator_columns(engine)  # 校验指标列齐备
     session_factory = sessionmaker(bind=engine, future=True)
 
-    # ========== 4. 初始化IBKR客户端 ==========
+    logger = structlog.get_logger(__name__)
+
+    # ========== 4. 刷新交易日历 ==========
+    try:
+        refreshed = ensure_future_calendar(days_ahead=90)
+        logger.info("aggregator.calendar_ready: sessions=%d", refreshed)
+    except Exception:
+        logger.exception("aggregator.calendar_refresh_failed")
+        raise
+
+    # ========== 5. 初始化IBKR客户端 ==========
     # 连接到TWS/Gateway（配置在settings中）
     ib_client = build_ibkr_client(settings)
     
-    # ========== 5. 初始化MinuteAggregator ==========
+    # ========== 6. 初始化MinuteAggregator ==========
     aggregator = MinuteAggregator(
         ib_client,
         session_factory,
@@ -1827,20 +1951,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         vix_required=settings.vix_required,
     )
     
-    # ========== 6. 初始化Top5服务 ==========
+    # ========== 7. 初始化Top5服务 ==========
     top5_service = Top5Service(ib_client, session_factory, settings)
 
-    # ========== 7. 运行服务（阻塞） ==========
+    # ========== 8. 启动监控端点（可选） ==========
+    try:
+        if settings.monitoring_enabled:
+            start_http_server(int(settings.monitoring_port))
+    except Exception:
+        logger.warning("aggregator.monitoring_start_failed", port=settings.monitoring_port)
+
+    # ========== 9. 运行服务（阻塞） ==========
     try:
         # 同时运行aggregator和top5_scheduler
         # aggregator: 主循环（每分钟触发）
         # top5_scheduler: 定时任务（每天09:30:01触发）
-        asyncio.run(_run_services(aggregator, top5_service))
+        asyncio.run(_run_services(aggregator, top5_service, calendar_days=90, refresh_minute=5))
     except KeyboardInterrupt:  # pragma: no cover
         # Ctrl+C优雅退出
         pass
     finally:
-        # ========== 8. 清理资源 ==========
+        # ========== 10. 清理资源 ==========
         # 断开IBKR连接，停止后台线程
         ib_client.disconnect_and_stop()
 

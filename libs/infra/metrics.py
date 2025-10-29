@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import threading
+import os
 from contextlib import contextmanager
 from decimal import Decimal
+from functools import lru_cache
 from typing import Iterator, Optional
 
 from prometheus_client import Counter, Gauge, Histogram
+
+try:  # Local import to avoid heavy dependency for optional metrics usage
+    from libs.core.config import get_settings  # type: ignore
+except Exception:  # pragma: no cover - fallback when configuration bootstrap fails
+    get_settings = None  # type: ignore
 
 __all__ = [
     # 已有指标
@@ -32,6 +39,7 @@ __all__ = [
     "record_top5_selection",
     "observe_top5_calculation",
     "set_top5_candidates_count",
+    "set_last_bar_ts_diff_seconds",
     # signal_svc新增指标
     "record_signal_by_type",
     "observe_signal_generation",
@@ -68,7 +76,37 @@ __all__ = [
     "set_position_cost_basis",
     "set_avg_holding_duration",
     "record_exit_trigger",
+    "is_monitoring_enabled",
 ]
+
+
+@lru_cache(maxsize=1)
+def _resolve_monitoring_flag() -> bool:
+    """Return whether monitoring is enabled, falling back to env vars.
+
+    The flag is cached because settings are static during process lifetime.
+    """
+
+    env_value = os.getenv("MONITORING_ENABLED")
+    if env_value is not None:
+        lowered = env_value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    if get_settings is None:  # pragma: no cover - defensive fallback
+        return False
+    try:
+        settings = get_settings()
+    except Exception:  # pragma: no cover - settings bootstrap failure
+        return False
+    return bool(getattr(settings, "monitoring_enabled", False))
+
+
+def is_monitoring_enabled() -> bool:
+    """Expose monitoring flag for services to guard metrics emission."""
+
+    return _resolve_monitoring_flag()
 
 
 _BAR_LATENCY_SECONDS = Histogram(
@@ -235,6 +273,11 @@ _RT_TOP5_CALCULATION_SECONDS = Histogram(
 _RT_TOP5_CANDIDATES = Gauge(
     "rt_top5_candidates_count",
     "Number of candidates meeting Top5 criteria.",
+)
+
+_LAST_BAR_TS_DIFF_SECONDS = Gauge(
+    "last_bar_ts_diff_seconds",
+    "Seconds between now and the freshest persisted 1m bar.",
 )
 
 # ============================================================
@@ -615,6 +658,12 @@ def observe_top5_calculation(duration_seconds: float) -> None:
 def set_top5_candidates_count(count: int) -> None:
     """Update the number of Top5 candidates."""
     _RT_TOP5_CANDIDATES.set(count)
+
+
+def set_last_bar_ts_diff_seconds(seconds: float) -> None:
+    """Track freshness delta between now and latest 1m bar."""
+
+    _LAST_BAR_TS_DIFF_SECONDS.set(max(0.0, seconds))
 
 
 # ============================================================

@@ -17,17 +17,24 @@ from .logging import (
     update_trace_context,
     get_logger,
 )
-from .timeutil import (
-    EASTERN,
-    epoch_ms,
-    is_half_day,
-    session_close_utc,
-    to_et,
-    to_utc,
-    trading_session_window,
-    ts_end,
-    utc_now,
-)
+
+# Lazy import to avoid circular dependency with libs.db.dim_trading_calendar
+def __getattr__(name):
+    if name in ("EASTERN", "epoch_ms", "is_half_day", "session_close_utc", 
+                "to_et", "to_utc", "trading_session_window", "ts_end", "utc_now"):
+        from .timeutil import (
+            EASTERN,
+            epoch_ms,
+            is_half_day,
+            session_close_utc,
+            to_et,
+            to_utc,
+            trading_session_window,
+            ts_end,
+            utc_now,
+        )
+        return locals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "Settings",

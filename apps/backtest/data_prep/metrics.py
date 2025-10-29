@@ -370,6 +370,31 @@ class DataIngestionMonitor:
             
             self._update_rate_and_eta()
     
+    def set_current_trade_date(self, trade_date: date):
+        """设置当前处理的交易日（用于监控显示）"""
+        # This is a no-op for now, but can be used for detailed monitoring
+        pass
+    
+    def set_day_expected_bars(self, trade_date: date, expected_bars: int):
+        """设置某个交易日的预期K线数量（用于监控显示）"""
+        # This is a no-op for now, but can be used for detailed monitoring
+        pass
+    
+    def mark_day_completed(self, trade_date: date):
+        """标记某个交易日完成"""
+        # This is a no-op for now, but can be used for detailed monitoring
+        pass
+    
+    def mark_day_failed_partial(self, trade_date: date):
+        """标记某个交易日部分失败"""
+        # This is a no-op for now, but can be used for detailed monitoring
+        pass
+    
+    def record_vix_done(self, trade_date: date):
+        """记录VIX数据获取完成"""
+        # This is a no-op for now, but can be used for detailed monitoring
+        pass
+    
     def record_symbol_failed(self, symbol: str, reason: str):
         """记录 symbol 处理失败"""
         SYMBOLS_FAILED.labels(symbol=symbol, reason=reason).inc()

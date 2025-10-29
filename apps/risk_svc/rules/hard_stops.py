@@ -49,6 +49,7 @@ class HardStopRules:
         self._risk_service = risk_service
         self._redis_bus = redis_bus
         self._overnight_status: Dict[str, OvernightDecision] = {}
+        self._emit_metric = getattr(risk_service, "_emit_metric", None)
 
     async def evaluate(
         self,
@@ -507,7 +508,13 @@ class HardStopRules:
             },
             trace_id=trace_id,
         )
-        record_force_close(event_code)
+        if callable(self._emit_metric):
+            self._emit_metric(record_force_close, event_code)
+        else:  # pragma: no cover - fallback when risk_service missing helper
+            try:
+                record_force_close(event_code)
+            except Exception:
+                pass
 
     def _load_option_metrics(
         self,

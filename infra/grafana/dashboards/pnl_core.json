@@ -1,0 +1,132 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Realized / Unrealized PnL",
+      "description": "实时观测当日实现/浮动盈亏，异常跳变需核对成交记录。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "pnl_realized_today_usd{env=~\"$env\", instance=~\"$instance\"}",
+          "legendFormat": "Realized",
+          "refId": "A"
+        },
+        {
+          "expr": "pnl_unrealized_today_usd{env=~\"$env\", instance=~\"$instance\"}",
+          "legendFormat": "Unrealized",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "currencyUSD"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 0},
+      "options": {"legend": {"displayMode": "table", "placement":"bottom"}, "tooltip": {"mode": "multi", "sort": "none"}}
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "累计 PnL",
+      "description": "`pnl_cumulative_usd` 用于纸交/实盘周期对比。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "pnl_cumulative_usd{env=~\"$env\", instance=~\"$instance\"}",
+          "legendFormat": "$instance",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "currencyUSD"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 9},
+      "options": {"legend": {"displayMode": "hidden"}, "tooltip": {"mode": "single", "sort": "none"}}
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "成交数量 / 胜率",
+      "description": "胜率下降需结合策略集及时复盘；样本量不足时看趋势。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "pnl_trades_count_today{env=~\"$env\", instance=~\"$instance\"}",
+          "legendFormat": "Trades",
+          "refId": "A"
+        },
+        {
+          "expr": "pnl_win_rate_pct{env=~\"$env\", instance=~\"$instance\"}",
+          "legendFormat": "Win Rate",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "short"},
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "Win Rate"},
+            "properties": [{"id": "unit", "value": "percent"}]
+          }
+        ]
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 9},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "none"}}
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "单笔 PnL 分布",
+      "description": "利用直方图桶均值观察盈亏分布是否失衡。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "increase(pnl_per_trade_usd_bucket{env=~\"$env\", instance=~\"$instance\"}[1h])",
+          "legendFormat": "{{le}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 17},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["pnl", "core"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "label": "Datasource",
+        "query": "prometheus",
+        "current": {"selected": true, "text": "Prometheus", "value": "Prometheus"}
+      },
+      {
+        "name": "env",
+        "label": "Environment",
+        "type": "custom",
+        "query": "paper,live",
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {"selected": true, "text": "All", "value": ".*"}
+      },
+      {
+        "name": "instance",
+        "label": "Instance",
+        "type": "query",
+        "datasource": "$datasource",
+        "refresh": 1,
+        "query": "label_values({env=~\"$env\"}, instance)",
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {"selected": true, "text": "All", "value": ".*"}
+      }
+    ]
+  },
+  "time": {"from": "now-7d", "to": "now"},
+  "title": "PnL (Core)",
+  "uid": "pnl-core",
+  "version": 1
+}

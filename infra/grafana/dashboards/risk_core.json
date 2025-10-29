@@ -1,0 +1,210 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Kill Switch",
+      "description": "1 表示熔断开启，核对损益与 VIX 状态后按流程解锁。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "avg(risk_kill_switch_state{env=~\"$env\", instance=~\"$instance\"})",
+          "legendFormat": "Kill Switch",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "values": false},
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 5, "w": 6, "x": 0, "y": 0}
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "VIX 监控",
+      "description": "实盘阈值通常 20，超阈值说明 VIX Gate 可能触发。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "risk_vix_last{env=~\"$env\", instance=~\"$instance\"}",
+          "legendFormat": "VIX",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 9, "x": 6, "y": 0},
+      "options": {"legend": {"displayMode": "hidden"}, "tooltip": {"mode": "single", "sort": "none"}}
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "风险占用 (R)",
+      "description": "`risk_used_r` 应小于风控上限，异常上涨说明仓位过度。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "risk_used_r{env=~\"$env\", instance=~\"$instance\"}",
+          "legendFormat": "Used R",
+          "refId": "A"
+        },
+        {
+          "expr": "risk_drawdown_r{env=~\"$env\", instance=~\"$instance\"}",
+          "legendFormat": "Drawdown R",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 9, "x": 15, "y": 0},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "none"}}
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "仓位与敞口",
+      "description": "`risk_position_count` 与 `risk_total_exposure_usd` 观察仓位规模，防止超限。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "risk_position_count{env=~\"$env\", instance=~\"$instance\"}",
+          "legendFormat": "Position Count",
+          "refId": "A"
+        },
+        {
+          "expr": "risk_total_exposure_usd{env=~\"$env\", instance=~\"$instance\"}",
+          "legendFormat": "Exposure USD",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "short"},
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "Exposure USD"},
+            "properties": [{"id": "unit", "value": "currencyUSD"}]
+          }
+        ]
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "none"}}
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "限额使用率",
+      "description": "按 limit_type 查看使用率，>80% 触发预警。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "risk_limit_usage_pct{env=~\"$env\", instance=~\"$instance\"}",
+          "legendFormat": "{{limit_type}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "percentage",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 0.8},
+              {"color": "red", "value": 0.95}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "none"}}
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "风控拒单 (15m)",
+      "description": "查看主要拒单原因，快速定位风险限额或策略参数问题。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (reason_code) (increase(risk_block_events_total{env=~\"$env\", instance=~\"$instance\"}[15m]))",
+          "legendFormat": "{{reason_code}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 13},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "强平事件 (15m)",
+      "description": "强平次数异常需回溯执行和行情，确认是否误触或参数问题。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (reason_code) (increase(risk_force_close_total{env=~\"$env\", instance=~\"$instance\"}[15m]))",
+          "legendFormat": "{{reason_code}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 13},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["risk", "core"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "label": "Datasource",
+        "query": "prometheus",
+        "current": {"selected": true, "text": "Prometheus", "value": "Prometheus"}
+      },
+      {
+        "name": "env",
+        "label": "Environment",
+        "type": "custom",
+        "query": "paper,live",
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {"selected": true, "text": "All", "value": ".*"}
+      },
+      {
+        "name": "instance",
+        "label": "Instance",
+        "type": "query",
+        "datasource": "$datasource",
+        "refresh": 1,
+        "query": "label_values({env=~\"$env\"}, instance)",
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {"selected": true, "text": "All", "value": ".*"}
+      }
+    ]
+  },
+  "time": {"from": "now-12h", "to": "now"},
+  "title": "Risk (Core)",
+  "uid": "risk-core",
+  "version": 1
+}

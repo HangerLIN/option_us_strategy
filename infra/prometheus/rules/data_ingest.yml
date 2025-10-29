@@ -53,6 +53,21 @@ groups:
             任务已运行{{ (time() - data_ingest_task_start_timestamp) | humanizeDuration }}
             但最近5分钟无数据写入
           action: "检查IBKR连接状态，查看进程CPU占用，检查数据库连接"
+
+      # 检查点未推进（新增）
+      - alert: DataIngestCheckpointStuck
+        expr: |
+          increase(data_ingest_checkpoint_last_completed_trade_date_timestamp[30m]) == 0
+          and data_ingest_task_status == 1
+        for: 10m
+        labels:
+          severity: warning
+          component: data_ingest
+          service: ingest_equity_1m_ibkr
+        annotations:
+          summary: "⚠️ 检查点长时间未推进"
+          description: "最近40分钟没有新的完整交易日完成"
+          action: "检查失败的股票列表与错误类型"
       
       # Pacing violations 频繁
       - alert: DataIngestPacingViolations
@@ -158,6 +173,21 @@ groups:
           summary: "⚠️ 股票{{ $labels.symbol }}在{{ $labels.trade_date }}的K线数不足"
           description: "预期至少390根K线（RTH），实际只有{{ $value }}根"
           action: "检查该股票在该日期是否有特殊情况（停牌、半日交易等）"
+
+      # 当日处理超时未完成（新增）
+      - alert: DataIngestDayTimeout
+        expr: |
+          data_ingest_day_status == 1
+          and data_ingest_checkpoint_current_trade_date_age_seconds > 3600
+        for: 10m
+        labels:
+          severity: warning
+          component: data_ingest
+          service: ingest_equity_1m_ibkr
+        annotations:
+          summary: "⚠️ 当日处理超时未完成"
+          description: "当前交易日处理已超过1小时仍未完成"
+          action: "排查Top失败symbol，考虑缩小batch或增加重试间隔"
       
       # ============================================================
       # Info 级别告警

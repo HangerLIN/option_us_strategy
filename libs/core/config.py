@@ -72,6 +72,11 @@ class Settings(BaseSettings):
     option_strike_upper_pct: Decimal = Field(Decimal("1.5"), validation_alias="OPTION_STRIKE_UPPER_PCT")
     hist_backfill_window_min: int = Field(15, validation_alias="HIST_BACKFILL_WINDOW_MIN")
     
+    # Monitoring
+    monitoring_enabled: bool = Field(False, validation_alias="MONITORING_ENABLED")
+    monitoring_port: int = Field(9106, validation_alias="MONITORING_PORT")
+    monitoring_env: str = Field("paper", validation_alias="MONITORING_ENV")
+    
     # Top5 股票池配置
     top5_mode: Literal["scanner", "fixed_pool"] = Field("fixed_pool", validation_alias="TOP5_MODE")
     top5_fixed_pool: str = Field(

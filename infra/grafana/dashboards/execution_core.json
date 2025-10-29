@@ -1,0 +1,190 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "订单漏斗 (5m)",
+      "description": "对比提交/通过量，快速定位风控或执行异常。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (mode) (increase(orders_submitted_total{env=~\"$env\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "Submitted {{mode}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (mode) (increase(orders_accepted_total{env=~\"$env\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "Accepted {{mode}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 0},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "none"}}
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "订单转化率",
+      "description": "目标 ≥ 0.6；低于 0.4 时需排查 risk_block/执行阻断。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "avg(orders_conversion_rate{env=~\"$env\", instance=~\"$instance\"})",
+          "legendFormat": "Conversion",
+          "refId": "A"
+        }
+      ],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "orientation": "horizontal"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "percentage",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 0.4},
+              {"color": "green", "value": 0.6}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 5, "w": 8, "x": 0, "y": 9}
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "拒单原因 (5m)",
+      "description": "按 stage & reason 查看阻断来源，常见为 risk/time window。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (stage, reason_code) (increase(orders_blocked_total{env=~\"$env\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{stage}}/{{reason_code}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 16, "x": 8, "y": 9},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "执行延迟 P95",
+      "description": "按 stage 计算 P95；若 >10s，排查 IBKR、网络与策略设置。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(order_execution_latency_seconds_bucket{env=~\"$env\", instance=~\"$instance\"}[5m])) by (stage, le))",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 5},
+              {"color": "red", "value": 10}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 14},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "none"}}
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "超时次数 (15m)",
+      "description": "超时计数飙升需检查 IBKR 响应或价格逻辑。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum(increase(orders_timeout_total{env=~\"$env\", instance=~\"$instance\"}[15m]))",
+          "legendFormat": "Timeouts",
+          "refId": "A"
+        }
+      ],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "orientation": "horizontal"},
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 5, "w": 12, "x": 12, "y": 18}
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "挂单年龄",
+      "description": "`orders_pending_age_seconds` 持续增长说明订单未及时成交/撤单。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "orders_pending_age_seconds{env=~\"$env\", instance=~\"$instance\"}",
+          "legendFormat": "$instance",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 14},
+      "options": {"legend": {"displayMode": "hidden"}, "tooltip": {"mode": "single", "sort": "none"}}
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["execution", "core"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "label": "Datasource",
+        "query": "prometheus",
+        "current": {"selected": true, "text": "Prometheus", "value": "Prometheus"}
+      },
+      {
+        "name": "env",
+        "label": "Environment",
+        "type": "custom",
+        "query": "paper,live",
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {"selected": true, "text": "All", "value": ".*"}
+      },
+      {
+        "name": "instance",
+        "label": "Instance",
+        "type": "query",
+        "datasource": "$datasource",
+        "refresh": 1,
+        "query": "label_values({env=~\"$env\"}, instance)",
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {"selected": true, "text": "All", "value": ".*"}
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "title": "Execution (Core)",
+  "uid": "execution-core",
+  "version": 1
+}

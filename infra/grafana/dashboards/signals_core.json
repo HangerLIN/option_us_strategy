@@ -1,0 +1,159 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "信号产出 (5m)",
+      "description": "分 signal_code 统计 5 分钟产量，关注异常飙升/骤降。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (signal_code) (increase(signals_emitted_total{env=~\"$env\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{signal_code}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 0},
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "过滤原因 (5m)",
+      "description": "查看 TOP 过滤原因，VIX/TIME_WINDOW 异常时需确认参数。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (reason) (increase(signals_filtered_total{env=~\"$env\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 9},
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "信号生成 P95",
+      "description": "P95 > 2s 需检查数据库访问与指标计算。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(signal_generation_latency_seconds_bucket{env=~\"$env\", instance=~\"$instance\"}[5m])) by (le))",
+          "legendFormat": "P95",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 1},
+              {"color": "red", "value": 2}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 9},
+      "options": {
+        "legend": {"displayMode": "hidden", "placement": "bottom"},
+        "tooltip": {"mode": "single", "sort": "none"}
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "AM 系列产量 (15m)",
+      "description": "只统计 AM 系列，帮助观察晨盘策略触发情况。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum(increase(signals_emitted_total{env=~\"$env\", instance=~\"$instance\", signal_code=~\"SIG_AM_.*\"}[15m]))",
+          "legendFormat": "AM Signals",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "green", "value": 1}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 12, "x": 0, "y": 18}
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["signals", "core"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "label": "Datasource",
+        "query": "prometheus",
+        "current": {"selected": true, "text": "Prometheus", "value": "Prometheus"}
+      },
+      {
+        "name": "env",
+        "label": "Environment",
+        "type": "custom",
+        "query": "paper,live",
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {"selected": true, "text": "All", "value": ".*"}
+      },
+      {
+        "name": "instance",
+        "label": "Instance",
+        "type": "query",
+        "datasource": "$datasource",
+        "refresh": 1,
+        "query": "label_values({env=~\"$env\"}, instance)",
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {"selected": true, "text": "All", "value": ".*"}
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "title": "Signals (Core)",
+  "uid": "signals-core",
+  "version": 1
+}

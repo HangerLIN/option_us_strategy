@@ -21,7 +21,7 @@ import logging
 import time
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Dict, Iterable, List, Mapping, Sequence
+from typing import Dict, Iterable, List, Mapping, Sequence, Optional, Tuple
 
 import pandas as pd
 from sqlalchemy import text
@@ -39,46 +39,66 @@ LOGGER = logging.getLogger("ingest_equity_1m")
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Ingest 1m equity bars from IBKR into TimescaleDB")
-    parser.add_argument("--date", help="Single trade date in YYYY-MM-DD (Eastern)")
-    parser.add_argument("--start", help="Start trade date (inclusive, YYYY-MM-DD)")
-    parser.add_argument("--end", help="End trade date (inclusive, YYYY-MM-DD)")
-    parser.add_argument("--symbols", nargs="+", help="Explicit equity symbols to ingest")
+    parser = argparse.ArgumentParser(
+        description="从IBKR拉取1分钟股票K线数据到TimescaleDB",
+        epilog="""
+示例:
+  # 拉取所有股票池数据（2025年9-10月）
+  %(prog)s --start 2025-09-01 --end 2025-10-22 --batch-size 10
+  
+  # 只拉取前10个股票（测试用）
+  %(prog)s --start 2025-10-22 --end 2025-10-22 --symbols-limit 10
+  
+  # 分段拉取：第50-100个股票
+  %(prog)s --start 2025-09-01 --end 2025-10-22 --symbols-offset 50 --symbols-limit 50
+  
+  # 按市值分类拉取：只拉超大盘股
+  %(prog)s --start 2025-09-01 --end 2025-10-22 --universe "stock_universe:超大盘股"
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--start",
+        required=True,
+        help="起始日期 (包含, YYYY-MM-DD, 东部时间)",
+    )
+    parser.add_argument(
+        "--end",
+        required=True,
+        help="结束日期 (包含, YYYY-MM-DD, 东部时间)",
+    )
     parser.add_argument(
         "--universe",
-        default=None,
-        help="Universe specification (default ref_market_cap:GLOBAL when --symbols omitted)",
+        default="stock_universe",
+        help="股票池规范 (默认: stock_universe=所有105个股票, 可选: stock_universe:超大盘股)",
     )
     parser.add_argument(
         "--symbols-offset",
         type=int,
         default=0,
-        help="Skip the first N symbols after universe resolution (default 0)",
+        help="跳过前N个股票 (默认: 0)",
     )
     parser.add_argument(
         "--symbols-limit",
         type=int,
-        help="Limit number of symbols processed after applying offset",
+        help="限制拉取股票数量 (不指定则拉取全部)",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        help="Process symbols in batches of N; defaults to all symbols in one batch",
+        default=10,
+        help="每批处理股票数量 (默认: 10)",
     )
     parser.add_argument(
-        "--rth-only",
-        type=int,
-        default=0,
-        choices=[0, 1],
-        help="When set to 1 only request Regular Trading Hours (09:30-16:00), when 0 (default) includes pre-market (09:00-16:00)",
+        "--ingestion-id",
+        help="本次拉取批次ID（缺省将根据起止日期与universe生成稳定ID）",
     )
-    args = parser.parse_args()
-    if not args.date:
-        if not (args.start and args.end):
-            parser.error("either --date or both --start/--end must be provided")
-    if args.date and (args.start or args.end):
-        parser.error("--date cannot be combined with --start/--end")
-    return args
+    parser.add_argument(
+        "--strict-mode",
+        action="store_true",
+        help="严格模式：单日存在失败则中止，不推进检查点",
+    )
+    return parser.parse_args()
 
 
 def _to_trade_date(value: str) -> date:
@@ -117,19 +137,199 @@ def _bars_to_records(bars: Sequence[Mapping[str, object]]) -> List[Dict[str, obj
     return records
 
 
-def _expected_rth_minutes(trade_date: date) -> int:
+def _get_rth_window_utc(
+    session_factory: sessionmaker[Session], trade_date: date
+) -> Tuple[datetime, datetime, int]:
     """
-    Calculate expected RTH minutes from 08:00 to 16:00 (inclusive).
-    This includes the minute at 16:00, so total is 481 minutes.
-    Note: Data starts from 08:00 to ensure sufficient history for indicators at 09:34.
+    从 dim_trading_calendar 读取 RTH 开收盘(ET时间)，转换为UTC，并计算预期K线数量。
+    返回: (start_utc, end_utc, expected_minutes)
     """
-    start = datetime.combine(trade_date, datetime.min.time(), tzinfo=EASTERN).replace(
-        hour=8, minute=0
+    with session_factory() as session:
+        row = session.execute(
+            text(
+                """
+                SELECT open_et, close_et, is_half_day
+                FROM dim_trading_calendar
+                WHERE trade_date = :d
+                """
+            ),
+            {"d": trade_date},
+        ).one_or_none()
+    if not row or not row[0] or not row[1]:
+        # 兜底：如缺失日历，退回旧逻辑（08:00-16:01，含最后一分钟）
+        start_et = datetime.combine(trade_date, datetime.min.time(), tzinfo=EASTERN).replace(
+            hour=8, minute=1
+        )
+        end_et = datetime.combine(trade_date, datetime.min.time(), tzinfo=EASTERN).replace(
+            hour=16, minute=1
+        )
+        start_utc = start_et.astimezone(timezone.utc)
+        end_utc = end_et.astimezone(timezone.utc)
+        expected = int((end_utc - start_utc).total_seconds() / 60)
+        return start_utc, end_utc, expected
+
+    # row[0] 和 row[1] 是 time 类型，组合成带时区的 datetime
+    open_time = row[0]  # time
+    close_time = row[1]  # time
+    
+    # 组合日期和时间，加上东部时区
+    start_et = datetime.combine(trade_date, open_time, tzinfo=EASTERN)
+    close_et = datetime.combine(trade_date, close_time, tzinfo=EASTERN)
+    
+    # ts_end 以分钟结束时刻计，因此统计窗口取 [open+1m, close+1m)
+    start_utc = (start_et + timedelta(minutes=1)).astimezone(timezone.utc)
+    end_utc = (close_et + timedelta(minutes=1)).astimezone(timezone.utc)
+    expected = int((end_utc - start_utc).total_seconds() / 60)
+    return start_utc, end_utc, expected
+
+
+def _count_symbol_bars_between(
+    session_factory: sessionmaker[Session], symbol: str, start_ts: datetime, end_ts: datetime
+) -> int:
+    with session_factory() as session:
+        count = session.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM bars1m_equity
+                WHERE symbol = :symbol
+                  AND ts_end >= :start_ts
+                  AND ts_end <= :end_ts
+                """
+            ),
+            {"symbol": symbol, "start_ts": start_ts, "end_ts": end_ts},
+        ).scalar()
+        return int(count or 0)
+
+
+# ===================== Progress helpers (DB) =====================
+
+def _stable_ingestion_id(universe: str, start_date: date, end_date: date) -> str:
+    # 生成稳定ID，便于断点续拉（相同起止+universe复用同一ID）
+    return f"ingest-{start_date.isoformat()}-{end_date.isoformat()}-{universe.replace(':','_')}"
+
+
+def _initialize_ingestion_progress(
+    session: Session,
+    ingestion_id: str,
+    trade_dates: List[date],
+    symbols: List[str],
+) -> None:
+    for d in trade_dates:
+        for s in symbols:
+            session.execute(
+                text(
+                    """
+                    INSERT INTO data_ingestion_progress (ingestion_id, trade_date, symbol, status)
+                    VALUES (:ingestion_id, :trade_date, :symbol, 'PENDING')
+                    ON CONFLICT (ingestion_id, trade_date, symbol) DO NOTHING
+                    """
+                ),
+                {"ingestion_id": ingestion_id, "trade_date": d, "symbol": s},
+            )
+    session.commit()
+
+
+def _get_last_completed_trade_date(session: Session, ingestion_id: str) -> Optional[date]:
+    return session.execute(
+        text(
+            """
+            SELECT trade_date
+            FROM mv_ingestion_daily_completion
+            WHERE ingestion_id = :ingestion_id AND is_day_complete
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """
+        ),
+        {"ingestion_id": ingestion_id},
+    ).scalar()
+
+
+def _mark_symbol_in_progress(
+    session: Session, ingestion_id: str, trade_date: date, symbol: str
+) -> None:
+    session.execute(
+        text(
+            """
+            UPDATE data_ingestion_progress
+            SET status = 'IN_PROGRESS', started_at = now(), updated_at = now()
+            WHERE ingestion_id = :ingestion_id AND trade_date = :trade_date AND symbol = :symbol
+            """
+        ),
+        {"ingestion_id": ingestion_id, "trade_date": trade_date, "symbol": symbol},
     )
-    end = datetime.combine(trade_date, datetime.min.time(), tzinfo=EASTERN).replace(
-        hour=16, minute=1  # 16:01 to include the 16:00 minute
+
+
+def _mark_symbol_completed(
+    session: Session,
+    ingestion_id: str,
+    trade_date: date,
+    symbol: str,
+    bars_count: int,
+    indicators_count: int,
+) -> None:
+    session.execute(
+        text(
+            """
+            UPDATE data_ingestion_progress
+            SET status = 'COMPLETED',
+                completed_at = now(),
+                updated_at = now(),
+                bars_count = :bars_count,
+                indicators_count = :indicators_count
+            WHERE ingestion_id = :ingestion_id AND trade_date = :trade_date AND symbol = :symbol
+            """
+        ),
+        {
+            "ingestion_id": ingestion_id,
+            "trade_date": trade_date,
+            "symbol": symbol,
+            "bars_count": int(bars_count),
+            "indicators_count": int(indicators_count),
+        },
     )
-    return int((end - start).total_seconds() / 60)
+
+
+def _mark_symbol_failed(
+    session: Session, ingestion_id: str, trade_date: date, symbol: str, error: str
+) -> None:
+    session.execute(
+        text(
+            """
+            UPDATE data_ingestion_progress
+            SET status = 'FAILED', updated_at = now(), last_error = :err, retry_count = retry_count + 1
+            WHERE ingestion_id = :ingestion_id AND trade_date = :trade_date AND symbol = :symbol
+            """
+        ),
+        {
+            "ingestion_id": ingestion_id,
+            "trade_date": trade_date,
+            "symbol": symbol,
+            "err": error[:500],
+        },
+    )
+
+
+def _refresh_ingest_mv(session: Session) -> None:
+    session.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_ingestion_daily_completion"))
+    session.commit()
+
+
+def _check_day_completion(
+    session: Session, ingestion_id: str, trade_date: date
+) -> Tuple[bool, int, int, int]:
+    row = session.execute(
+        text(
+            """
+            SELECT total_symbols, completed_symbols, failed_symbols, is_day_complete
+            FROM mv_ingestion_daily_completion
+            WHERE ingestion_id = :ingestion_id AND trade_date = :trade_date
+            """
+        ),
+        {"ingestion_id": ingestion_id, "trade_date": trade_date},
+    ).one_or_none()
+    if not row:
+        return False, 0, 0, 0
+    return bool(row[3]), int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
 
 
 def _load_baseline_map(session: Session, symbol: str) -> Dict[int, Decimal]:
@@ -454,11 +654,15 @@ def _request_equity_bars_with_retry(
     *,
     symbol: str,
     trade_date: date,
-    rth_only: bool,
     monitor: Optional[DataIngestionMonitor] = None,
     max_attempts: int = 4,
     backoff_seconds: float = 5.0,
 ):
+    """
+    Request equity bars with exponential backoff retry logic.
+    
+    从08:00-16:00 ET拉取分钟级K线数据（包含盘前1小时）。
+    """
     # 记录请求
     if monitor:
         monitor.record_bars_request(symbol, trade_date)
@@ -466,7 +670,7 @@ def _request_equity_bars_with_retry(
     last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            return client.req_historical_1m_equity(symbol, trade_date, rth_only=rth_only)
+            return client.req_historical_1m_equity(symbol, trade_date, rth_only=False)
         except Exception as exc:  # pragma: no cover - network/ib failure
             last_exc = exc
             
@@ -544,6 +748,13 @@ def ingest_vix(
         
         # 存储到risk_state表
         _store_vix_to_risk_state(session_factory, records)
+        # metrics: vix done
+        try:
+            monitor = globals().get("_GLOBAL_MONITOR")  # set in main
+            if isinstance(monitor, DataIngestionMonitor):
+                monitor.record_vix_done(trade_date)
+        except Exception:
+            pass
         
         LOGGER.info(
             "VIX data ingestion complete: trade_date=%s vix_close=%s records=%d",
@@ -567,15 +778,13 @@ def ingest_equity(
     trade_date: date,
     symbol: str,
     *,
-    rth_only: bool,
     monitor: Optional[DataIngestionMonitor] = None,
-) -> None:
+) -> int:
     LOGGER.info("Fetching 1m bars symbol=%s trade_date=%s", symbol, trade_date.isoformat())
     bars = _request_equity_bars_with_retry(
         client,
         symbol=symbol,
         trade_date=trade_date,
-        rth_only=rth_only,
         monitor=monitor,
     )
     records = _bars_to_records(bars)
@@ -611,7 +820,7 @@ def ingest_equity(
     )
     start_utc = start_et.astimezone(timezone.utc)
     end_utc = (end_et + timedelta(minutes=1)).astimezone(timezone.utc)
-    expected = max(480, _expected_rth_minutes(trade_date))
+    _, _, expected = _get_rth_window_utc(session_factory, trade_date)
     _validate_rth_count(session_factory, symbol, start_utc, end_utc, expected)
     
     # 记录完成
@@ -619,7 +828,7 @@ def ingest_equity(
         monitor.record_symbol_date_completed(symbol, trade_date)
     
     LOGGER.info("Ingest completed symbol=%s records=%s", symbol, len(records))
-
+    return len(records)
 
 def main() -> int:
     args = _parse_args()
@@ -642,25 +851,23 @@ def main() -> int:
             option_bar_table=settings.option_bar_table,
             option_chain_table=settings.option_chain_table,
         )
-        if args.date:
-            trade_dates = [_to_trade_date(args.date)]
-        else:
-            start_date = _to_trade_date(args.start)
-            end_date = _to_trade_date(args.end)
-            if end_date < start_date:
-                raise SystemExit("--end must not be earlier than --start")
-            trade_dates = dao.fetch_trade_dates_between(start_date=start_date, end_date=end_date)
+        # 解析日期范围
+        start_date = _to_trade_date(args.start)
+        end_date = _to_trade_date(args.end)
+        if end_date < start_date:
+            raise SystemExit("--end must not be earlier than --start")
+        trade_dates = dao.fetch_trade_dates_between(start_date=start_date, end_date=end_date)
         if not trade_dates:
             raise SystemExit("No trading dates available in the requested window")
 
-        if args.symbols:
-            symbols = [symbol.upper() for symbol in args.symbols]
-        else:
-            resolver = UniverseResolver(session)
-            universe = resolver.resolve(args.universe)
-            symbols = universe.symbols
+        # 从数据库表解析股票池
+        resolver = UniverseResolver(session)
+        universe = resolver.resolve(args.universe)
+        symbols = universe.symbols
         if not symbols:
             raise SystemExit("Symbol universe resolved to zero entries")
+        
+        # 应用offset和limit
         offset = max(0, int(args.symbols_offset))
         if offset:
             symbols = symbols[offset:]
@@ -679,6 +886,19 @@ def main() -> int:
         args.batch_size,
     )
     
+    # 生成/确定 ingestion_id
+    ingestion_id = args.ingestion_id or _stable_ingestion_id(args.universe or "stock_universe", trade_dates[0], trade_dates[-1])
+
+    # 初始化进度（幂等）并寻找断点
+    with session_factory() as session:
+        _initialize_ingestion_progress(session, ingestion_id, trade_dates, symbols)
+        last_completed = _get_last_completed_trade_date(session, ingestion_id)
+        if last_completed:
+            trade_dates = [d for d in trade_dates if d > last_completed]
+            LOGGER.info("Resuming from checkpoint. last_completed=%s remaining_days=%d", last_completed.isoformat(), len(trade_dates))
+        else:
+            LOGGER.info("No checkpoint found. Starting from scratch days=%d", len(trade_dates))
+
     # 创建监控器
     monitor: Optional[DataIngestionMonitor] = None
     if metrics_enabled:
@@ -690,6 +910,8 @@ def main() -> int:
             end_date_str=trade_dates[-1].isoformat() if trade_dates else "",
             universe=args.universe or "explicit_symbols",
         )
+        # global handle for ingest_vix metric hook
+        globals()["_GLOBAL_MONITOR"] = monitor
     
     client = build_ibkr_client(settings)
     try:
@@ -719,6 +941,11 @@ def main() -> int:
                 batch_symbols,
             )
             for trade_date in trade_dates:
+                # 设置当前处理交易日与预期bars
+                if monitor:
+                    monitor.set_current_trade_date(trade_date)
+                    _, _, expected_bars = _get_rth_window_utc(session_factory, trade_date)
+                    monitor.set_day_expected_bars(trade_date, expected_bars)
                 # 首先拉取VIX数据（每个交易日一次）
                 try:
                     ingest_vix(
@@ -734,17 +961,43 @@ def main() -> int:
                     )
                     # VIX拉取失败不影响equity数据拉取，继续执行
                 
-                # 拉取股票数据
+                # 拉取股票数据（先检查是否已完整，已完整则跳过并标记完成）
                 for symbol in batch_symbols:
                     try:
-                        ingest_equity(
+                        # 预检查：按交易日历RTH窗口计算预期与现有条数
+                        start_utc, end_utc, expected = _get_rth_window_utc(session_factory, trade_date)
+                        existing = _count_symbol_bars_between(session_factory, symbol, start_utc, end_utc)
+                        if existing >= max(1, expected):
+                            with session_factory() as session:
+                                _mark_symbol_completed(session, ingestion_id, trade_date, symbol, existing, existing)
+                                session.commit()
+                            if monitor:
+                                monitor.record_symbol_date_completed(symbol, trade_date)
+                            LOGGER.info(
+                                "skip.ingest already complete symbol=%s trade_date=%s bars=%d expected=%d",
+                                symbol,
+                                trade_date.isoformat(),
+                                existing,
+                                expected,
+                            )
+                            continue
+
+                        # 标记进度：IN_PROGRESS
+                        with session_factory() as session:
+                            _mark_symbol_in_progress(session, ingestion_id, trade_date, symbol)
+                            session.commit()
+
+                        bars_count = ingest_equity(
                             client=client,
                             session_factory=session_factory,
                             trade_date=trade_date,
                             symbol=symbol,
-                            rth_only=bool(args.rth_only),
                             monitor=monitor,
                         )
+                        # 标记完成
+                        with session_factory() as session:
+                            _mark_symbol_completed(session, ingestion_id, trade_date, symbol, bars_count, bars_count)
+                            session.commit()
                     except Exception as exc:  # pragma: no cover - network failure path
                         # 记录失败
                         if monitor:
@@ -756,7 +1009,33 @@ def main() -> int:
                             trade_date.isoformat(),
                             str(exc),
                         )
+                        with session_factory() as session:
+                            _mark_symbol_failed(session, ingestion_id, trade_date, symbol, str(exc))
+                            session.commit()
                         continue
+                # 若为最后一个batch，检查该交易日是否已全部完成
+                if batch_index == len(batches):
+                    with session_factory() as session:
+                        try:
+                            _refresh_ingest_mv(session)
+                        except Exception:
+                            pass
+                        is_complete, total, done, failed = _check_day_completion(session, ingestion_id, trade_date)
+                    if is_complete:
+                        if monitor:
+                            monitor.mark_day_completed(trade_date)
+                        LOGGER.info("✅ trade_date=%s fully completed (%d/%d, failed=%d)", trade_date.isoformat(), done, total, failed)
+                    else:
+                        if monitor:
+                            monitor.mark_day_failed_partial(trade_date)
+                        # 额外再做一次“剩余缺口”日志，便于人工排查
+                        remaining = max(0, total - done - failed)
+                        LOGGER.warning(
+                            "⚠️ trade_date=%s incomplete (%d/%d, failed=%d, remaining=%d)",
+                            trade_date.isoformat(), done, total, failed, remaining
+                        )
+                        if args.strict_mode:
+                            raise RuntimeError(f"Trade date {trade_date.isoformat()} incomplete: {done}/{total}, failed={failed}")
             
             # 批次完成后输出统计
             LOGGER.info(

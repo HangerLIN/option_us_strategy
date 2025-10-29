@@ -12,8 +12,8 @@ from alembic import op
 
 revision = "20251105_093000"
 branch_labels = None
-depends_on = "20251101_090000_add_bt_top5_table"
-down_revision = "20251101_090000_add_bt_top5_table"
+depends_on = "20251101090000"
+down_revision = "20251101090000"
 
 
 def upgrade() -> None:
@@ -25,7 +25,7 @@ def upgrade() -> None:
             underlying_symbol TEXT NOT NULL,
             conid BIGINT NOT NULL,
             expiry DATE NOT NULL,
-            right TEXT NOT NULL,
+            "right" TEXT NOT NULL,
             strike NUMERIC(18, 6) NOT NULL,
             trading_class TEXT,
             multiplier TEXT,
@@ -54,16 +54,40 @@ def upgrade() -> None:
         DO $$
         DECLARE
             pk_name text;
+            pk_columns text;
         BEGIN
-            SELECT tc.constraint_name INTO pk_name
+            -- Check if primary key already exists with correct columns
+            SELECT string_agg(kcu.column_name, ', ' ORDER BY kcu.ordinal_position) INTO pk_columns
             FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+                ON tc.constraint_name = kcu.constraint_name
+                AND tc.table_schema = kcu.table_schema
             WHERE tc.table_schema = 'public'
               AND tc.table_name = 'option_chain_meta'
               AND tc.constraint_type = 'PRIMARY KEY';
-            IF pk_name IS NOT NULL THEN
-                EXECUTE format('ALTER TABLE option_chain_meta DROP CONSTRAINT %I', pk_name);
+            
+            -- If PK exists with correct columns, skip
+            IF pk_columns = 'trade_date, conid' THEN
+                RAISE NOTICE 'Primary key already exists with correct columns, skipping';
+                RETURN;
             END IF;
-            EXECUTE 'ALTER TABLE option_chain_meta ADD CONSTRAINT option_chain_meta_pkey PRIMARY KEY (trade_date, conid)';
+            
+            -- Try to drop and recreate PK
+            BEGIN
+                SELECT tc.constraint_name INTO pk_name
+                FROM information_schema.table_constraints tc
+                WHERE tc.table_schema = 'public'
+                  AND tc.table_name = 'option_chain_meta'
+                  AND tc.constraint_type = 'PRIMARY KEY';
+                  
+                IF pk_name IS NOT NULL THEN
+                    EXECUTE format('ALTER TABLE option_chain_meta DROP CONSTRAINT %I', pk_name);
+                END IF;
+                EXECUTE 'ALTER TABLE option_chain_meta ADD CONSTRAINT option_chain_meta_pkey PRIMARY KEY (trade_date, conid)';
+            EXCEPTION
+                WHEN insufficient_privilege THEN
+                    RAISE NOTICE 'Insufficient privilege to modify primary key, skipping';
+            END;
         END $$;
         """
     )
@@ -245,7 +269,7 @@ def upgrade() -> None:
         """
         DO $$
         BEGIN
-            EXECUTE 'CREATE INDEX IF NOT EXISTS idx_option_chain_meta_trade_date_right ON option_chain_meta (trade_date, right)';
+            EXECUTE 'CREATE INDEX IF NOT EXISTS idx_option_chain_meta_trade_date_right ON option_chain_meta (trade_date, "right")';
         EXCEPTION
             WHEN insufficient_privilege THEN
                 RAISE NOTICE 'Skipping idx_option_chain_meta_trade_date_right due to insufficient privileges';
@@ -261,7 +285,7 @@ def upgrade() -> None:
             ts_end TIMESTAMPTZ NOT NULL,
             underlying_symbol TEXT NOT NULL,
             expiry DATE NOT NULL,
-            right TEXT NOT NULL,
+            "right" TEXT NOT NULL,
             strike NUMERIC(18, 6) NOT NULL,
             trading_class TEXT,
             multiplier TEXT,
@@ -289,16 +313,40 @@ def upgrade() -> None:
         DO $$
         DECLARE
             pk_name text;
+            pk_columns text;
         BEGIN
-            SELECT tc.constraint_name INTO pk_name
+            -- Check if primary key already exists with correct columns
+            SELECT string_agg(kcu.column_name, ', ' ORDER BY kcu.ordinal_position) INTO pk_columns
             FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+                ON tc.constraint_name = kcu.constraint_name
+                AND tc.table_schema = kcu.table_schema
             WHERE tc.table_schema = 'public'
               AND tc.table_name = 'bars1m_option'
               AND tc.constraint_type = 'PRIMARY KEY';
-            IF pk_name IS NOT NULL THEN
-                EXECUTE format('ALTER TABLE bars1m_option DROP CONSTRAINT %I', pk_name);
+            
+            -- If PK exists with correct columns, skip
+            IF pk_columns = 'conid, ts_end' THEN
+                RAISE NOTICE 'Primary key already exists with correct columns, skipping';
+                RETURN;
             END IF;
-            EXECUTE 'ALTER TABLE bars1m_option ADD CONSTRAINT bars1m_option_pkey PRIMARY KEY (conid, ts_end)';
+            
+            -- Try to drop and recreate PK
+            BEGIN
+                SELECT tc.constraint_name INTO pk_name
+                FROM information_schema.table_constraints tc
+                WHERE tc.table_schema = 'public'
+                  AND tc.table_name = 'bars1m_option'
+                  AND tc.constraint_type = 'PRIMARY KEY';
+                  
+                IF pk_name IS NOT NULL THEN
+                    EXECUTE format('ALTER TABLE bars1m_option DROP CONSTRAINT %I', pk_name);
+                END IF;
+                EXECUTE 'ALTER TABLE bars1m_option ADD CONSTRAINT bars1m_option_pkey PRIMARY KEY (conid, ts_end)';
+            EXCEPTION
+                WHEN insufficient_privilege THEN
+                    RAISE NOTICE 'Insufficient privilege to modify primary key, skipping';
+            END;
         END $$;
         """
     )
@@ -480,6 +528,8 @@ def upgrade() -> None:
             EXCEPTION
                 WHEN insufficient_privilege THEN
                     RAISE NOTICE 'Skipping idx_bars1m_option_symbol_ts due to insufficient privileges';
+                WHEN undefined_column THEN
+                    RAISE NOTICE 'Skipping idx_bars1m_option_symbol_ts, column does not exist';
             END;
         END $$;
         """

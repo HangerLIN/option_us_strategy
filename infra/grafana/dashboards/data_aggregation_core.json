@@ -1,0 +1,208 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Bar 延迟 P95",
+      "description": "P95 超过 5s 说明聚合线程阻塞或数据库写入慢，检查 rt_engine 日志与数据库状况。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(bars_latency_seconds_bucket{env=~\"$env\", instance=~\"$instance\"}[5m])) by (le))",
+          "legendFormat": "P95",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 3},
+              {"color": "red", "value": 5}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "single", "sort": "none"}
+      },
+      "pluginVersion": "9.5.0"
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "数据新鲜度 (s)",
+      "description": "`last_bar_ts_diff_seconds` > 90s 说明分钟数据滞后，优先看 md_gw 订阅和历史补数。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "max(last_bar_ts_diff_seconds{env=~\"$env\", instance=~\"$instance\"})",
+          "legendFormat": "$instance",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 90}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "single", "sort": "none"}
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "指标计算耗时",
+      "description": "监控 RSI/BOLL 等计算延迟；若阈值 >0.5s，检查 pandas/DB 压力。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(rt_indicator_calculation_seconds_bucket{env=~\"$env\", instance=~\"$instance\", indicator=~\".*\"}[5m])) by (indicator, le))",
+          "legendFormat": "{{indicator}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 8},
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "指标失败次数 (15m)",
+      "description": "快速识别指标计算异常，常见因子：数据 NaN 或 pandas 异常。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum(increase(rt_indicator_failures_total{env=~\"$env\", instance=~\"$instance\"}[15m]))",
+          "legendFormat": "Failures",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 5, "w": 12, "x": 12, "y": 8}
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Top5 候选与耗时",
+      "description": "候选数量异动或耗时>5s 需检查 Scanner/数据库。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "rt_top5_candidates_count{env=~\"$env\", instance=~\"$instance\"}",
+          "legendFormat": "候选数",
+          "refId": "A"
+        },
+        {
+          "expr": "rt_top5_calculation_seconds_sum{env=~\"$env\", instance=~\"$instance\"} / rt_top5_calculation_seconds_count{env=~\"$env\", instance=~\"$instance\"}",
+          "legendFormat": "平均耗时",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "平均耗时"},
+            "properties": [{"id": "unit", "value": "s"}]
+          }
+        ]
+      },
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 17},
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["aggregation", "core"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "label": "Datasource",
+        "query": "prometheus",
+        "current": {"selected": true, "text": "Prometheus", "value": "Prometheus"}
+      },
+      {
+        "name": "env",
+        "label": "Environment",
+        "type": "custom",
+        "query": "paper,live",
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {"selected": true, "text": "All", "value": ".*"}
+      },
+      {
+        "name": "instance",
+        "label": "Instance",
+        "type": "query",
+        "datasource": "$datasource",
+        "refresh": 1,
+        "query": "label_values({env=~\"$env\"}, instance)",
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {"selected": true, "text": "All", "value": ".*"}
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "title": "Data & Aggregation (Core)",
+  "uid": "data-aggregation-core",
+  "version": 1
+}

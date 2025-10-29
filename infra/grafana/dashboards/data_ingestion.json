@@ -22,6 +22,46 @@
   "links": [],
   "panels": [
     {
+      "datasource": {"type": "prometheus", "uid": "bf1tzgy5kopogd"},
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 32},
+      "id": 101,
+      "type": "stat",
+      "title": "Checkpoint - Last Completed Day",
+      "targets": [{"expr": "data_ingest_checkpoint_last_completed_trade_date_timestamp", "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "fieldConfig": {"defaults": {"unit": "dateTimeAsIso"}}
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "bf1tzgy5kopogd"},
+      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 32},
+      "id": 102,
+      "type": "stat",
+      "title": "Current Day",
+      "targets": [{"expr": "data_ingest_checkpoint_current_trade_date_timestamp", "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "fieldConfig": {"defaults": {"unit": "dateTimeAsIso"}}
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "bf1tzgy5kopogd"},
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 32},
+      "id": 103,
+      "type": "stat",
+      "title": "Current Day Age (min)",
+      "targets": [{"expr": "data_ingest_checkpoint_current_trade_date_age_seconds / 60", "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "fieldConfig": {"defaults": {"unit": "m", "decimals": 1}}
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "bf1tzgy5kopogd"},
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 32},
+      "id": 104,
+      "type": "gauge",
+      "title": "Current Day Completion (%)",
+      "targets": [{"expr": "100 * data_ingest_day_completed_symbols / data_ingest_day_total_symbols", "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100}}
+    }
+    {
       "datasource": {
         "type": "prometheus",
         "uid": "bf1tzgy5kopogd"

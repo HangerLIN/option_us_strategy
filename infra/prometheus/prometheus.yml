@@ -24,7 +24,7 @@ scrape_configs:
     scrape_interval: 15s
     scrape_timeout: 10s
 
-  # 业务服务 - 实时数据引擎
+  # 业务服务 - 实时数据引擎（保留原有采集配置）
   - job_name: 'rt_engine'
     static_configs:
       - targets: ['host.docker.internal:8002']
@@ -35,7 +35,10 @@ scrape_configs:
   # 业务服务 - 信号服务
   - job_name: 'signal_svc'
     static_configs:
-      - targets: ['host.docker.internal:8003']
+      - targets: ['127.0.0.1:8000']
+    relabel_configs:
+      - target_label: env
+        replacement: ${MONITORING_ENV}
     metrics_path: '/metrics'
     scrape_interval: 15s
     scrape_timeout: 10s
@@ -43,7 +46,10 @@ scrape_configs:
   # 业务服务 - 风控服务
   - job_name: 'risk_svc'
     static_configs:
-      - targets: ['host.docker.internal:8004']
+      - targets: ['127.0.0.1:8002']
+    relabel_configs:
+      - target_label: env
+        replacement: ${MONITORING_ENV}
     metrics_path: '/metrics'
     scrape_interval: 10s  # 风控指标需要更及时
     scrape_timeout: 8s
@@ -51,7 +57,10 @@ scrape_configs:
   # 业务服务 - 执行服务
   - job_name: 'exec_svc'
     static_configs:
-      - targets: ['host.docker.internal:8001']
+      - targets: ['127.0.0.1:8001']
+    relabel_configs:
+      - target_label: env
+        replacement: ${MONITORING_ENV}
     metrics_path: '/metrics'
     scrape_interval: 15s
     scrape_timeout: 10s
@@ -59,7 +68,42 @@ scrape_configs:
   # 业务服务 - 盈亏服务
   - job_name: 'pnl_svc'
     static_configs:
-      - targets: ['host.docker.internal:8005']
+      - targets: ['127.0.0.1:8003']
+    relabel_configs:
+      - target_label: env
+        replacement: ${MONITORING_ENV}
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+
+  # 业务服务 - 行情网关
+  - job_name: 'md_gw'
+    static_configs:
+      - targets: ['127.0.0.1:8005']
+    relabel_configs:
+      - target_label: env
+        replacement: ${MONITORING_ENV}
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+
+  # 实时引擎指标聚合端口
+  - job_name: 'rt_engine_aggregator'
+    static_configs:
+      - targets: ['127.0.0.1:9106']
+    relabel_configs:
+      - target_label: env
+        replacement: ${MONITORING_ENV}
+    scrape_interval: 15s
+    scrape_timeout: 10s
+
+  # 实时引擎 API
+  - job_name: 'rt_api'
+    static_configs:
+      - targets: ['127.0.0.1:8007']
+    relabel_configs:
+      - target_label: env
+        replacement: ${MONITORING_ENV}
     metrics_path: '/metrics'
     scrape_interval: 15s
     scrape_timeout: 10s

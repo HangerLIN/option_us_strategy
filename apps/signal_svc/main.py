@@ -9,6 +9,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from libs.core import (
     TraceContextMiddleware,
+    bind_trace_context,
     configure_logging,
     get_settings,
     update_trace_context,
@@ -66,6 +67,54 @@ class _SignalStreamBroker:
 
 
 signal_stream = _SignalStreamBroker()
+bars_closed_consumer_task: asyncio.Task | None = None
+
+
+async def _consume_bars_closed() -> None:
+    try:
+        await redis_bus.ensure_group("bars_closed", "signal_svc", start_id="0")
+        LOGGER.info("signal_svc.consumer_started", stream="bars_closed")
+        while True:
+            try:
+                entries = await redis_bus.consume(
+                    event="bars_closed",
+                    group="signal_svc",
+                    consumer="signal-worker",
+                    count=20,
+                    block_ms=5000,
+                    ack=True,
+                )
+            except Exception:
+                LOGGER.exception("signal_svc.consume_failed")
+                await asyncio.sleep(2)
+                continue
+
+            if not entries:
+                continue
+
+            for entry in entries:
+                payload = entry.get("payload") or {}
+                trace_id = entry.get("trace_id")
+                try:
+                    event = BarsClosed(**payload)
+                except Exception:
+                    LOGGER.exception("signal_svc.parse_failed", payload=payload)
+                    continue
+
+                bind_trace_context(trace_id, symbol=event.symbol)
+                try:
+                    signals = signal_engine.process_bar(event)
+                except Exception:
+                    LOGGER.exception("signal_svc.process_failed", symbol=event.symbol)
+                    continue
+
+                if signals:
+                    await signal_stream.broadcast(
+                        _build_signal_message(signals, source="bars_closed")
+                    )
+    except asyncio.CancelledError:
+        LOGGER.info("signal_svc.consumer_stopped")
+        raise
 
 
 def _build_signal_message(signals, *, source: str) -> dict:
@@ -173,10 +222,21 @@ async def startup_event() -> None:
         LOGGER.debug("Skipping redis ping in test environment")
         return
     await redis_bus.ping()
+    global bars_closed_consumer_task
+    bars_closed_consumer_task = asyncio.create_task(_consume_bars_closed())
 
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
+    global bars_closed_consumer_task
+    task = bars_closed_consumer_task
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        bars_closed_consumer_task = None
     await redis_bus.close()
 
 

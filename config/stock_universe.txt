@@ -1,6 +1,8 @@
 # 美股期权交易股票池
-# 共138个股票，按市值和流动性筛选
-# 更新日期：2025-10-21
+# 共99个股票，按市值和流动性筛选
+# 更新日期：2025-10-25
+# 移除：CORE, MRST（IBKR中不存在）
+# 移除：UVIX（波动率ETF）, XOM（能源）, NEM（矿业）, AZN（制药）
 
 # 超大盘股（市值 > 1T）
 NVDA
@@ -71,8 +73,8 @@ AXP
 HOOD
 
 # 能源与材料
-XOM
-NEM
+# XOM - 已移除（非科技股）
+# NEM - 已移除（非科技股）
 
 # 工业与制造
 GE
@@ -101,7 +103,7 @@ CFLT
 PDD
 DLR
 EA
-AZN
+# AZN - 已移除（制药公司，非科技股）
 
 # 新兴成长股与加密相关
 MP
@@ -111,17 +113,15 @@ CRDO
 ALAB
 SMCI
 VRT
-CORE
 WDC
 CRCL
 GLXY
 QBTS
 RGTI
-UVIX
+# UVIX - 已移除（波动率ETF，非股票）
 BIDU
 CORZ
 APLD
 IREN
-MRST
 RXRX
 

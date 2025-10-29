@@ -22,6 +22,7 @@ from libs.core import (
     utc_now,
 )
 from libs.db.dao import RiskEventDAO, StrategyPositionDAO
+from libs.db.calendar_refresher import ensure_future_calendar, schedule_daily_refresh
 from libs.infra.db import get_session_factory
 from libs.infra.redis_bus import RedisBus
 from libs.schemas.common import ApiResult, ServiceHealth
@@ -47,12 +48,14 @@ configure_logging(settings)
 session_factory = get_session_factory(settings)
 redis_bus = RedisBus(settings.redis_url)
 risk_service = RiskService(session_factory, redis_url=settings.redis_url)
+METRICS_ENABLED = bool(settings.monitoring_enabled)
 _initial_limits = risk_service.current_limits()
 _limits_snapshot: RiskLimits = _initial_limits.model_copy(deep=True)
 _risk_notional_cap: Decimal = _limits_snapshot.notional_cap
 _limits_updated_at = _limits_snapshot.updated_at
 consumer_manager: Optional[RiskStreamConsumers] = None
 consumer_tasks: list[asyncio.Task[Any]] = []
+calendar_task: asyncio.Task[Any] | None = None
 
 app = FastAPI(title="风控服务", version="0.1.0", description="风险管理与动态调整 API")
 app.add_middleware(TraceContextMiddleware)
@@ -108,10 +111,16 @@ async def verify_dependencies() -> None:
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    global consumer_manager
+    global consumer_manager, calendar_task
     if settings.app_env == "test":
         LOGGER.debug("Skipping dependency verification in test environment")
         return
+    try:
+        refreshed = ensure_future_calendar(days_ahead=90)
+        LOGGER.info("risk_svc.calendar_ready: sessions=%d", refreshed)
+    except Exception:
+        LOGGER.exception("risk_svc.calendar_refresh_failed")
+        raise
     await verify_dependencies()
     state_aggregator = RiskStateAggregator(session_factory, risk_service, redis_bus)
     consumer_manager = RiskStreamConsumers(
@@ -125,11 +134,20 @@ async def startup_event() -> None:
     tasks = list(consumer_manager.start())
     consumer_tasks.clear()
     consumer_tasks.extend(tasks)
+    calendar_task = asyncio.create_task(schedule_daily_refresh(days_ahead=90, at_minute=5))
 
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
-    global consumer_manager
+    global consumer_manager, calendar_task
+    task = calendar_task
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        calendar_task = None
     if consumer_manager is not None:
         await consumer_manager.stop()
         consumer_manager = None
@@ -409,7 +427,11 @@ async def force_close(
         },
         trace_id=str(uuid4()),
     )
-    record_force_close("MANUAL")
+    if METRICS_ENABLED:
+        try:
+            record_force_close("MANUAL")
+        except Exception:  # pragma: no cover - metrics best-effort
+            pass
 
     result = ForceCloseResult(
         strategy_code=payload.strategy_code,

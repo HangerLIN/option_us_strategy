@@ -10,7 +10,7 @@ from queue import Queue
 from typing import Dict, List, Optional
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from ibapi.scanner import ScannerSubscription
 from ibapi.ticktype import TickTypeEnum
 from pydantic import BaseModel, Field, model_validator
@@ -24,8 +24,15 @@ from libs.core import (
     utc_now,
 )
 from libs.infra import RedisBus, build_ibkr_client
+from libs.infra.metrics import (
+    set_ibkr_connection_status,
+    record_ibkr_reconnection,
+    record_tick_received,
+    set_subscribed_symbols_count,
+)
 from libs.infra.ibkr_client import IBClient
 from libs.schemas.common import ServiceHealth
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from libs.schemas.events import MarketDataEvent
 
 import structlog
@@ -72,6 +79,11 @@ async def _ensure_ib_connection() -> None:
     client = _require_ib_client()
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, client.connect_and_wait)
+    try:
+        if settings.monitoring_enabled:
+            set_ibkr_connection_status(True)
+    except Exception:  # pragma: no cover - metrics best-effort
+        pass
 
 
 async def _connection_watchdog() -> None:
@@ -85,6 +97,12 @@ async def _connection_watchdog() -> None:
                 try:
                     await loop.run_in_executor(None, client.connect_and_wait)
                     LOGGER.info("md_gw.watchdog_reconnect_success")
+                    try:
+                        if settings.monitoring_enabled:
+                            set_ibkr_connection_status(True)
+                            record_ibkr_reconnection("watchdog")
+                    except Exception:
+                        pass
                 except Exception:  # pragma: no cover - defensive
                     LOGGER.exception("md_gw.watchdog_reconnect_failed")
                     await asyncio.sleep(10)
@@ -159,6 +177,12 @@ async def _consume_subscription(state: SubscriptionState) -> None:
             elif event_type == "size":
                 continue
             await _publish_top_of_book(state)
+            try:
+                if settings.monitoring_enabled:
+                    # 使用 alias 作为标签，避免与纯 symbol 冲突
+                    record_tick_received(state.alias)
+            except Exception:  # pragma: no cover
+                pass
     except asyncio.CancelledError:  # pragma: no cover - cooperative shutdown
         LOGGER.debug("md_gw.subscription_stream_cancelled", alias=state.alias)
     finally:
@@ -182,6 +206,12 @@ async def _unsubscribe(req_id: int) -> None:
         await loop.run_in_executor(None, client.unsubscribe_l1, state.alias)
     except Exception:  # pragma: no cover - external dependency
         LOGGER.exception("md_gw.unsubscribe_failed", alias=state.alias)
+    try:
+        if settings.monitoring_enabled:
+            async with subscription_lock:
+                set_subscribed_symbols_count(len(subscriptions))
+    except Exception:  # pragma: no cover
+        pass
 
 
 class MarketDataSubscription(BaseModel):
@@ -259,6 +289,11 @@ async def healthcheck() -> ServiceHealth:
     return ServiceHealth(status="ok", service="md_gw", timestamp=utc_now())
 
 
+@app.get("/metrics", summary="Prometheus 指标")
+async def metrics() -> Response:
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.post("/subscriptions")
 async def subscribe_market_data(payload: MarketDataSubscription) -> dict[str, int]:
     try:
@@ -299,6 +334,11 @@ async def subscribe_market_data(payload: MarketDataSubscription) -> dict[str, in
 
     async with subscription_lock:
         subscriptions[req_id] = state
+        try:
+            if settings.monitoring_enabled:
+                set_subscribed_symbols_count(len(subscriptions))
+        except Exception:  # pragma: no cover
+            pass
 
     LOGGER.info(
         "md_gw.subscription_created",

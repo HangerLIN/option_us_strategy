@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import statistics
+import time as time_module
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -17,7 +18,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from libs.core import EASTERN, get_settings
 from libs.db import RiskStateDAO, SignalLogDAO
 from libs.db.preearn import evaluate_preearn_guard
-from libs.infra.metrics import observe_bar_latency, record_signal_emitted
+from libs.infra.metrics import (
+    observe_bar_latency,
+    record_signal_emitted,
+    observe_signal_generation,
+    record_signal_filtered,
+)
 from libs.infra.redis_bus import RedisBus
 from libs.schemas.events import BarsClosed
 from libs.schemas.signals import SignalEnvelope, SignalPushItem, SignalSide
@@ -53,6 +59,7 @@ SELL_SIGNALS = {
     "SIG_EXIT_UPPER_TAP_X2",
     "SIG_EXIT_BOX2MID",
     "SIG_TIME_CLEAR_12_14",
+    "SIG_OVERNIGHT_GAP_EXIT",
     "SIG_AM_SELL_C1",
     "SIG_AM_CONFLUENCE_SELL_S2",
 }
@@ -101,6 +108,7 @@ class SignalEngine:
         self._top5_today_cache: Dict[date, set[str]] = {}
         self._top5_source: Top5Source = top5_source or PremarketTop5Source()
         self._vix_cache: Tuple[Optional[Decimal], Optional[datetime]] = (None, None)
+        self._metrics_enabled: bool = bool(self._settings.monitoring_enabled)
         limits_cache = LimitsCache(session_factory)
         risk_limits = limits_cache.snapshot
         self._am_bottom_limits = risk_limits.am_bottom
@@ -108,6 +116,7 @@ class SignalEngine:
         self._am_conf_limits = risk_limits.am_conf
         self._vix_gate_mode = risk_limits.gate.vix.mode
         self._vix_gate = Decimal(str(risk_limits.gate.vix.thresh))
+        self._ma60_cache: Dict[Tuple[str, date], Optional[Decimal]] = {}
 
         # Resolve bt_run for logging
         session: Session = self._session_factory()
@@ -129,9 +138,13 @@ class SignalEngine:
         """Evaluate strategies for a given 1m bar and emit qualified signals."""
         session: Session = self._session_factory()
         try:
-            latency = (event.received_at - event.bar_end).total_seconds()
-            observe_bar_latency(latency if latency >= 0 else 0.0)
-
+            if self._metrics_enabled and event.received_at is not None:
+                try:
+                    latency = (event.received_at - event.bar_end).total_seconds()
+                    observe_bar_latency(latency if latency >= 0 else 0.0)
+                except Exception:
+                    pass
+            t0 = time_module.perf_counter()
             detected = self._evaluate_event(
                 session,
                 event,
@@ -141,6 +154,12 @@ class SignalEngine:
                 record_metric=True,
             )
             session.commit()
+            try:
+                if self._metrics_enabled:
+                    dt = max(0.0, time_module.perf_counter() - t0)
+                    observe_signal_generation(dt)
+            except Exception:
+                pass
             return [entry.signal for entry in detected]
         except Exception:
             session.rollback()
@@ -449,6 +468,68 @@ class SignalEngine:
             cooldown_override=self._am_conf_limits.cooldown_s,
         )
 
+    def _detect_overnight_gap_exit(
+        self,
+        event: BarsClosed,
+        df: pd.DataFrame,
+        trade_date: date,
+        vix_value: Optional[Decimal],
+        session: Optional[Session],
+    ) -> Optional[SignalEnvelope]:
+        state = self._positions.get(event.symbol)
+        if state is None or state.signal_code not in BUY_SIGNALS:
+            return None
+        et_time = _to_eastern(event.bar_end)
+        if et_time.time() not in (time(9, 30), time(9, 31)):
+            return None
+        opened_et = _to_eastern(state.opened_at)
+        if opened_et.date() >= trade_date:
+            return None
+        current = df.iloc[-1]
+        today_open = None
+        today_source = "bar"
+        if session is not None:
+            today_open = self._daily_open_price(session, event.symbol, trade_date)
+            if today_open is not None:
+                today_source = "daily"
+        if today_open is None:
+            open_value = current.get("open")
+            if open_value is None:
+                return None
+            try:
+                today_open = Decimal(str(open_value))
+            except (InvalidOperation, TypeError):
+                return None
+        prev_trade_date = opened_et.date()
+        prev_close = self._daily_close_price(session, event.symbol, prev_trade_date)
+        if prev_close is None:
+            # fallback: 从df获取前日16:00的close
+            prev_close = self._day_close_price(df, prev_trade_date)
+        if prev_close is None or prev_close <= 0:
+            return None
+        
+        # 计算缺口：(今日开盘 - 昨日收盘) / 昨日收盘
+        gap = (today_open - prev_close) / prev_close
+        
+        # 如果高开超过0.5%，不退出（让利润奔跑）
+        if gap > Decimal("0.005"):
+            return None
+        reason = {
+            "prev_close": str(prev_close),
+            "prev_trade_date": str(prev_trade_date),
+            "today_open": str(today_open),
+            "today_source": today_source,
+            "gap_pct": str(gap),
+            "threshold": "0.005",
+        }
+        return self._build_signal(
+            symbol=event.symbol,
+            signal_code="SIG_OVERNIGHT_GAP_EXIT",
+            side=SignalSide.SELL,
+            reason=reason,
+            generated_at=event.bar_end,
+        )
+
     def _detect_am_sell_c1(
         self,
         event: BarsClosed,
@@ -459,6 +540,10 @@ class SignalEngine:
     ) -> Optional[SignalEnvelope]:
         state = self._positions.get(event.symbol)
         if state is None:
+            return None
+        # AM 卖出仅在上午时段有效
+        et_time = _to_eastern(event.bar_end)
+        if et_time.time() < time(9, 30) or et_time.time() >= time(12, 0):
             return None
         consecutive = max(2, self._am_sell1_limits.consecutive)
         if len(df) < consecutive + 5:
@@ -536,6 +621,10 @@ class SignalEngine:
         state = self._positions.get(event.symbol)
         if state is None:
             return None
+        # AM 卖出仅在上午时段有效
+        et_time = _to_eastern(event.bar_end)
+        if et_time.time() < time(9, 30) or et_time.time() >= time(12, 0):
+            return None
         lookback = max(3, self._am_conf_limits.sell.lookback_n)
         if len(df) < lookback + 1:
             return None
@@ -602,11 +691,95 @@ class SignalEngine:
             and self._vix_gate_mode == "enforce"
             and vix_value >= self._vix_gate
         ):
+            try:
+                if self._metrics_enabled:
+                    record_signal_filtered("VIX_GATE")
+            except Exception:
+                pass
             return None
         if not self._top5_today(trade_date, session, event.symbol):
+            try:
+                if self._metrics_enabled:
+                    record_signal_filtered("TOP5_FILTER")
+            except Exception:
+                pass
             return None
         if len(df) < 6:
             return None
+
+        # 盘前涨幅过滤（权威来源）：09:28 价相对昨收 > 0.5%
+        # 使用数据库查询 prev_close_rth 与 09:28 的 bars1m_equity
+        try:
+            # 昨日收盘价（RTH 收盘）
+            row_prev = session.execute(
+                text(
+                    """
+                    SELECT prev_close_rth
+                    FROM v_daily_ohlcv_enriched
+                    WHERE symbol = :symbol AND trade_date_et::date = :trade_date
+                    """
+                ),
+                {"symbol": event.symbol, "trade_date": trade_date},
+            ).fetchone()
+            # 09:28 分钟的 ts_end（美东时区）
+            ts_0928_et = datetime.combine(trade_date, time(9, 28), EASTERN)
+            ts_0928_utc = ts_0928_et.astimezone(timezone.utc)
+            row_0928 = session.execute(
+                text(
+                    """
+                    SELECT close
+                    FROM bars1m_equity
+                    WHERE symbol = :symbol AND ts_end = :ts_end
+                    """
+                ),
+                {"symbol": event.symbol, "ts_end": ts_0928_utc},
+            ).fetchone()
+
+            if row_prev is None or row_prev[0] is None or row_0928 is None or row_0928[0] is None:
+                # 缺少关键数据则不通过过滤
+                try:
+                    if self._metrics_enabled:
+                        record_signal_filtered("PREMARKET_GAP_MISSING")
+                except Exception:
+                    pass
+                return None
+
+            try:
+                prev_close = Decimal(str(row_prev[0]))
+                price_0928 = Decimal(str(row_0928[0]))
+            except Exception:
+                try:
+                    if self._metrics_enabled:
+                        record_signal_filtered("PREMARKET_GAP_PARSE_FAIL")
+                except Exception:
+                    pass
+                return None
+
+            if prev_close <= 0 or price_0928 <= 0:
+                try:
+                    if self._metrics_enabled:
+                        record_signal_filtered("PREMARKET_GAP_INVALID")
+                except Exception:
+                    pass
+                return None
+
+            pre_gap = (price_0928 - prev_close) / prev_close
+            if pre_gap < Decimal("0.005"):
+                try:
+                    if self._metrics_enabled:
+                        record_signal_filtered("PREMARKET_GAP_FILTER")
+                except Exception:
+                    pass
+                return None
+        except Exception:
+            # 防御性：任何异常都视为不通过，避免放行
+            try:
+                if self._metrics_enabled:
+                    record_signal_filtered("PREMARKET_GAP_EXCEPTION")
+            except Exception:
+                pass
+            return None
+        
         prev = df.iloc[-2]
         prev2 = df.iloc[-3]
         two_green = bool(
@@ -640,6 +813,11 @@ class SignalEngine:
                 return None
 
         if 12 <= et_time.hour < 14:
+            try:
+                if self._metrics_enabled:
+                    record_signal_filtered("TIME_WINDOW")
+            except Exception:
+                pass
             return None
         allowed, addition = self._can_open_position(event.symbol, df, session, event.bar_end)
         if not allowed:
@@ -1088,6 +1266,7 @@ class SignalEngine:
         vix_value = self._current_vix(session, event.bar_end)
 
         detectors = [
+            self._detect_overnight_gap_exit,
             self._detect_am_sell_c1,
             self._detect_am_confluence_sell_s2,
             self._detect_s2,
@@ -1141,7 +1320,11 @@ class SignalEngine:
         if publish:
             self._publish_signal(signal, detected.trace_id, ts_end)
         if record_metric:
-            record_signal_emitted(signal.signal_code)
+            if self._metrics_enabled:
+                try:
+                    record_signal_emitted(signal.signal_code)
+                except Exception:
+                    pass
 
     def _publish_signal(self, signal: SignalEnvelope, trace_id: str, ts_end: datetime) -> None:
         if self._redis_bus is None:
@@ -1174,12 +1357,124 @@ class SignalEngine:
         self._upper_break = snapshot["upper_break"]
         self._last_signal_ts = snapshot["last_signal_ts"]
 
+    def _daily_open_price(
+        self,
+        session: Optional[Session],
+        symbol: str,
+        trade_date: date,
+    ) -> Optional[Decimal]:
+        if session is None:
+            return None
+        row = session.execute(
+            text(
+                """
+                SELECT open_rth
+                FROM v_daily_ohlcv_enriched
+                WHERE symbol = :symbol AND trade_date_et::date = :trade_date
+                """
+            ),
+            {"symbol": symbol, "trade_date": trade_date},
+        ).fetchone()
+        if not row:
+            return None
+        open_rth = row[0]
+        if open_rth is None:
+            return None
+        try:
+            return Decimal(str(open_rth))
+        except (InvalidOperation, TypeError):
+            return None
+
+    def _day_open_price(self, df: pd.DataFrame, trade_date: date) -> Optional[Decimal]:
+        if df is None or df.empty:
+            return None
+        if "et" in df.columns:
+            et_series = df["et"]
+        else:
+            et_series = df["ts_end"].dt.tz_convert("US/Eastern")
+        mask = et_series.dt.date == trade_date
+        if not mask.any():
+            return None
+        todays = df.loc[mask]
+        if todays.empty:
+            return None
+        if "et" in todays.columns:
+            time_series = todays["et"].dt.time
+        else:
+            time_series = todays["ts_end"].dt.tz_convert("US/Eastern").dt.time
+        open_rows = todays.loc[time_series == time(9, 31)]
+        if not open_rows.empty:
+            open_value = open_rows.iloc[0].get("open")
+        else:
+            open_value = todays.iloc[0].get("open")
+        if open_value is None:
+            return None
+        try:
+            return Decimal(str(open_value))
+        except (InvalidOperation, TypeError):
+            return None
+
     def _should_emit(self, signal: SignalEnvelope, ts_end: datetime) -> bool:
         key = (signal.symbol, signal.signal_code)
         last_ts = self._last_signal_ts.get(key)
         if last_ts is None:
             return True
         return (ts_end - last_ts).total_seconds() >= signal.cooldown_seconds
+
+    def _daily_ma60_value(
+        self, session: Session, symbol: str, ts_end: datetime
+    ) -> Optional[Decimal]:
+        trade_date = ts_end.astimezone(EASTERN).date()
+        key = (symbol.upper(), trade_date)
+        if key in self._ma60_cache:
+            return self._ma60_cache[key]
+        try:
+            row = session.execute(
+                text(
+                    """
+                    SELECT sma60
+                    FROM v_daily_ma60
+                    WHERE symbol = :symbol AND trade_date_et::date = :trade_date
+                    """
+                ),
+                {"symbol": symbol, "trade_date": trade_date},
+            ).fetchone()
+        except Exception:
+            LOGGER.exception(
+                "signal_engine.ma60_query_failed", symbol=symbol, trade_date=str(trade_date)
+            )
+            self._ma60_cache[key] = None
+            return None
+        if row is None:
+            LOGGER.warning(
+                "signal_engine.ma60_missing",
+                symbol=symbol,
+                trade_date=str(trade_date),
+            )
+            self._ma60_cache[key] = None
+            return None
+        ma60_raw = row[0]
+        if ma60_raw is None:
+            LOGGER.warning(
+                "signal_engine.ma60_null",
+                symbol=symbol,
+                trade_date=str(trade_date),
+            )
+            self._ma60_cache[key] = None
+            return None
+        try:
+            ma60_value = Decimal(str(ma60_raw))
+        except (InvalidOperation, TypeError, ValueError):
+            LOGGER.warning(
+                "signal_engine.ma60_parse_failed",
+                symbol=symbol,
+                trade_date=str(trade_date),
+                raw=str(ma60_raw),
+            )
+            self._ma60_cache[key] = None
+            return None
+        self._ma60_cache[key] = ma60_value
+        return ma60_value
 
     def _can_open_position(
         self,
@@ -1207,6 +1502,46 @@ class SignalEngine:
                 )
                 preearn_allowed = True
             if not preearn_allowed:
+                return False, False
+
+        if session is not None and ts_end is not None and df is not None and not df.empty:
+            current_close_raw = df.iloc[-1].get("close")
+            current_close: Optional[Decimal]
+            try:
+                if current_close_raw is None:
+                    current_close = None
+                elif isinstance(current_close_raw, Decimal):
+                    current_close = current_close_raw
+                else:
+                    current_close = Decimal(str(current_close_raw))
+            except (InvalidOperation, TypeError, ValueError):
+                current_close = None
+            if current_close is None:
+                LOGGER.debug(
+                    "signal_engine.ma60_no_close",
+                    symbol=symbol,
+                    ts_end=str(ts_end),
+                )
+                try:
+                    if self._metrics_enabled:
+                        record_signal_filtered("MA60_FILTER")
+                except Exception:
+                    pass
+                return False, False
+            ma60_value = self._daily_ma60_value(session, symbol, ts_end)
+            if ma60_value is None or current_close <= ma60_value:
+                LOGGER.debug(
+                    "signal_engine.ma60_blocked",
+                    symbol=symbol,
+                    ts_end=str(ts_end),
+                    close=str(current_close),
+                    sma60=str(ma60_value) if ma60_value is not None else None,
+                )
+                try:
+                    if self._metrics_enabled:
+                        record_signal_filtered("MA60_FILTER")
+                except Exception:
+                    pass
                 return False, False
 
         state = self._positions.get(symbol)
@@ -1399,8 +1734,20 @@ class SignalEngine:
             dn_curr = df.iloc[idx]["lr_boll_dn_slope"]
             if None in (m5_prev, dn_prev, m5_curr, dn_curr):
                 continue
-            if m5_curr > 0 and dn_curr > 0 and (m5_prev < 0 or dn_prev < 0):
-                pivots.append(idx)
+            # 检查是否为有效数字（排除NaN、Infinity等）
+            try:
+                if isinstance(m5_curr, Decimal) and not m5_curr.is_finite():
+                    continue
+                if isinstance(dn_curr, Decimal) and not dn_curr.is_finite():
+                    continue
+                if isinstance(m5_prev, Decimal) and not m5_prev.is_finite():
+                    continue
+                if isinstance(dn_prev, Decimal) and not dn_prev.is_finite():
+                    continue
+                if m5_curr > 0 and dn_curr > 0 and (m5_prev < 0 or dn_prev < 0):
+                    pivots.append(idx)
+            except (InvalidOperation, ValueError):
+                continue
         return pivots
 
     def _check_slope_sequences(

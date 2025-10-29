@@ -359,6 +359,24 @@ class PremarketTop5(Base):
     ret_0925_0930: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)  # 盘前涨幅：(price_0925 - prev_close) / prev_close
 
 
+class PremarketLeadersLagged(Base):
+    __tablename__ = "premarket_leaders_lagged"
+
+    trade_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    source_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    direction: Mapped[str] = mapped_column(String(8), primary_key=True)
+    rank: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    ret_0928: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
+    volume_rth: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 class BacktestTop5(Base):
     __tablename__ = "bt_top5"
 

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
-from decimal import Decimal
-from typing import Any, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import date, datetime, time, timezone
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from .models import (
@@ -17,6 +18,7 @@ from .models import (
     Order,
     Position,
     PremarketTop5,
+    PremarketLeadersLagged,
     PnLDaily,
     PnLIntraday,
     RefMarketCap,
@@ -25,6 +27,19 @@ from .models import (
     StrategyPosition,
     BacktestSignal,
 )
+from libs.core import EASTERN
+from libs.db.dim_trading_calendar import get_trading_session
+
+
+@dataclass(frozen=True)
+class LaggedLeaderRecord:
+    trade_date: date
+    source_date: date
+    direction: str
+    rank: int
+    symbol: str
+    ret_0928: Decimal
+    volume_rth: Optional[int]
 
 
 class StrategyPositionDAO:
@@ -417,6 +432,273 @@ class BacktestTop5DAO:
         )
         return self._session.execute(stmt).scalars().all()
 
+
+class PremarketLeadersLaggedDAO:
+    """Manage lagged premarket leaders derived from recent sessions."""
+
+    LOOKBACK_DEFAULT = 5
+    TOP_DEFAULT = 10
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def fetch(self, trade_date: date) -> list[PremarketLeadersLagged]:
+        return (
+            self._session.query(PremarketLeadersLagged)
+            .filter(PremarketLeadersLagged.trade_date == trade_date)
+            .order_by(
+                PremarketLeadersLagged.source_date.desc(),
+                PremarketLeadersLagged.direction.asc(),
+                PremarketLeadersLagged.rank.asc(),
+            )
+            .all()
+        )
+
+    def replace(self, trade_date: date, rows: Sequence[LaggedLeaderRecord]) -> None:
+        self._session.query(PremarketLeadersLagged).filter(
+            PremarketLeadersLagged.trade_date == trade_date
+        ).delete()
+        objects = [
+            PremarketLeadersLagged(
+                trade_date=row.trade_date,
+                source_date=row.source_date,
+                direction=row.direction,
+                rank=row.rank,
+                symbol=row.symbol,
+                ret_0928=row.ret_0928,
+                volume_rth=row.volume_rth,
+            )
+            for row in rows
+        ]
+        if objects:
+            self._session.bulk_save_objects(objects)
+            self._session.flush()
+
+    def ensure(
+        self,
+        trade_date: date,
+        symbols: Sequence[str],
+        *,
+        lookback: int | None = None,
+        top_n: int | None = None,
+    ) -> list[PremarketLeadersLagged]:
+        rows = self.fetch(trade_date)
+        if rows:
+            return rows
+        computed = self._build_records(
+            trade_date,
+            symbols,
+            lookback=lookback or self.LOOKBACK_DEFAULT,
+            top_n=top_n or self.TOP_DEFAULT,
+        )
+        if computed:
+            self.replace(trade_date, computed)
+            return self.fetch(trade_date)
+        return []
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _build_records(
+        self,
+        trade_date: date,
+        symbols: Sequence[str],
+        *,
+        lookback: int,
+        top_n: int,
+    ) -> list[LaggedLeaderRecord]:
+        if not symbols or lookback <= 0 or top_n <= 0:
+            return []
+        upper_symbols = [s.strip().upper() for s in symbols if s.strip()]
+        if not upper_symbols:
+            return []
+
+        source_dates = self._previous_sessions(trade_date, lookback)
+        if not source_dates:
+            return []
+
+        records: list[LaggedLeaderRecord] = []
+        for source_date in source_dates:
+            entries = self._collect_metrics_for_day(source_date, upper_symbols)
+            if not entries:
+                continue
+            gains = sorted(entries, key=lambda item: item[1], reverse=True)[:top_n]
+            losses = sorted(entries, key=lambda item: item[1])[:top_n]
+
+            for idx, (symbol, ret_value, volume) in enumerate(gains, start=1):
+                records.append(
+                    LaggedLeaderRecord(
+                        trade_date=trade_date,
+                        source_date=source_date,
+                        direction="GAIN",
+                        rank=idx,
+                        symbol=symbol,
+                        ret_0928=ret_value,
+                        volume_rth=volume,
+                    )
+                )
+            for idx, (symbol, ret_value, volume) in enumerate(losses, start=1):
+                records.append(
+                    LaggedLeaderRecord(
+                        trade_date=trade_date,
+                        source_date=source_date,
+                        direction="LOSS",
+                        rank=idx,
+                        symbol=symbol,
+                        ret_0928=ret_value,
+                        volume_rth=volume,
+                    )
+                )
+        return records
+
+    def _previous_sessions(self, trade_date: date, lookback: int) -> list[date]:
+        dates: list[date] = []
+        current = trade_date
+        for _ in range(lookback):
+            row = self._session.execute(
+                text(
+                    """
+                    SELECT MAX(trade_date)
+                    FROM dim_trading_calendar
+                    WHERE trade_date < :current
+                    """
+                ),
+                {"current": current},
+            ).scalar_one_or_none()
+            if row is None:
+                break
+            dates.append(row)
+            current = row
+        return dates
+
+    def _collect_metrics_for_day(
+        self,
+        source_date: date,
+        symbols: Sequence[str],
+    ) -> list[Tuple[str, Decimal, Optional[int]]]:
+        price_map = self._fetch_premarket_prices(source_date, symbols)
+        prev_close_map = self._fetch_prev_close(source_date, symbols)
+        volume_map = self._fetch_rth_volume(source_date, symbols)
+
+        entries: list[Tuple[str, Decimal, Optional[int]]] = []
+        for symbol in symbols:
+            price = price_map.get(symbol)
+            prev_close = prev_close_map.get(symbol)
+            if price is None or prev_close is None or prev_close <= 0:
+                continue
+            try:
+                ret_value = (price - prev_close) / prev_close
+            except (InvalidOperation, ZeroDivisionError):
+                continue
+            entries.append((symbol, ret_value, volume_map.get(symbol)))
+        return entries
+
+    def _fetch_prev_close(
+        self,
+        source_date: date,
+        symbols: Sequence[str],
+    ) -> Dict[str, Decimal]:
+        if not symbols:
+            return {}
+        stmt = text(
+            """
+            SELECT symbol, prev_close_rth
+            FROM v_daily_ohlcv
+            WHERE trade_date = :trade_date
+              AND symbol = ANY(:symbols)
+            """
+        )
+        rows = self._session.execute(
+            stmt,
+            {"trade_date": source_date, "symbols": list(symbols)},
+        ).fetchall()
+        result: Dict[str, Decimal] = {}
+        for symbol, prev_close in rows:
+            if prev_close is None:
+                continue
+            try:
+                result[str(symbol).upper()] = Decimal(str(prev_close))
+            except (InvalidOperation, TypeError):
+                continue
+        return result
+
+    def _fetch_premarket_prices(
+        self,
+        source_date: date,
+        symbols: Sequence[str],
+    ) -> Dict[str, Decimal]:
+        if not symbols:
+            return {}
+        target_et = datetime.combine(source_date, time(9, 28), EASTERN)
+        target_ts = target_et.astimezone(timezone.utc)
+        stmt = text(
+            """
+            SELECT symbol, close
+            FROM bars1m_equity
+            WHERE ts_end = :ts_end
+              AND symbol = ANY(:symbols)
+            """
+        )
+        rows = self._session.execute(
+            stmt,
+            {"ts_end": target_ts, "symbols": list(symbols)},
+        ).fetchall()
+        result: Dict[str, Decimal] = {}
+        for symbol, close_price in rows:
+            if close_price is None:
+                continue
+            try:
+                result[str(symbol).upper()] = Decimal(str(close_price))
+            except (InvalidOperation, TypeError):
+                continue
+        return result
+
+    def _fetch_rth_volume(
+        self,
+        source_date: date,
+        symbols: Sequence[str],
+    ) -> Dict[str, int]:
+        if not symbols:
+            return {}
+        try:
+            session_info = get_trading_session(source_date)
+            open_time = session_info.open_time
+            close_time = session_info.close_time
+        except Exception:
+            open_time = time(9, 30)
+            close_time = time(16, 0)
+        start_et = datetime.combine(source_date, open_time, EASTERN)
+        end_et = datetime.combine(source_date, close_time, EASTERN)
+        start_ts = start_et.astimezone(timezone.utc)
+        end_ts = end_et.astimezone(timezone.utc)
+        stmt = text(
+            """
+            SELECT symbol, SUM(volume) AS total_volume
+            FROM bars1m_equity
+            WHERE ts_end >= :start_ts
+              AND ts_end <= :end_ts
+              AND symbol = ANY(:symbols)
+            GROUP BY symbol
+            """
+        )
+        rows = self._session.execute(
+            stmt,
+            {
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "symbols": list(symbols),
+            },
+        ).fetchall()
+        volumes: Dict[str, int] = {}
+        for symbol, volume in rows:
+            try:
+                volumes[str(symbol).upper()] = int(volume) if volume is not None else 0
+            except (TypeError, ValueError):
+                continue
+        return volumes
 
 class RiskEventDAO:
     """Persist risk events emitted by services."""

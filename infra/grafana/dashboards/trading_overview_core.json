@@ -1,0 +1,222 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "IBKR 连接状态",
+      "description": "关闭=0 表示行情断连，立即排查 IBKR/TWS 心跳或网络。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "avg(rt_ibkr_connection_status{env=~\"$env\", instance=~\"$instance\"})",
+          "legendFormat": "IBKR",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "green", "value": 1}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 5, "w": 8, "x": 0, "y": 0},
+      "pluginVersion": "9.5.0"
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Bar 处理 P95 (s)",
+      "description": "期望 P95 < 5s；若超过，检查 rt_engine/数据库瓶颈。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(bars_latency_seconds_bucket{env=~\"$env\", instance=~\"$instance\"}[5m])) by (le))",
+          "legendFormat": "P95",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 3},
+              {"color": "red", "value": 5}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 9, "w": 16, "x": 8, "y": 0},
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "single", "sort": "none"}
+      },
+      "pluginVersion": "9.5.0"
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Kill Switch",
+      "description": "1 表示风控熔断，需核对 daily loss / VIX Gate，确认后人工解除。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "avg(risk_kill_switch_state{env=~\"$env\", instance=~\"$instance\"})",
+          "legendFormat": "Kill Switch",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 5, "w": 8, "x": 0, "y": 5}
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "订单转化率",
+      "description": "目标 ≥ 0.6；低于阈值检查风控阻断原因和执行链路。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "avg(orders_conversion_rate{env=~\"$env\", instance=~\"$instance\"})",
+          "legendFormat": "Conversion",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "percentage",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 0.4},
+              {"color": "green", "value": 0.6}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 5, "w": 8, "x": 0, "y": 10}
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Realized PnL",
+      "description": "按 env 查看当日实现盈亏，异常波动需对照订单与风控事件。",
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "pnl_realized_today_usd{env=~\"$env\", instance=~\"$instance\"}",
+          "legendFormat": "$instance",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 9, "w": 16, "x": 8, "y": 9},
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "single", "sort": "none"}
+      },
+      "pluginVersion": "9.5.0"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["trading", "core"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "label": "Datasource",
+        "query": "prometheus",
+        "hide": 0,
+        "current": {"selected": true, "text": "Prometheus", "value": "Prometheus"}
+      },
+      {
+        "name": "env",
+        "label": "Environment",
+        "type": "custom",
+        "query": "paper,live",
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {"selected": true, "text": "All", "value": ".*"}
+      },
+      {
+        "name": "instance",
+        "label": "Instance",
+        "type": "query",
+        "datasource": "$datasource",
+        "refresh": 1,
+        "query": "label_values({env=~\"$env\"}, instance)",
+        "sort": 1,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {"selected": true, "text": "All", "value": ".*"}
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "title": "Trading Overview (Core)",
+  "uid": "trading-overview-core",
+  "version": 1
+}

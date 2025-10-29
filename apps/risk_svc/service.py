@@ -7,7 +7,7 @@ import threading
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Protocol, cast
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Protocol, cast
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
@@ -18,9 +18,16 @@ from libs.core import EASTERN, current_trace_context, get_settings, utc_now
 from libs.db import RiskEventDAO, RiskStateDAO, StrategyPositionDAO
 from libs.db.preearn import evaluate_preearn_guard
 from libs.infra.metrics import (
+    record_limit_approaching,
     record_risk_block,
+    set_capital_utilization,
     set_kill_switch_state,
+    set_limit_usage,
+    set_position_count,
+    set_risk_drawdown,
+    set_risk_used_r,
     set_risk_vix,
+    set_total_exposure,
 )
 from libs.infra import build_ibkr_client, IBClient
 from libs.infra.redis_bus import RedisBus
@@ -103,7 +110,8 @@ class RiskService:
         self._vix_gate_locked_today: bool = False
         self._restore_gate_state()
         self.reload_limits()
-        set_kill_switch_state(self._kill_switch_active)
+        self._metrics_enabled = bool(settings.monitoring_enabled)
+        self._emit_metric(set_kill_switch_state, self._kill_switch_active)
 
     def current_limits(self) -> RiskLimits:
         return self._limits_cache.snapshot
@@ -147,11 +155,24 @@ class RiskService:
 
     def set_kill_switch(self, active: bool) -> None:
         self._kill_switch_active = active
-        set_kill_switch_state(active)
+        self._emit_metric(set_kill_switch_state, active)
 
     @property
     def iv_overnight_cap(self) -> Decimal:
         return self._iv_overnight_call_cap
+
+    def _emit_metric(
+        self,
+        func: Callable[..., None],
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        if not self._metrics_enabled:
+            return
+        try:
+            func(*args, **kwargs)
+        except Exception:  # pragma: no cover - metrics best-effort
+            return
 
     def signal_emitted(
         self,
@@ -502,6 +523,20 @@ class RiskService:
         trade_date = now_et.date()
         self._reset_if_new_day(trade_date)
 
+        open_positions = sum(1 for exposure in exposures if getattr(exposure, "open_quantity", 0))
+        self._emit_metric(set_position_count, open_positions)
+        try:
+            total_exposure_value = float(current_notional)
+        except (TypeError, ValueError, InvalidOperation):
+            total_exposure_value = None
+        if total_exposure_value is not None:
+            self._emit_metric(set_total_exposure, total_exposure_value)
+        self._emit_metric(set_capital_utilization, utilisation)
+        self._emit_metric(set_limit_usage, "notional", utilisation)
+        if utilisation >= 0.8:
+            threshold = "0.80" if utilisation < 0.95 else "0.95"
+            self._emit_metric(record_limit_approaching, "notional", threshold)
+
         approved = True
         code = "OK"
         detail = "limit-ok"
@@ -721,8 +756,10 @@ class RiskService:
         drawdown_r = self._latest_global_metric(session, "DRAWDOWN_R")
         if used_r is not None:
             decision.reasons["used_r"] = str(used_r)
+            self._emit_metric(set_risk_used_r, used_r)
         if drawdown_r is not None:
             decision.reasons["drawdown_r"] = str(drawdown_r)
+            self._emit_metric(set_risk_drawdown, drawdown_r)
 
     def _emit_block_signal(
         self,
@@ -874,8 +911,8 @@ class RiskService:
         gate_open: bool,
         vix_value: Optional[Decimal],
     ) -> None:
-        set_kill_switch_state(kill_switch_active)
-        set_risk_vix(vix_value)
+        self._emit_metric(set_kill_switch_state, kill_switch_active)
+        self._emit_metric(set_risk_vix, vix_value)
         states: List[Dict[str, object]] = [
             {
                 "ts": now_utc,
@@ -912,7 +949,7 @@ class RiskService:
         decision: RiskDecision,
     ) -> None:
         trace_id = current_trace_context().get("trace_id")
-        record_risk_block(decision.code)
+        self._emit_metric(record_risk_block, decision.code)
         event_payload = {
             "strategy_code": payload.strategy_code,
             "reasons": decision.reasons,
@@ -1042,7 +1079,7 @@ class RiskService:
                     trace_id=trace_id or f"vix-gate-unblock-open-{now_utc.isoformat()}",
                 )
             else:
-                record_risk_block("VIX_GATE_ON")
+                self._emit_metric(record_risk_block, "VIX_GATE_ON")
         
         LOGGER.info(
             "vix_gate.checked_at_open",
@@ -1104,7 +1141,7 @@ class RiskService:
                 trace_id=trace_id or f"vix-gate-unblock-{now_utc.isoformat()}",
             )
         else:
-            record_risk_block("VIX_GATE_ON")
+            self._emit_metric(record_risk_block, "VIX_GATE_ON")
             await publish_risk_block(
                 redis_bus,
                 {
@@ -1149,7 +1186,7 @@ class RiskService:
             )
             session.commit()
         self._blocks.block(symbol, until, "MISSED_ENTRY")
-        record_risk_block("MISSED_ENTRY")
+        self._emit_metric(record_risk_block, "MISSED_ENTRY")
         await publish_risk_block(
             redis_bus,
             {
@@ -1190,7 +1227,7 @@ class RiskService:
             )
             session.commit()
         self._blocks.block(symbol, block_until, "MIDFAIL_UNTIL_1400")
-        record_risk_block("MIDFAIL_UNTIL_1400")
+        self._emit_metric(record_risk_block, "MIDFAIL_UNTIL_1400")
         await publish_risk_block(
             redis_bus,
             {

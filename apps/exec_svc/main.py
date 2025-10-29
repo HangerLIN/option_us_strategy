@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, InvalidOperation
@@ -28,9 +29,13 @@ from libs.db.dao import StrategyPositionDAO
 from libs.infra import IBClient, RedisBus, build_ibkr_client, get_next_order_id
 from libs.infra.db import get_session_factory
 from libs.infra.metrics import (
+    observe_order_execution_latency,
     record_order_accept,
     record_order_block,
     record_order_submission,
+    record_order_timeout,
+    set_orders_by_status,
+    set_pending_order_age,
 )
 from libs.schemas.common import ApiResult, ServiceHealth
 from libs.schemas.events import ExecutionFill, ForceCloseEvent, RiskAlert, RiskBlock, RiskUnblock
@@ -53,6 +58,7 @@ session_factory = get_session_factory(settings)
 orders_registry: dict[int, OrderState] = {}
 orders_lock = asyncio.Lock()
 trace_registry: Dict[str, int] = {}
+METRICS_ENABLED = bool(settings.monitoring_enabled)
 
 
 class _OrderStreamBroker:
@@ -80,6 +86,41 @@ class _OrderStreamBroker:
 
 
 order_stream = _OrderStreamBroker()
+
+
+def _emit_metric(func, *args, **kwargs) -> None:
+    if not METRICS_ENABLED:
+        return
+    try:
+        func(*args, **kwargs)
+    except Exception:  # pragma: no cover - metrics best-effort
+        pass
+
+
+def _refresh_order_metrics() -> None:
+    if not METRICS_ENABLED:
+        return
+    try:
+        counts = Counter(state.status for state in orders_registry.values())
+        for status, count in counts.items():
+            _emit_metric(set_orders_by_status, status, count)
+        # Ensure gauges fall back to zero for statuses not observed recently
+        for status in {"submitted", "partial", "filled", "cancelled", "inactive", "pending", "cancelling"}:
+            if status not in counts:
+                _emit_metric(set_orders_by_status, status, 0)
+
+        pending_states = [
+            state for state in orders_registry.values()
+            if state.status in {"submitted", "partial", "pending", "cancelling"}
+        ]
+        if pending_states:
+            oldest = min(state.submitted_at for state in pending_states)
+            age_seconds = max(0.0, (utc_now() - oldest).total_seconds())
+        else:
+            age_seconds = 0.0
+        _emit_metric(set_pending_order_age, age_seconds)
+    except Exception:  # pragma: no cover - defensive metrics bookkeeping
+        pass
 
 
 def _order_state_payload(event_type: str, state: OrderState) -> dict[str, Any]:
@@ -273,11 +314,11 @@ async def submit_order(payload: ExecutionRequest) -> ApiResult:
         if isinstance(payload.execution_mode, ExecutionMode)
         else str(payload.execution_mode)
     )
-    record_order_submission(mode_label)
+    _emit_metric(record_order_submission, mode_label)
 
     local_ok, local_code, local_message = _local_precheck(payload)
     if not local_ok:
-        record_order_block("local", local_code)
+        _emit_metric(record_order_block, "local", local_code)
         LOGGER.info(
             "order.precheck.local_block",
             symbol=payload.symbol,
@@ -290,7 +331,7 @@ async def submit_order(payload: ExecutionRequest) -> ApiResult:
     notional = payload.limit_price * Decimal(payload.quantity) * OPTION_MULTIPLIER
     risk_ok, risk_code, risk_message = await _risk_precheck(payload, notional)
     if not risk_ok:
-        record_order_block("risk", risk_code)
+        _emit_metric(record_order_block, "risk", risk_code)
         LOGGER.info(
             "order.precheck.risk_block",
             symbol=payload.symbol,
@@ -324,7 +365,7 @@ async def submit_order(payload: ExecutionRequest) -> ApiResult:
     meta.force_jumps = 0
 
     state, order_id = await _place_attempt(meta, trace_id, retry=False)
-    record_order_accept(mode_label)
+    _emit_metric(record_order_accept, mode_label)
 
     event_payload = attach_trace_metadata(meta.payload.model_dump())
     await redis_bus.publish(
@@ -371,6 +412,11 @@ async def cancel_order(request: OrderCancelRequest) -> ApiResult:
         trace_id = state.details.trace_id
         if trace_id and trace_registry.get(trace_id) == request.order_id:
             trace_registry.pop(trace_id, None)
+        latency_seconds = max(
+            0.0, (updated_state.updated_at - updated_state.submitted_at).total_seconds()
+        )
+        _emit_metric(observe_order_execution_latency, "cancel", latency_seconds)
+        _refresh_order_metrics()
 
     client.cancelOrder(request.order_id)
     event_payload = attach_trace_metadata(updated_state.model_dump())
@@ -801,6 +847,7 @@ async def _place_attempt(meta: TraceMeta, trace_id: str, *, retry: bool) -> tupl
         trace_registry[trace_id] = order_id
         _clear_tasks(order_id)
         _schedule_tasks(order_id, trace_id, meta)
+        _refresh_order_metrics()
 
     return state, order_id
 
@@ -893,6 +940,11 @@ async def _ttl_watch(order_id: int, trace_id: str) -> None:
             )
             orders_registry[order_id] = updated
             _clear_tasks(order_id)
+            latency_seconds = max(
+                0.0, (updated.updated_at - updated.submitted_at).total_seconds()
+            )
+            _emit_metric(record_order_timeout, "ttl_expired")
+            _emit_metric(observe_order_execution_latency, "cancel", latency_seconds)
         else:
             retry_needed = True
             updated = state.model_copy(
@@ -904,6 +956,8 @@ async def _ttl_watch(order_id: int, trace_id: str) -> None:
             )
             orders_registry[order_id] = updated
             _clear_tasks(order_id)
+            _emit_metric(record_order_timeout, "ttl_retry")
+        _refresh_order_metrics()
 
     client = _require_ib_client()
     client.cancelOrder(order_id)
@@ -923,6 +977,11 @@ async def _ttl_watch(order_id: int, trace_id: str) -> None:
                 }
             )
             orders_registry[order_id] = cancelled
+            latency_seconds = max(
+                0.0, (cancelled.updated_at - cancelled.submitted_at).total_seconds()
+            )
+            _emit_metric(observe_order_execution_latency, "cancel", latency_seconds)
+            _refresh_order_metrics()
     LOGGER.info(
         "order.retry.success",
         previous_order_id=order_id,
@@ -1049,6 +1108,12 @@ async def _handle_order_status_event(event: Dict[str, Any]) -> None:
             remaining is not None and remaining <= 0
         ):
             _finalise_order_lifecycle(order_id, updated)
+        if status in {"cancelled", "apicancelled", "inactive"}:
+            latency_seconds = max(
+                0.0, (updated.updated_at - updated.submitted_at).total_seconds()
+            )
+            _emit_metric(observe_order_execution_latency, "cancel", latency_seconds)
+        _refresh_order_metrics()
         broadcast_state = updated
     await _broadcast_order_state("status", broadcast_state)
 
@@ -1065,6 +1130,7 @@ async def _handle_execution_event(event: Dict[str, Any]) -> None:
     exchange = event.get("exchange")
     side_raw = str(event.get("side") or "BOT")
 
+    latency_seconds: float | None = None
     async with orders_lock:
         state = orders_registry.get(order_id)
         if state is None:
@@ -1118,6 +1184,11 @@ async def _handle_execution_event(event: Dict[str, Any]) -> None:
         orders_registry[order_id] = updated_state
         if status == "filled":
             _finalise_order_lifecycle(order_id, updated_state)
+        if filled_at is not None:
+            latency_seconds = max(0.0, (filled_at - state.submitted_at).total_seconds())
+        else:
+            latency_seconds = max(0.0, (updated_state.updated_at - state.submitted_at).total_seconds())
+        _refresh_order_metrics()
         broadcast_state = updated_state
     await _broadcast_order_state("fill", broadcast_state)
 
@@ -1144,6 +1215,10 @@ async def _handle_execution_event(event: Dict[str, Any]) -> None:
     )
     payload = fill.model_dump(mode="json")
     await redis_bus.publish("execution_fills", payload, trace_id=fill.trace_id)
+
+    if latency_seconds is not None:
+        stage = "fill" if status == "filled" else "partial"
+        _emit_metric(observe_order_execution_latency, stage, latency_seconds)
 
 
 async def _handle_signal_payload(payload: Dict[str, object]) -> None:

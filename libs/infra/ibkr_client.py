@@ -21,7 +21,7 @@ from ibapi.wrapper import EWrapper
 from ibapi.ticktype import TickTypeEnum
 
 from libs.core.config import Settings
-from libs.core import EASTERN, trading_session_window, utc_now
+from libs.core.timeutil import EASTERN, trading_session_window, utc_now
 
 LOGGER = logging.getLogger(__name__)
 

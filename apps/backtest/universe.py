@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterable, List
 
 import structlog
@@ -21,14 +20,22 @@ class UniverseSpec:
 
 
 class UniverseResolver:
-    """Resolve universe specifications into symbol lists."""
+    """Resolve universe specifications into symbol lists from database."""
 
-    DEFAULT_SPEC = "ref_market_cap:GLOBAL"
+    DEFAULT_SPEC = "stock_universe"
 
     def __init__(self, session: Session) -> None:
         self._session = session
 
     def resolve(self, spec: str | None) -> UniverseSpec:
+        """
+        解析股票池规范，统一从数据库表读取。
+        
+        支持的格式：
+        - "stock_universe" 或 None: 从stock_universe表读取所有active股票
+        - "stock_universe:超大盘股": 按market_cap_tier筛选
+        - "ref_market_cap": 兼容旧格式，从ref_market_cap表读取
+        """
         spec_value = (spec or self.DEFAULT_SPEC).strip()
         if not spec_value:
             spec_value = self.DEFAULT_SPEC
@@ -37,18 +44,59 @@ class UniverseResolver:
         provider = provider.lower()
         target_value = target.strip() if target else ""
 
+        # 优先使用stock_universe表
+        if provider in {"stock_universe", "universe"}:
+            return self._resolve_stock_universe(target_value or None, original=spec_value)
+        
+        # 兼容旧的ref_market_cap格式
         if provider in {"ref_market_cap", "market_cap"}:
             return self._resolve_market_cap(target_value or None, original=spec_value)
-        if provider == "file":
-            return self._resolve_file(target_value, original=spec_value)
-        if provider == "sql":
-            return self._resolve_sql(target_value, original=spec_value)
-        if provider == "list":
-            return self._resolve_inline_list(target_value, original=spec_value)
 
-        raise ValueError(f"Unsupported universe provider: {provider}")
+        raise ValueError(
+            f"Unsupported universe provider: {provider}. "
+            f"Use 'stock_universe' or 'ref_market_cap'"
+        )
 
     # ------------------------------------------------------------------
+    def _resolve_stock_universe(self, tier: str | None, *, original: str) -> UniverseSpec:
+        """
+        从stock_universe表读取股票池。
+        
+        Args:
+            tier: 市值分类筛选，如"超大盘股"、"大盘科技股"等，None表示全部
+            original: 原始规范字符串
+        """
+        if tier:
+            stmt = text(
+                """
+                SELECT symbol
+                FROM stock_universe
+                WHERE active = true
+                  AND market_cap_tier = :tier
+                ORDER BY sort_order
+                """
+            )
+            rows = self._session.execute(stmt, {"tier": tier}).scalars().all()
+            metadata = {"provider": "stock_universe", "tier": tier, "table": "stock_universe"}
+        else:
+            stmt = text(
+                """
+                SELECT symbol
+                FROM stock_universe
+                WHERE active = true
+                ORDER BY sort_order
+                """
+            )
+            rows = self._session.execute(stmt).scalars().all()
+            metadata = {"provider": "stock_universe", "tier": "all", "table": "stock_universe"}
+        
+        symbols = _normalise_symbols(rows)
+        if not symbols:
+            raise ValueError(f"stock_universe table returned no symbols for tier={tier}")
+        
+        metadata["count"] = len(symbols)
+        return UniverseSpec(code=original, symbols=symbols, metadata=metadata)
+
     def _resolve_market_cap(self, source: str | None, *, original: str) -> UniverseSpec:
         stmt = text(
             """
@@ -78,70 +126,6 @@ class UniverseResolver:
                 fallback_count=len(symbols),
             )
         return UniverseSpec(code=original, symbols=symbols, metadata=metadata)
-
-    def _resolve_file(self, path_str: str, *, original: str) -> UniverseSpec:
-        if not path_str:
-            raise ValueError("Universe file path must not be empty")
-        path = Path(path_str).expanduser().resolve()
-        if not path.exists():
-            raise FileNotFoundError(f"Universe file not found: {path}")
-        symbols: list[str] = []
-        for raw in path.read_text(encoding="utf-8").splitlines():
-            token = raw.strip()
-            if not token or token.startswith("#"):
-                continue
-            symbols.append(token.upper())
-        if not symbols:
-            raise ValueError(f"Universe file produced no symbols: {path}")
-        return UniverseSpec(
-            code=original,
-            symbols=_deduplicate(symbols),
-            metadata={"provider": "file", "path": str(path)},
-        )
-
-    def _resolve_sql(self, target: str, *, original: str) -> UniverseSpec:
-        if not target:
-            raise ValueError("Universe SQL target must not be empty")
-        sql_text: str
-        candidate_path = Path(target).expanduser()
-        if candidate_path.exists():
-            sql_text = candidate_path.read_text(encoding="utf-8")
-            metadata = {"provider": "sql", "path": str(candidate_path)}
-        else:
-            sql_text = target
-            metadata = {"provider": "sql", "inline": True}
-
-        stmt = text(sql_text)
-        rows = self._session.execute(stmt).fetchall()
-        if not rows:
-            raise ValueError("Universe SQL returned no rows")
-
-        symbols = []
-        for row in rows:
-            if isinstance(row, dict):
-                value = row.get("symbol") or next(iter(row.values()))
-            else:
-                try:
-                    value = row[0]
-                except (TypeError, IndexError):
-                    value = getattr(row, "symbol", None)
-            if value is None:
-                continue
-            symbols.append(str(value).upper())
-        if not symbols:
-            raise ValueError("Universe SQL did not produce any symbols")
-        metadata["rowcount"] = len(symbols)
-        return UniverseSpec(code=original, symbols=_deduplicate(symbols), metadata=metadata)
-
-    def _resolve_inline_list(self, payload: str, *, original: str) -> UniverseSpec:
-        tokens = [token.strip().upper() for token in payload.split(",") if token.strip()]
-        if not tokens:
-            raise ValueError("Universe list is empty")
-        return UniverseSpec(
-            code=original,
-            symbols=_deduplicate(tokens),
-            metadata={"provider": "list", "count": len(tokens)},
-        )
 
 
 def _normalise_symbols(values: Iterable[str]) -> list[str]:

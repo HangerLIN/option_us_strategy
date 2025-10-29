@@ -1,0 +1,39 @@
+groups:
+  - name: trading-core
+    rules:
+      - alert: MdGwOffline
+        expr: rt_ibkr_connection_status == 0
+        for: 60s
+        labels:
+          severity: critical
+        annotations:
+          summary: 'IBKR disconnected'
+
+      - alert: BarsLatencyStuck
+        expr: histogram_quantile(0.95, sum(rate(bars_latency_seconds_bucket[5m])) by (le)) > 5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: '1m bar processing P95 > 5s'
+
+      - alert: KillSwitchOn
+        expr: risk_kill_switch_state == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Kill switch active'
+
+      - alert: ForceCloseSpike
+        expr: increase(risk_force_close_total[15m]) > 3
+        for: 0m
+        labels:
+          severity: high
+
+      - alert: LowOrderConversionLive
+        expr: orders_conversion_rate < 0.4
+        for: 5m
+        labels:
+          severity: high
+          env: live
