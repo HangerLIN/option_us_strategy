@@ -359,6 +359,8 @@ class SignalEngine:
                 if current["close"] is None or current["boll_mid"] is None
                 else float(current["close"] - current["boll_mid"])
             ),
+            "rank_score": float(_to_decimal(df.iloc[l2_idx]["lr_boll_dn_slope"] or Decimal("0"))),
+            "rank_metric": "boll_dn_slope",
             "add_position": addition,
             "option_liquidity": True,
         }
