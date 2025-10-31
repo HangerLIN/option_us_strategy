@@ -3,6 +3,7 @@ Core library utilities shared across services.
 """
 
 from .config import Settings, get_settings
+from .constants import EASTERN
 from .logging import (
     SIGNAL_HEADER,
     SYMBOL_HEADER,
@@ -20,10 +21,9 @@ from .logging import (
 
 # Lazy import to avoid circular dependency with libs.db.dim_trading_calendar
 def __getattr__(name):
-    if name in ("EASTERN", "epoch_ms", "is_half_day", "session_close_utc", 
+    if name in ("epoch_ms", "is_half_day", "session_close_utc", 
                 "to_et", "to_utc", "trading_session_window", "ts_end", "utc_now"):
         from .timeutil import (
-            EASTERN,
             epoch_ms,
             is_half_day,
             session_close_utc,

@@ -542,6 +542,15 @@ class RiskService:
         detail = "limit-ok"
         reasons: Dict[str, object] = {}
         symbol_block_until: Optional[datetime] = None
+        option_snapshot: Dict[str, Any] | None = None
+        if payload.signal_code in self._BUY_SIGNALS:
+            passed, snapshot = self._check_option_liquidity(payload)
+            option_snapshot = snapshot
+            if not passed:
+                approved = False
+                code = "BLOCK:OPTION_LIQUIDITY"
+                detail = "option-liquidity-insufficient"
+                reasons["option_liquidity"] = snapshot
 
         with self._session_factory() as session:
             try:
@@ -612,11 +621,18 @@ class RiskService:
                         code = "BLOCK:CONCURRENCY"
                         detail = "max-concurrent-top-reached"
                         reasons["max_concurrent"] = self._max_concurrent_top
+                        reasons["active_symbols"] = sorted({exp.symbol for exp in exposures if getattr(exp, "open_quantity", 0)})
                         if self._symbol_block_minutes > 0:
                             symbol_block_until = now_utc + timedelta(
                                 minutes=self._symbol_block_minutes
                             )
                             reasons["block_until"] = symbol_block_until.isoformat()
+                        LOGGER.info(
+                            "risk_service.concurrency_block",
+                            symbol=payload.symbol,
+                            max_concurrent=self._max_concurrent_top,
+                            active=reasons["active_symbols"],
+                        )
 
                 decision = RiskDecision(
                     approved=approved,
@@ -635,6 +651,8 @@ class RiskService:
                     - (current_notional + pending_notional),
                     session=session,
                 )
+                if option_snapshot and "option_liquidity" not in decision.reasons:
+                    decision.reasons["option_liquidity"] = option_snapshot
 
                 if record_events and not decision.approved:
                     self._log_block_event(session, now_utc, payload, decision)
@@ -654,6 +672,66 @@ class RiskService:
             except Exception:
                 session.rollback()
                 raise
+
+    # ------------------------------------------------------------------
+    def _check_option_liquidity(self, payload: RiskCheckRequest) -> Tuple[bool, Dict[str, Any]]:
+        """基于风控请求中附带的合约细节判断期权流动性是否达标。"""
+        snapshot: Dict[str, Any] = {"pass": True, "reason": "insufficient_data"}
+        if payload.signal_code not in self._BUY_SIGNALS:
+            return True, snapshot
+        bid = payload.option_bid
+        ask = payload.option_ask
+        oi = payload.option_open_interest
+        volume = payload.option_volume
+        strike = payload.option_strike
+        expiry = payload.option_expiry
+        mid = payload.option_mid
+        spread = payload.option_spread
+        dte = payload.option_dte
+        snapshot.update(
+            {
+                "bid": float(bid) if bid is not None else None,
+                "ask": float(ask) if ask is not None else None,
+                "open_interest": oi,
+                "volume": volume,
+                "strike": float(strike) if strike is not None else None,
+                "expiry": expiry,
+                "mid": float(mid) if mid is not None else None,
+                "spread": float(spread) if spread is not None else None,
+                "dte": dte,
+            }
+        )
+        if None in (bid, ask, oi, volume):
+            snapshot["reason"] = "missing_fields"
+            return True, snapshot
+        if mid is None:
+            mid = (bid + ask) / Decimal("2")
+            snapshot["mid"] = float(mid)
+        if spread is None:
+            spread = ask - bid
+            snapshot["spread"] = float(spread)
+        threshold = max(Decimal("0.10"), mid * Decimal("0.05"))
+        snapshot["threshold"] = float(threshold)
+        if oi < 500 or volume < 100 or spread > threshold:
+            snapshot["pass"] = False
+            snapshot["reason"] = "volume_or_spread"
+            LOGGER.info(
+                "risk_service.option_liquidity_block",
+                symbol=payload.symbol,
+                snapshot=snapshot,
+            )
+            return False, snapshot
+        if dte is not None and not (2 <= dte <= 7):
+            snapshot["pass"] = False
+            snapshot["reason"] = "dte_out_of_range"
+            LOGGER.info(
+                "risk_service.option_liquidity_dte_block",
+                symbol=payload.symbol,
+                snapshot=snapshot,
+            )
+            return False, snapshot
+        snapshot["reason"] = "ok"
+        return True, snapshot
 
     # ------------------------------------------------------------------
     def _reset_if_new_day(self, trade_date: date) -> None:

@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone, tzinfo
-from zoneinfo import ZoneInfo
 
+from libs.core.constants import EASTERN
 from libs.db.dim_trading_calendar import get_trading_session
-
-EASTERN = ZoneInfo("America/New_York")
 
 
 def utc_now() -> datetime:

@@ -15,6 +15,17 @@ class RiskCheckRequest(BaseModel):
     timestamp: datetime
     signal_code: str | None = Field(default=None, max_length=64)
     option_right: str | None = Field(default=None, pattern="^(CALL|PUT)$")
+    option_strike: Decimal | None = Field(default=None, gt=0)
+    option_expiry: str | None = Field(default=None, max_length=8)
+    option_open_interest: int | None = Field(default=None, ge=0)
+    option_volume: int | None = Field(default=None, ge=0)
+    option_bid: Decimal | None = Field(default=None, ge=0)
+    option_ask: Decimal | None = Field(default=None, ge=0)
+    option_mid: Decimal | None = Field(default=None, ge=0)
+    option_spread: Decimal | None = Field(default=None, ge=0)
+    option_dte: int | None = Field(default=None, ge=0)
+    option_otm_steps: int | None = Field(default=None, ge=0)
+    option_liquidity: Dict[str, Any] | None = Field(default=None)
 
 
 class RiskCheckResult(BaseModel):

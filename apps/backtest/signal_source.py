@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Dict, Iterable, Iterator, List
 from uuid import uuid4
 
@@ -87,9 +88,13 @@ def _generate_signals_recompute(
         session_factory=session_factory,
         redis_bus=None,
         top5_source=top5_source,
+        is_backtest=True,
     )
     for symbol in symbols:
         rows = dao.fetch_equity_bars(symbol=symbol, start_ts=start, end_ts=end)
+        cumulative_notional = Decimal("0")
+        cumulative_volume = Decimal("0")
+        vwap_session_date: date | None = None
         for row in rows:
             ts_end = row.ts_end
             if isinstance(ts_end, datetime) and ts_end.tzinfo is None:
@@ -102,10 +107,22 @@ def _generate_signals_recompute(
             bar_et = bar_end.astimezone(EASTERN) if bar_end.tzinfo else bar_end.replace(tzinfo=EASTERN)
             hour = bar_et.hour
             minute = bar_et.minute
+            session_date = bar_et.date()
+
+            if vwap_session_date != session_date:
+                cumulative_notional = Decimal("0")
+                cumulative_volume = Decimal("0")
+                vwap_session_date = session_date
             
             # 只处理9:30-16:00的K线，排除盘前时段（8:00-9:30）
             if hour < 9 or (hour == 9 and minute < 30) or hour >= 16:
                 continue
+
+            volume_dec = Decimal(row.volume or 0)
+            if volume_dec > 0:
+                cumulative_notional += row.close * volume_dec
+                cumulative_volume += volume_dec
+            vwap_value = row.close if cumulative_volume <= 0 else cumulative_notional / cumulative_volume
             
             event = BarsClosed(
                 trace_id=str(uuid4()),
@@ -118,7 +135,7 @@ def _generate_signals_recompute(
                 low=row.low,
                 close=row.close,
                 volume=int(row.volume or 0),
-                vwap=None,
+                vwap=vwap_value,
                 source="backtest",
                 received_at=bar_end,
             )

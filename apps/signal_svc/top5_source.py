@@ -92,50 +92,8 @@ class BacktestTop5Source:
         return {str(symbol).upper() for symbol in rows if symbol}
 
 
-@dataclass(frozen=True)
-class LaggedLeadersSource:
-    table_name: str = "premarket_leaders_lagged"
-    volume_threshold: int = 800_000
-
-    def symbols_for_date(self, session: Session, trade_date: date) -> Set[str]:
-        stmt = text(
-            f"""
-            SELECT DISTINCT symbol
-            FROM {self.table_name}
-            WHERE trade_date = :trade_date
-              AND COALESCE(volume_rth, 0) >= :threshold
-            """
-        )
-        rows = session.execute(
-            stmt, {"trade_date": trade_date, "threshold": self.volume_threshold}
-        ).scalars().all()
-        return {str(symbol).upper() for symbol in rows if symbol}
-
-    def symbols_between(
-        self, session: Session, start_date: date, end_date: date
-    ) -> Set[str]:
-        stmt = text(
-            f"""
-            SELECT DISTINCT symbol
-            FROM {self.table_name}
-            WHERE trade_date BETWEEN :start_date AND :end_date
-              AND COALESCE(volume_rth, 0) >= :threshold
-            """
-        )
-        rows = session.execute(
-            stmt,
-            {
-                "start_date": start_date,
-                "end_date": end_date,
-                "threshold": self.volume_threshold,
-            },
-        ).scalars().all()
-        return {str(symbol).upper() for symbol in rows if symbol}
-
-
 __all__ = [
     "Top5Source",
     "PremarketTop5Source",
     "BacktestTop5Source",
-    "LaggedLeadersSource",
 ]

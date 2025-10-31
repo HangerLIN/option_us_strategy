@@ -116,7 +116,8 @@ class RiskStreamConsumers:
         payload = entry.get("payload") or {}
         trace_id = entry.get("trace_id")
         LOGGER.info("risk_subscriber.signal_received", trace_id=trace_id, payload=payload)
-        status = (payload.get("status") or "").lower()
+        raw_status = payload.get("status")
+        status = (raw_status or ("emitted" if str(payload.get("side")).upper() == "BUY" else "")).lower()
         signal_code = payload.get("signal_code")
         symbol = payload.get("symbol")
         strategy_code = str(payload.get("strategy_code") or "core-vol")
@@ -124,14 +125,32 @@ class RiskStreamConsumers:
         ts_event = self._parse_ts(ts_emitted_raw) if ts_emitted_raw else datetime.now(timezone.utc)
 
         if status == "emitted" and symbol:
+            LOGGER.debug(
+                "risk_subscriber.signal_emitted",
+                symbol=symbol,
+                signal_code=signal_code,
+                trace_id=trace_id,
+            )
             self._risk_service.signal_emitted(strategy_code, symbol, signal_code, ts_event)
         elif status == "filled" and symbol:
             filled_ts = payload.get("filled_at") or payload.get("resolved_at")
             ts_filled = self._parse_ts(filled_ts) if filled_ts else datetime.now(timezone.utc)
+            LOGGER.debug(
+                "risk_subscriber.signal_filled",
+                symbol=symbol,
+                signal_code=signal_code,
+                trace_id=trace_id,
+            )
             self._risk_service.signal_filled(strategy_code, symbol, ts_filled)
         elif status == "ttl_expired" and symbol and self._risk_service.is_buy_signal(signal_code):
             ts_value = payload.get("generated_at") or payload.get("expiry_ts")
             ts_expired = self._parse_ts(ts_value) if ts_value else datetime.now(timezone.utc)
+            LOGGER.info(
+                "risk_subscriber.signal_ttl_expired",
+                symbol=symbol,
+                signal_code=signal_code,
+                trace_id=trace_id,
+            )
             await self._risk_service.record_missed_entry(
                 symbol,
                 strategy_code,

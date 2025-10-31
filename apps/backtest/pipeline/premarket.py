@@ -3,14 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Dict, Iterable, List, Mapping, Sequence, Set
+from typing import Dict, Iterable, List, Mapping, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from libs.core import EASTERN
-from libs.db.dao import BacktestTop5DAO, PremarketLeadersLaggedDAO
+from libs.db.dao import BacktestTop5DAO
 from libs.db.preearn import evaluate_preearn_guard
 
 PRICE_QUANT = Decimal("0.000001")
@@ -62,7 +62,6 @@ class PremarketTop5Builder:
     ) -> None:
         self._session = session
         self._top5_dao = BacktestTop5DAO(session)
-        self._lagged_dao = PremarketLeadersLaggedDAO(session)
         self._preearn_days_min = preearn_days_min
         self._preearn_days_max = preearn_days_max
         self._preearn_atr_pct_max = Decimal(str(preearn_atr_pct_max))
@@ -82,38 +81,73 @@ class PremarketTop5Builder:
             self._top5_dao.replace(batch_id, trade_date, [])
             return []
 
-        lagged_symbols = self._lagged_symbol_pool(trade_date, universe_symbols)
-        active_symbols = [s for s in universe_symbols if s in lagged_symbols] if lagged_symbols else universe_symbols
+        active_symbols = universe_symbols
+
+        import structlog
+        LOGGER = structlog.get_logger(__name__)
+        LOGGER.info(
+            "top5.generation.start",
+            trade_date=trade_date.isoformat(),
+            universe_count=len(universe_symbols),
+            active_count=len(active_symbols),
+        )
+        
         if not active_symbols:
+            LOGGER.warning(
+                "top5.generation.no_active_symbols",
+                trade_date=trade_date.isoformat(),
+                reason="无可用股票",
+            )
             self._top5_dao.replace(batch_id, trade_date, [])
             return []
 
         snapshots = self._load_daily_snapshot(trade_date, active_symbols)
         prices = self._load_premarket_prices(trade_date, active_symbols)
+        
+        LOGGER.info(
+            "top5.generation.data_loaded",
+            trade_date=trade_date.isoformat(),
+            snapshots_count=len(snapshots),
+            prices_count=len(prices)
+        )
+        
         candidates: list[CandidateRow] = []
+        filtered_counts = {
+            'no_snapshot': 0,
+            'no_price': 0,
+            'invalid_prev_close': 0,
+            'invalid_pm_price': 0,
+            'ma60_down': 0,
+            'preearn_blocked': 0,
+        }
 
         for symbol in active_symbols:
             key = symbol.upper()
             snapshot = snapshots.get(key)
             price = prices.get(key)
             if snapshot is None or price is None:
+                filtered_counts['no_snapshot' if snapshot is None else 'no_price'] += 1
                 continue
             prev_close = snapshot.prev_close
             if prev_close is None or prev_close <= Decimal("0"):
+                filtered_counts['invalid_prev_close'] += 1
                 continue
 
             price_value = price.price_preopen
             if price_value <= Decimal("0"):
+                filtered_counts['invalid_pm_price'] += 1
                 continue
 
             try:
                 ret = (price_value - prev_close) / prev_close
                 ret = ret.quantize(RET_QUANT, rounding=ROUND_HALF_UP)
             except (InvalidOperation, ZeroDivisionError):
+                filtered_counts['invalid_pm_price'] += 1
                 continue
 
             m60_up = _m60_up(snapshot)
             if not m60_up:
+                filtered_counts['ma60_down'] += 1
                 continue
 
             allowed, context = evaluate_preearn_guard(
@@ -125,6 +159,7 @@ class PremarketTop5Builder:
                 atr_pct_max=self._preearn_atr_pct_max,
             )
             if not allowed:
+                filtered_counts['preearn_blocked'] += 1
                 continue
 
             candidate = CandidateRow(
@@ -138,12 +173,39 @@ class PremarketTop5Builder:
             )
             candidates.append(candidate)
 
+        LOGGER.info(
+            "top5.generation.filtering_summary",
+            trade_date=trade_date.isoformat(),
+            active_symbols=len(active_symbols),
+            candidates_passed=len(candidates),
+            filtered_no_snapshot=filtered_counts['no_snapshot'],
+            filtered_no_price=filtered_counts['no_price'],
+            filtered_invalid_prev_close=filtered_counts['invalid_prev_close'],
+            filtered_invalid_pm_price=filtered_counts['invalid_pm_price'],
+            filtered_ma60_down=filtered_counts['ma60_down'],
+            filtered_preearn_blocked=filtered_counts['preearn_blocked']
+        )
+        
         if not candidates:
+            LOGGER.warning(
+                "top5.generation.no_candidates",
+                trade_date=trade_date.isoformat(),
+                reason="所有股票都被过滤，无候选股票",
+                ma60_down_ratio=f"{filtered_counts['ma60_down']}/{len(active_symbols)}"
+            )
             self._top5_dao.replace(batch_id, trade_date, [])
             return []
 
         candidates.sort(key=lambda row: row.ret_preopen, reverse=True)
         top_rows = candidates[:10]
+        
+        LOGGER.info(
+            "top5.generation.completed",
+            trade_date=trade_date.isoformat(),
+            top10_count=len(top_rows),
+            top10_symbols=[c.symbol for c in top_rows],
+            gap_range=f"{top_rows[-1].ret_preopen:.2%} ~ {top_rows[0].ret_preopen:.2%}"
+        )
 
         payload: list[dict[str, object]] = []
         for rank, candidate in enumerate(top_rows, start=1):
@@ -166,23 +228,6 @@ class PremarketTop5Builder:
         return payload
 
     # ------------------------------------------------------------------
-    def _lagged_symbol_pool(self, trade_date: date, symbols: Sequence[str]) -> Set[str]:
-        cached = self._lagged_cache.get(trade_date)
-        if cached is not None:
-            return cached
-        rows = self._lagged_dao.ensure(trade_date, symbols)
-        if not rows:
-            self._lagged_cache[trade_date] = set()
-            return set()
-        threshold = self.MIN_RTH_VOLUME
-        selected = {
-            row.symbol.upper()
-            for row in rows
-            if (row.volume_rth or 0) >= threshold
-        }
-        self._lagged_cache[trade_date] = selected
-        return selected
-
     def _load_premarket_prices(
         self, trade_date: date, symbols: Sequence[str]
     ) -> Dict[str, PriceSample]:
@@ -301,6 +346,7 @@ class PremarketTop5Builder:
                 ma_stmt, {"trade_date": trade_date, "symbols": list(symbols)}
             ).fetchall()
         except SQLAlchemyError:
+            self._session.rollback()
             ma_rows = []
 
         for row in ma_rows:

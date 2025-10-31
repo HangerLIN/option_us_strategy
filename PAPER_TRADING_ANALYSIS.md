@@ -183,3 +183,5 @@ async def _consume_bars_closed() -> None:
 3. 测试完整的自动化链路
 
 
+
+

@@ -57,6 +57,7 @@ class AggregatedBar:
         low: 最低价
         close: 收盘价
         volume: 成交量
+        notional: 价格*成交量累积，用于VWAP计算
         ts_end: K线结束时间（UTC，精确到分钟）
     """
     symbol: str
@@ -65,7 +66,16 @@ class AggregatedBar:
     low: Decimal
     close: Decimal
     volume: Decimal
+    notional: Decimal
     ts_end: datetime
+
+
+@dataclass
+class VWAPState:
+    session_date: date
+    notional: Decimal = Decimal("0")
+    volume: Decimal = Decimal("0")
+    last_ts: datetime | None = None
 
 
 @dataclass
@@ -238,6 +248,11 @@ class MinuteAggregator:
         # 100=Option Volume, 101=Option Open Interest, 104=Historical Volatility
         # 106=Option Implied Volatility, 233=RT Volume
         self._option_generic_ticks = "100,101,104,106,233"
+
+        # ========== VWAP累积状态 ==========
+        # _vwap_state: {symbol: VWAPState}
+        # 跟踪同一天内的成交额与成交量，供intraday VWAP计算
+        self._vwap_state: Dict[str, VWAPState] = {}
         
         # ========== Redis连接 ==========
         try:
@@ -793,7 +808,7 @@ class MinuteAggregator:
                 
                 # 5.5 发布bars_closed事件到Redis Stream
                 # 触发signal_svc消费并评估信号
-                self._publish_bar(meta, bar)
+                self._publish_bar(session, meta, bar)
                 
                 # 5.6 更新持久化时间（用于缺口检测）
                 self._last_persisted[alias] = bar.ts_end
@@ -1066,15 +1081,42 @@ class MinuteAggregator:
             聚合后的K线
         """
         # ========== 策略1：使用tick数据聚合 ==========
-        prices = [record["price"] for record in bucket if "price" in record]
+        prices: List[Decimal] = []
+        notional = Decimal("0")
+        volume = Decimal("0")
+        last_price = self._last_trade.get(meta.alias)
+
+        for record in bucket:
+            price = record.get("price")
+            if price is not None:
+                prices.append(price)
+                last_price = price
+
+            size = record.get("size")
+            if size is None:
+                continue
+            volume += size
+            if size <= Decimal("0"):
+                continue
+            trade_price = price if price is not None else last_price
+            if trade_price is None:
+                continue
+            notional += trade_price * size
+
         if prices:
             open_price = prices[0]   # 第一笔成交价
             high_price = max(prices)  # 最高成交价
             low_price = min(prices)   # 最低成交价
             close_price = prices[-1]  # 最后一笔成交价
-            volume = sum((record.get("size", Decimal("0")) for record in bucket), Decimal("0"))
             return AggregatedBar(
-                meta.alias, open_price, high_price, low_price, close_price, volume, ts_end
+                meta.alias,
+                open_price,
+                high_price,
+                low_price,
+                close_price,
+                volume,
+                notional,
+                ts_end,
             )
 
         # ========== 策略2：NBBO回退（无tick时） ==========
@@ -1088,7 +1130,7 @@ class MinuteAggregator:
             mid = self._last_trade.get(meta.alias) or Decimal("0")
         
         # NBBO回退K线：open=high=low=close=mid, volume=0
-        return AggregatedBar(meta.alias, mid, mid, mid, mid, Decimal("0"), ts_end)
+        return AggregatedBar(meta.alias, mid, mid, mid, mid, Decimal("0"), Decimal("0"), ts_end)
 
     def _persist_equity_bar(self, session: Session, bar: AggregatedBar) -> None:
         stmt = text(
@@ -1207,9 +1249,10 @@ class MinuteAggregator:
             },
         )
 
-    def _publish_bar(self, meta: SymbolMeta, bar: AggregatedBar) -> None:
+    def _publish_bar(self, session: Session, meta: SymbolMeta, bar: AggregatedBar) -> None:
         if meta.kind != "EQUITY":
             return
+        vwap_value = self._compute_intraday_vwap(session, meta.underlying, bar)
         event = BarsClosed(
             trace_id=str(uuid4()),
             symbol=meta.underlying,
@@ -1221,7 +1264,7 @@ class MinuteAggregator:
             low=bar.low,
             close=bar.close,
             volume=int(bar.volume),
-            vwap=None,
+            vwap=vwap_value,
             source="aggregator",
             received_at=utc_now(),
         )
@@ -1235,6 +1278,91 @@ class MinuteAggregator:
                     self._loop.create_task(self._safe_publish(publish_coro, meta.underlying))
                 else:
                     asyncio.create_task(self._safe_publish(publish_coro, meta.underlying))
+
+    def _compute_intraday_vwap(
+        self,
+        session: Session,
+        symbol: str,
+        bar: AggregatedBar,
+    ) -> Decimal:
+        ts_end = bar.ts_end
+        et = ts_end.astimezone(EASTERN)
+        session_date = et.date()
+
+        state = self._vwap_state.get(symbol)
+        if (
+            state is None
+            or state.session_date != session_date
+            or (state.last_ts is not None and ts_end <= state.last_ts)
+        ):
+            state = self._bootstrap_vwap_state(session, symbol, session_date, ts_end)
+            self._vwap_state[symbol] = state
+
+        if state.last_ts is None or ts_end > state.last_ts:
+            volume_increment = bar.volume
+            notional_increment = bar.notional
+            if volume_increment > 0:
+                if notional_increment <= Decimal("0"):
+                    notional_increment = bar.close * volume_increment
+                state.notional += notional_increment
+                state.volume += volume_increment
+            state.last_ts = ts_end
+
+        if state.volume > 0:
+            return state.notional / state.volume
+        return bar.close
+
+    def _bootstrap_vwap_state(
+        self,
+        session: Session,
+        symbol: str,
+        session_date: date,
+        ts_end: datetime,
+    ) -> VWAPState:
+        try:
+            session_open_et, _ = trading_session_window(session_date, tz=EASTERN)
+        except KeyError:
+            session_open_et = datetime.combine(session_date, time(9, 30), EASTERN)
+
+        start_utc = session_open_et.astimezone(timezone.utc)
+        rows = session.execute(
+            text(
+                """
+                SELECT ts_end, close, volume
+                FROM bars1m_equity
+                WHERE symbol = :symbol
+                  AND ts_end >= :start
+                  AND ts_end < :ts_end
+                ORDER BY ts_end ASC
+                """
+            ),
+            {"symbol": symbol, "start": start_utc, "ts_end": ts_end},
+        ).all()
+
+        notional = Decimal("0")
+        volume_total = Decimal("0")
+        last_ts = None
+
+        for prev_ts, close_val, volume_val in rows:
+            if volume_val is None:
+                continue
+            volume_dec = volume_val if isinstance(volume_val, Decimal) else Decimal(str(volume_val))
+            if volume_dec <= 0:
+                continue
+            if close_val is None:
+                close_dec = Decimal("0")
+            else:
+                close_dec = close_val if isinstance(close_val, Decimal) else Decimal(str(close_val))
+            notional += close_dec * volume_dec
+            volume_total += volume_dec
+            last_ts = prev_ts
+
+        return VWAPState(
+            session_date=session_date,
+            notional=notional,
+            volume=volume_total,
+            last_ts=last_ts,
+        )
 
     async def _safe_publish(self, awaitable: Awaitable[Any], symbol: str) -> None:
         try:
@@ -1351,13 +1479,20 @@ class MinuteAggregator:
         time_str = str(raw.get("time"))
         dt_et = datetime.strptime(time_str, "%Y%m%d %H:%M:%S").replace(tzinfo=EASTERN)
         ts_end_utc = (dt_et + timedelta(minutes=1)).astimezone(timezone.utc)
+        open_price = Decimal(str(raw.get("open", "0")))
+        high_price = Decimal(str(raw.get("high", "0")))
+        low_price = Decimal(str(raw.get("low", "0")))
+        close_price = Decimal(str(raw.get("close", "0")))
+        volume_val = Decimal(str(raw.get("volume", "0")))
+        notional = close_price * volume_val if volume_val > 0 else Decimal("0")
         return AggregatedBar(
             symbol=symbol,
-            open=Decimal(str(raw.get("open", "0"))),
-            high=Decimal(str(raw.get("high", "0"))),
-            low=Decimal(str(raw.get("low", "0"))),
-            close=Decimal(str(raw.get("close", "0"))),
-            volume=Decimal(str(raw.get("volume", "0"))),
+            open=open_price,
+            high=high_price,
+            low=low_price,
+            close=close_price,
+            volume=volume_val,
+            notional=notional,
             ts_end=ts_end_utc,
         )
 
@@ -1691,6 +1826,7 @@ class MinuteAggregator:
                 option_list.remove(alias)
         elif meta and meta.kind == "EQUITY":
             self._last_equity_close.pop(meta.underlying, None)
+            self._vwap_state.pop(meta.underlying, None)
             option_list = list(self._underlying_options.pop(meta.underlying, []))
             for opt_alias in option_list:
                 if opt_alias in self._active_symbols:
@@ -1775,7 +1911,7 @@ class MinuteAggregator:
 
 async def _top5_schedule_loop(top5_service: Top5Service) -> None:
     """
-    Top5选股定时任务 - 每个交易日09:30:01触发
+    Top5选股定时任务 - 每个交易日09:28:01触发
     
     功能：
     - 基于盘前5分钟（09:25-09:30）涨幅排序
@@ -1785,7 +1921,7 @@ async def _top5_schedule_loop(top5_service: Top5Service) -> None:
     
     触发时机：
     - 每个交易日（周一~周五）
-    - 东部时间09:30:01（盘前窗口关闭后立即计算）
+    - 东部时间09:28:01（正式开盘前2分钟计算完成）
     - 每天只运行一次（last_run标记）
     
     失败策略：
@@ -1808,10 +1944,8 @@ async def _top5_schedule_loop(top5_service: Top5Service) -> None:
                 await asyncio.sleep(1800)
                 continue
 
-            target = (
-                datetime.combine(now_et.date(), session.open_time, tzinfo=EASTERN)
-                + timedelta(seconds=1)
-            )
+            open_dt = datetime.combine(now_et.date(), session.open_time, tzinfo=EASTERN)
+            target = open_dt - timedelta(minutes=2) + timedelta(seconds=1)
             
             if now_et >= target:
                 # 已过触发时间，检查今天是否已运行

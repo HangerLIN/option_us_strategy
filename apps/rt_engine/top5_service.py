@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
 from time import perf_counter
-from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Tuple
 
 import pytz
 import structlog
@@ -14,11 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from libs.core import EASTERN, current_trace_context, utc_now
 from libs.core.config import Settings
-from libs.db import (
-    PremarketLeadersLaggedDAO,
-    PremarketTop5DAO,
-    RiskEventDAO,
-)
+from libs.db import PremarketTop5DAO, RiskEventDAO
 from libs.infra import IBClient
 from libs.infra.metrics import (
     observe_top5_calculation,
@@ -40,7 +36,6 @@ class Top5Service:
     SCANNER_MAX = 50
     TOP_N = 10
     PREMARKET_SAMPLE_MINUTE = 28
-    MIN_RTH_VOLUME = 800_000
     # 移除市值相关常量，改用M60均线过滤（如果可用）
 
     def __init__(self, ib_client: IBClient, session_factory: sessionmaker, settings: Settings) -> None:
@@ -49,7 +44,6 @@ class Top5Service:
         self._settings = settings
         self._logger = structlog.get_logger(__name__)
         self._metrics_enabled = bool(settings.monitoring_enabled)
-        self._lagged_symbol_cache: Dict[date, Set[str]] = {}
 
     def run_for_today(self, et_date: date | None = None) -> None:
         et_date = et_date or datetime.now(EASTERN).date()
@@ -86,39 +80,6 @@ class Top5Service:
         except Exception:  # pragma: no cover - metrics best-effort
             pass
 
-    def _lagged_candidate_symbols(self, session: Session, trade_date: date) -> Set[str]:
-        cached = self._lagged_symbol_cache.get(trade_date)
-        if cached is not None:
-            return cached
-        dao = PremarketLeadersLaggedDAO(session)
-        base_symbols = self._get_fixed_pool_symbols()
-        rows = dao.ensure(trade_date, base_symbols)
-        if not rows:
-            self._lagged_symbol_cache[trade_date] = set()
-            return set()
-        threshold = self.MIN_RTH_VOLUME
-        selected: Set[str] = {
-            row.symbol.upper()
-            for row in rows
-            if (row.volume_rth or 0) >= threshold
-        }
-        self._lagged_symbol_cache[trade_date] = selected
-        if selected:
-            self._logger.info(
-                "top5.lagged_pool",
-                trade_date=str(trade_date),
-                count=len(selected),
-                threshold=threshold,
-            )
-        else:
-            self._logger.warning(
-                "top5.lagged_pool_empty",
-                trade_date=str(trade_date),
-                rows=len(rows),
-                threshold=threshold,
-            )
-        return selected
-
     # ------------------------------------------------------------------
     def _run(self, session: Session, et_date: date) -> bool:
         top5_dao = PremarketTop5DAO(session)
@@ -142,67 +103,56 @@ class Top5Service:
         self._logger.info("top5.m60_check", available=m60_available, trade_date=str(et_date))
         
         candidate_symbols: List[str] = []
-        lagged_symbols = self._lagged_candidate_symbols(session, et_date)
-        if lagged_symbols:
-            candidate_symbols = sorted(lagged_symbols)
-            self._record_candidate_count(len(candidate_symbols))
-            self._logger.info(
-                "top5.candidates_from_lagged",
-                trade_date=str(et_date),
-                count=len(candidate_symbols),
-            )
-        else:
-            # 根据配置选择股票池来源
-            top5_mode = self._settings.top5_mode
-            self._logger.info("top5.mode", mode=top5_mode, trade_date=str(et_date))
+        top5_mode = self._settings.top5_mode
+        self._logger.info("top5.mode", mode=top5_mode, trade_date=str(et_date))
 
-            if top5_mode == "scanner":
-                # 使用Scanner扫描
-                try:
-                    subscription = self._build_subscription()
-                    scanner_results = self._ib_client.scanner_premarket(subscription)
-                except Exception as exc:
-                    self._handle_failure(
-                        session,
-                        top5_dao,
-                        risk_dao,
-                        et_date,
-                        reason="scanner_failed",
-                        detail=str(exc),
-                    )
-                    return False
-
-                candidate_symbols = self._extract_symbols(scanner_results)
-                self._record_candidate_count(len(candidate_symbols))
-                if not candidate_symbols:
-                    self._handle_failure(
-                        session,
-                        top5_dao,
-                        risk_dao,
-                        et_date,
-                        reason="no_scanner_candidates",
-                        detail="scanner returned no eligible symbols",
-                    )
-                    return False
-            else:
-                # 使用固定股票池
-                candidate_symbols = self._get_fixed_pool_symbols()
-                self._logger.info(
-                    "top5.fixed_pool",
-                    count=len(candidate_symbols),
-                    symbols=",".join(candidate_symbols[:10]) + "..." if len(candidate_symbols) > 10 else ",".join(candidate_symbols)
+        if top5_mode == "scanner":
+            # 使用Scanner扫描
+            try:
+                subscription = self._build_subscription()
+                scanner_results = self._ib_client.scanner_premarket(subscription)
+            except Exception as exc:
+                self._handle_failure(
+                    session,
+                    top5_dao,
+                    risk_dao,
+                    et_date,
+                    reason="scanner_failed",
+                    detail=str(exc),
                 )
-                self._record_candidate_count(len(candidate_symbols))
-                if not candidate_symbols:
-                    self._handle_failure(
-                        session,
-                        top5_dao,
-                        risk_dao,
-                        et_date,
-                        reason="fixed_pool_empty",
-                        detail="fixed pool has no symbols",
-                    )
-                    return False
+                return False
+
+            candidate_symbols = self._extract_symbols(scanner_results)
+            self._record_candidate_count(len(candidate_symbols))
+            if not candidate_symbols:
+                self._handle_failure(
+                    session,
+                    top5_dao,
+                    risk_dao,
+                    et_date,
+                    reason="no_scanner_candidates",
+                    detail="scanner returned no eligible symbols",
+                )
+                return False
+        else:
+            # 使用固定股票池
+            candidate_symbols = self._get_fixed_pool_symbols()
+            self._logger.info(
+                "top5.fixed_pool",
+                count=len(candidate_symbols),
+                symbols=",".join(candidate_symbols[:10]) + "..." if len(candidate_symbols) > 10 else ",".join(candidate_symbols)
+            )
+            self._record_candidate_count(len(candidate_symbols))
+            if not candidate_symbols:
+                self._handle_failure(
+                    session,
+                    top5_dao,
+                    risk_dao,
+                    et_date,
+                    reason="fixed_pool_empty",
+                    detail="fixed pool has no symbols",
+                )
+                return False
 
         returns: Dict[str, Decimal] = {}
         for symbol in candidate_symbols:

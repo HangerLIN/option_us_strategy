@@ -173,13 +173,16 @@ class OptionSelector:
             raise RuntimeError(f"No eligible option candidates for {symbol}")
 
         lower_delta, upper_delta = delta_band
+        max_volume = max(item.quote.volume for item in candidates)
+        top_volume_candidates = [
+            item for item in candidates if item.quote.volume == max_volume
+        ]
         selected = min(
-            candidates,
+            top_volume_candidates,
             key=lambda item: (
-                item.quote.spread,
                 _delta_penalty(item.quote.delta, lower_delta, upper_delta),
+                item.quote.spread,
                 -item.quote.open_interest,
-                -item.quote.volume,
                 item.strike_distance,
             ),
         )

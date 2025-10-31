@@ -89,6 +89,7 @@ class SignalEngine:
         strategy_code: str = "core-vol",
         history_window: int = 180,
         top5_source: Top5Source | None = None,
+        is_backtest: bool = False,
     ) -> None:
         self._session_factory = session_factory
         self._redis_bus = redis_bus
@@ -99,6 +100,7 @@ class SignalEngine:
         self._cooldown = self._settings.cooldown_buy_seconds
         self._mfi_stoch_filter = self._settings.feature_mfi_stoch_filter
         self._preearn_days_min = int(self._settings.preearn_days_min)
+        self._is_backtest = is_backtest
         self._preearn_days_max = int(self._settings.preearn_days_max)
         self._preearn_atr_pct_max = Decimal(str(self._settings.preearn_atr_pct_max))
         self._positions: Dict[str, PositionState] = {}
@@ -114,9 +116,14 @@ class SignalEngine:
         self._am_bottom_limits = risk_limits.am_bottom
         self._am_sell1_limits = risk_limits.am_sell1
         self._am_conf_limits = risk_limits.am_conf
+        self._buy_priority_slots: int = max(1, int(self._am_bottom_limits.top_n))
         self._vix_gate_mode = risk_limits.gate.vix.mode
         self._vix_gate = Decimal(str(risk_limits.gate.vix.thresh))
         self._ma60_cache: Dict[Tuple[str, date], Optional[Decimal]] = {}
+        # 记录最近一次期权流动性筛选结果，供 reason / option_hint 使用
+        self._liquidity_snapshot: Dict[str, Dict[str, Any]] = {}
+        # 当日买入信号优先级缓存：按布林下轨斜率排名选前N只
+        self._buy_priority: Dict[date, Dict[str, Decimal]] = {}
 
         # Resolve bt_run for logging
         session: Session = self._session_factory()
@@ -198,8 +205,25 @@ class SignalEngine:
             if not rows:
                 session.rollback()
                 return []
+            cumulative_notional = Decimal("0")
+            cumulative_volume = Decimal("0")
+            vwap_session_date: date | None = None
             for ts_end, open_, high_, low_, close_, volume in rows:
                 trace_id = f"preview-{symbol.upper()}-{int(ts_end.timestamp())}"
+                et = ts_end.astimezone(EASTERN)
+                session_date = et.date()
+                if vwap_session_date != session_date:
+                    cumulative_notional = Decimal("0")
+                    cumulative_volume = Decimal("0")
+                    vwap_session_date = session_date
+
+                close_dec = _to_decimal(close_)
+                volume_dec = Decimal(volume or 0)
+                if volume_dec > 0:
+                    cumulative_notional += close_dec * volume_dec
+                    cumulative_volume += volume_dec
+                vwap_value = close_dec if cumulative_volume <= 0 else cumulative_notional / cumulative_volume
+
                 event = BarsClosed(
                     trace_id=trace_id,
                     symbol=symbol,
@@ -209,9 +233,9 @@ class SignalEngine:
                     open=_to_decimal(open_),
                     high=_to_decimal(high_),
                     low=_to_decimal(low_),
-                    close=_to_decimal(close_),
+                    close=close_dec,
                     volume=int(volume or 0),
-                    vwap=None,
+                    vwap=vwap_value,
                     source="preview",
                     received_at=ts_end,
                 )
@@ -362,7 +386,7 @@ class SignalEngine:
             "rank_score": float(_to_decimal(df.iloc[l2_idx]["lr_boll_dn_slope"] or Decimal("0"))),
             "rank_metric": "boll_dn_slope",
             "add_position": addition,
-            "option_liquidity": True,
+            "option_liquidity": self._liquidity_snapshot.get(event.symbol, {"pass": True}),
         }
         return self._build_signal(
             symbol=event.symbol,
@@ -459,7 +483,7 @@ class SignalEngine:
             "stoch_rsi_cross_20": True,
             "obv_slope": str(current["lr_obv_slope"]),
             "add_position": addition,
-            "option_liquidity": True,
+            "option_liquidity": self._liquidity_snapshot.get(event.symbol, {"pass": True}),
         }
         return self._build_signal(
             symbol=event.symbol,
@@ -688,11 +712,30 @@ class SignalEngine:
         et_time = _to_eastern(event.bar_end)
         if (et_time.hour, et_time.minute) != (9, 31):
             return None
+        
+        # 入口日志：记录进入E1检测
+        LOGGER.info(
+            "signal.e1.enter",
+            symbol=event.symbol,
+            timestamp=et_time.isoformat(),
+            df_length=len(df),
+            vix=str(vix_value) if vix_value else "None",
+            vix_gate_mode=self._vix_gate_mode,
+            vix_gate_threshold=str(self._vix_gate) if self._vix_gate else "None"
+        )
         if (
             vix_value is not None
             and self._vix_gate_mode == "enforce"
             and vix_value >= self._vix_gate
         ):
+            LOGGER.info(
+                "signal.e1.vix_filtered",
+                symbol=event.symbol,
+                timestamp=et_time.isoformat(),
+                vix_value=str(vix_value),
+                vix_threshold=str(self._vix_gate),
+                reason="VIX过高，超过阈值"
+            )
             try:
                 if self._metrics_enabled:
                     record_signal_filtered("VIX_GATE")
@@ -700,6 +743,13 @@ class SignalEngine:
                 pass
             return None
         if not self._top5_today(trade_date, session, event.symbol):
+            LOGGER.info(
+                "signal.e1.top5_filtered",
+                symbol=event.symbol,
+                timestamp=et_time.isoformat(),
+                trade_date=trade_date.isoformat(),
+                reason="不在当天Top5列表中"
+            )
             try:
                 if self._metrics_enabled:
                     record_signal_filtered("TOP5_FILTER")
@@ -707,10 +757,25 @@ class SignalEngine:
                 pass
             return None
         if len(df) < 6:
+            LOGGER.info(
+                "signal.e1.history_insufficient",
+                symbol=event.symbol,
+                timestamp=et_time.isoformat(),
+                df_length=len(df),
+                required=6,
+                reason="历史K线数据不足（需要至少6根）"
+            )
             return None
 
         # 盘前涨幅过滤（权威来源）：09:28 价相对昨收 > 0.5%
         # 使用数据库查询 prev_close_rth 与 09:28 的 bars1m_equity
+        LOGGER.info(
+            "signal.e1.gap_check_start",
+            symbol=event.symbol,
+            timestamp=et_time.isoformat(),
+            trade_date=trade_date.isoformat(),
+            reason="开始盘前涨幅检查"
+        )
         try:
             # 昨日收盘价（RTH 收盘）
             row_prev = session.execute(
@@ -737,8 +802,26 @@ class SignalEngine:
                 {"symbol": event.symbol, "ts_end": ts_0928_utc},
             ).fetchone()
 
+            LOGGER.info(
+                "signal.e1.gap_data_fetched",
+                symbol=event.symbol,
+                timestamp=et_time.isoformat(),
+                has_prev_close=bool(row_prev and row_prev[0]),
+                has_0928_price=bool(row_0928 and row_0928[0]),
+                prev_close_value=str(row_prev[0]) if row_prev and row_prev[0] else "None",
+                price_0928_value=str(row_0928[0]) if row_0928 and row_0928[0] else "None"
+            )
+            
             if row_prev is None or row_prev[0] is None or row_0928 is None or row_0928[0] is None:
                 # 缺少关键数据则不通过过滤
+                LOGGER.info(
+                    "signal.e1.gap_data_missing",
+                    symbol=event.symbol,
+                    timestamp=et_time.isoformat(),
+                    prev_close_available=bool(row_prev and row_prev[0]),
+                    price_0928_available=bool(row_0928 and row_0928[0]),
+                    reason="盘前涨幅过滤：缺少昨收或09:28价格数据"
+                )
                 try:
                     if self._metrics_enabled:
                         record_signal_filtered("PREMARKET_GAP_MISSING")
@@ -749,7 +832,21 @@ class SignalEngine:
             try:
                 prev_close = Decimal(str(row_prev[0]))
                 price_0928 = Decimal(str(row_0928[0]))
-            except Exception:
+                LOGGER.info(
+                    "signal.e1.gap_data_parsed",
+                    symbol=event.symbol,
+                    timestamp=et_time.isoformat(),
+                    prev_close=str(prev_close),
+                    price_0928=str(price_0928)
+                )
+            except Exception as e:
+                LOGGER.info(
+                    "signal.e1.gap_data_parse_fail",
+                    symbol=event.symbol,
+                    timestamp=et_time.isoformat(),
+                    error=str(e),
+                    reason="盘前涨幅过滤：价格数据解析失败"
+                )
                 try:
                     if self._metrics_enabled:
                         record_signal_filtered("PREMARKET_GAP_PARSE_FAIL")
@@ -758,6 +855,14 @@ class SignalEngine:
                 return None
 
             if prev_close <= 0 or price_0928 <= 0:
+                LOGGER.info(
+                    "signal.e1.gap_data_invalid",
+                    symbol=event.symbol,
+                    timestamp=et_time.isoformat(),
+                    prev_close=str(prev_close),
+                    price_0928=str(price_0928),
+                    reason="盘前涨幅过滤：价格数据无效（<=0）"
+                )
                 try:
                     if self._metrics_enabled:
                         record_signal_filtered("PREMARKET_GAP_INVALID")
@@ -766,55 +871,220 @@ class SignalEngine:
                 return None
 
             pre_gap = (price_0928 - prev_close) / prev_close
+            LOGGER.info(
+                "signal.e1.gap_calculated",
+                symbol=event.symbol,
+                timestamp=et_time.isoformat(),
+                prev_close=str(prev_close),
+                price_0928=str(price_0928),
+                pre_gap_pct=f"{pre_gap * 100:.2f}%",
+                required_pct="0.50%",
+                passed=bool(pre_gap >= Decimal("0.005"))
+            )
             if pre_gap < Decimal("0.005"):
+                LOGGER.info(
+                    "signal.e1.gap_filtered",
+                    symbol=event.symbol,
+                    timestamp=et_time.isoformat(),
+                    prev_close=str(prev_close),
+                    price_0928=str(price_0928),
+                    pre_gap_pct=f"{pre_gap * 100:.2f}%",
+                    required_pct="0.50%",
+                    reason="盘前涨幅过滤：09:28涨幅不足0.5%"
+                )
                 try:
                     if self._metrics_enabled:
                         record_signal_filtered("PREMARKET_GAP_FILTER")
                 except Exception:
                     pass
                 return None
-        except Exception:
+            LOGGER.info(
+                "signal.e1.gap_passed",
+                symbol=event.symbol,
+                timestamp=et_time.isoformat(),
+                reason="通过盘前涨幅检查，进入K线形态判断"
+            )
+        except Exception as e:
             # 防御性：任何异常都视为不通过，避免放行
+            LOGGER.warning(
+                "signal.e1.gap_exception",
+                symbol=event.symbol,
+                timestamp=et_time.isoformat(),
+                error=str(e),
+                reason="盘前涨幅过滤：发生异常"
+            )
             try:
                 if self._metrics_enabled:
                     record_signal_filtered("PREMARKET_GAP_EXCEPTION")
             except Exception:
                 pass
-            return None
+                return None
         
-        prev = df.iloc[-2]
-        prev2 = df.iloc[-3]
-        two_green = bool(
-            prev["close"] > prev["open"]
-            and prev2["close"] > prev2["open"]
-            and prev["close"] > prev2["close"]
+        LOGGER.info(
+            "signal.e1.candle_check_start",
+            symbol=event.symbol,
+            timestamp=et_time.isoformat(),
+            reason="开始K线形态检查"
         )
-        opens_above_mid = bool(
-            prev["open"] >= prev["boll_mid"] and prev2["open"] >= prev2["boll_mid"]
-        )
+        try:
+            prev = df.iloc[-2]
+            prev2 = df.iloc[-3]
+            LOGGER.info(
+                "signal.e1.candle_data_loaded",
+                symbol=event.symbol,
+                timestamp=et_time.isoformat(),
+                prev_close=str(prev["close"]),
+                prev2_close=str(prev2["close"]),
+                prev_boll_mid=str(prev["boll_mid"])
+            )
+            two_green = bool(
+                prev["close"] > prev["open"]
+                and prev2["close"] > prev2["open"]
+                and prev["close"] > prev2["close"]
+            )
+            opens_above_mid = bool(
+                prev["open"] >= prev["boll_mid"] and prev2["open"] >= prev2["boll_mid"]
+            )
+        except Exception as e:
+            LOGGER.error(
+                "signal.e1.candle_data_error",
+                symbol=event.symbol,
+                timestamp=et_time.isoformat(),
+                error=str(e),
+                df_length=len(df),
+                reason="K线形态数据加载失败"
+            )
+            return None
         if not (two_green or opens_above_mid):
+            LOGGER.info(
+                "signal.e1.candle_pattern_filtered",
+                symbol=event.symbol,
+                timestamp=et_time.isoformat(),
+                two_green=two_green,
+                opens_above_mid=opens_above_mid,
+                prev_candle=f"O:{prev['open']:.2f} C:{prev['close']:.2f}",
+                prev2_candle=f"O:{prev2['open']:.2f} C:{prev2['close']:.2f}",
+                boll_mid_prev=f"{prev['boll_mid']:.2f}",
+                reason="K线形态不符：既不是连续两根阳线，也不是开盘在布林中轨上方"
+            )
+            try:
+                if self._metrics_enabled:
+                    record_signal_filtered("CANDLE_PATTERN")
+            except Exception:
+                pass
             return None
 
-        ao_up = bool(prev["ao"] > 0 and prev["ao"] >= prev2["ao"])
-        cci_positive = bool(prev["cci14"] > 0 and prev["cci6"] > 0)
-        obv_rising = bool(prev["obv"] >= prev["obv_ema20"])
-        if sum([ao_up, cci_positive, obv_rising]) < 2:
+        LOGGER.info(
+            "signal.e1.candle_pattern_passed",
+            symbol=event.symbol,
+            timestamp=et_time.isoformat(),
+            two_green=two_green,
+            opens_above_mid=opens_above_mid,
+            reason="K线形态检查通过，进入技术指标检查"
+        )
+        try:
+            ao_up = bool(prev["ao"] > 0 and prev["ao"] >= prev2["ao"])
+            cci_positive = bool(prev["cci14"] > 0 and prev["cci6"] > 0)
+            obv_rising = bool(prev["obv"] >= prev["obv_ema20"])
+            tech_score = sum([ao_up, cci_positive, obv_rising])
+        except Exception as e:
+            LOGGER.error(
+                "signal.e1.tech_indicator_error",
+                symbol=event.symbol,
+                timestamp=et_time.isoformat(),
+                error=str(e),
+                reason="技术指标计算失败"
+            )
+            return None
+        if tech_score < 2:
+            LOGGER.info(
+                "signal.e1.technical_filtered",
+                symbol=event.symbol,
+                timestamp=et_time.isoformat(),
+                ao_up=ao_up,
+                ao_value=f"{prev['ao']:.4f}",
+                ao_prev2=f"{prev2['ao']:.4f}",
+                cci_positive=cci_positive,
+                cci14=f"{prev['cci14']:.2f}",
+                cci6=f"{prev['cci6']:.2f}",
+                obv_rising=obv_rising,
+                obv=f"{prev['obv']:.0f}",
+                obv_ema20=f"{prev['obv_ema20']:.0f}",
+                tech_score=f"{tech_score}/3",
+                reason=f"技术指标不足：需满足2/3条件，实际{tech_score}/3"
+            )
+            try:
+                if self._metrics_enabled:
+                    record_signal_filtered("TECHNICAL_INDICATORS")
+            except Exception:
+                pass
             return None
 
         mfi_pass = False
         stoch_pass = False
         if self._mfi_stoch_filter:
-            mfi_slope = prev["mfi14"] - df.iloc[-5]["mfi14"]
-            mfi_pass = bool(prev["mfi14"] > 50 and mfi_slope > 0)
+            # 检查MFI数据有效性
+            current_mfi = prev["mfi14"]
+            lag5_mfi = df.iloc[-5]["mfi14"]
+            
+            if pd.isna(current_mfi) or pd.isna(lag5_mfi):
+                LOGGER.warning(
+                    "signal.e1.mfi_data_missing",
+                    symbol=event.symbol,
+                    timestamp=et_time.isoformat(),
+                    current_mfi=str(current_mfi),
+                    lag5_mfi=str(lag5_mfi),
+                    reason="MFI数据缺失，拒绝信号"
+                )
+                try:
+                    if self._metrics_enabled:
+                        record_signal_filtered("MFI_DATA_MISSING")
+                except Exception:
+                    pass
+                return None
+            
+            mfi_slope = current_mfi - lag5_mfi
+            mfi_pass = bool(current_mfi > 50 and mfi_slope > 0)
+            
             stoch_pass = bool(
                 prev2["stoch_k"] <= prev2["stoch_d"]
                 and prev["stoch_k"] > prev["stoch_d"]
                 and prev["stoch_k"] < 80
             )
+            
             if not (mfi_pass or stoch_pass):
+                LOGGER.info(
+                    "signal.e1.mfi_stoch_filtered",
+                    symbol=event.symbol,
+                    timestamp=et_time.isoformat(),
+                    mfi_pass=mfi_pass,
+                    mfi_current=f"{current_mfi:.2f}",
+                    mfi_lag5=f"{lag5_mfi:.2f}",
+                    mfi_slope=f"{mfi_slope:.2f}",
+                    mfi_check=f"MFI>{50}: {current_mfi > 50}, 斜率>0: {mfi_slope > 0}",
+                    stoch_pass=stoch_pass,
+                    stoch_k_prev2=f"{prev2['stoch_k']:.2f}",
+                    stoch_d_prev2=f"{prev2['stoch_d']:.2f}",
+                    stoch_k_prev=f"{prev['stoch_k']:.2f}",
+                    stoch_d_prev=f"{prev['stoch_d']:.2f}",
+                    stoch_check=f"金叉: {prev2['stoch_k'] <= prev2['stoch_d'] and prev['stoch_k'] > prev['stoch_d']}, K<80: {prev['stoch_k'] < 80}",
+                    reason="MFI/Stoch过滤：MFI和Stoch条件均不满足"
+                )
+                try:
+                    if self._metrics_enabled:
+                        record_signal_filtered("MFI_STOCH_FILTER")
+                except Exception:
+                    pass
                 return None
 
         if 12 <= et_time.hour < 14:
+            LOGGER.info(
+                "signal.e1.time_window_filtered",
+                symbol=event.symbol,
+                timestamp=et_time.isoformat(),
+                hour=et_time.hour,
+                reason="时间窗口过滤：12:00-14:00禁止开仓"
+            )
             try:
                 if self._metrics_enabled:
                     record_signal_filtered("TIME_WINDOW")
@@ -823,6 +1093,17 @@ class SignalEngine:
             return None
         allowed, addition = self._can_open_position(event.symbol, df, session, event.bar_end)
         if not allowed:
+            LOGGER.info(
+                "signal.e1.position_limit_filtered",
+                symbol=event.symbol,
+                timestamp=et_time.isoformat(),
+                reason="位置管理过滤：不允许开新仓位"
+            )
+            try:
+                if self._metrics_enabled:
+                    record_signal_filtered("POSITION_LIMIT")
+            except Exception:
+                pass
             return None
 
         reason = {
@@ -835,8 +1116,21 @@ class SignalEngine:
             "mfi_pass": mfi_pass,
             "stoch_pass": stoch_pass,
             "add_position": addition,
-            "option_liquidity": True,
+            "option_liquidity": self._liquidity_snapshot.get(event.symbol, {"pass": True}),
         }
+        
+        # 成功生成买入信号的日志
+        LOGGER.info(
+            "signal.e1.buy_signal_generated",
+            symbol=event.symbol,
+            timestamp=et_time.isoformat(),
+            signal_code="SIG_OPEN_CHASE_BUY",
+            candle_pattern="two_green" if two_green else "opens_above_mid",
+            tech_indicators=f"AO:{ao_up}, CCI:{cci_positive}, OBV:{obv_rising}",
+            mfi_stoch=f"MFI:{mfi_pass}, Stoch:{stoch_pass}" if self._mfi_stoch_filter else "disabled",
+            reason="所有过滤条件已通过，生成开盘追涨买入信号"
+        )
+        
         return self._build_signal(
             symbol=event.symbol,
             signal_code="SIG_OPEN_CHASE_BUY",
@@ -877,7 +1171,29 @@ class SignalEngine:
         rvol_pass = bool(current["rvol6"] >= 2)
         obv_cross = bool(prev["obv"] <= prev["obv_ema20"] and current["obv"] > current["obv_ema20"])
         ao_positive = bool(prev["ao"] <= 0 and current["ao"] > 0)
-        if sum([rvol_pass, obv_cross, ao_positive]) < 2:
+        e2_tech_score = sum([rvol_pass, obv_cross, ao_positive])
+        if e2_tech_score < 2:
+            LOGGER.info(
+                "signal.e2.technical_filtered",
+                symbol=event.symbol,
+                timestamp=et_time.isoformat(),
+                rvol_pass=rvol_pass,
+                rvol6=f"{current['rvol6']:.2f}",
+                obv_cross=obv_cross,
+                obv_prev=f"{prev['obv']:.0f}",
+                obv_current=f"{current['obv']:.0f}",
+                obv_ema20=f"{current['obv_ema20']:.0f}",
+                ao_positive=ao_positive,
+                ao_prev=f"{prev['ao']:.4f}",
+                ao_current=f"{current['ao']:.4f}",
+                tech_score=f"{e2_tech_score}/3",
+                reason=f"E2技术指标不足：需满足2/3条件，实际{e2_tech_score}/3"
+            )
+            try:
+                if self._metrics_enabled:
+                    record_signal_filtered("E2_TECHNICAL_INDICATORS")
+            except Exception:
+                pass
             return None
 
         scenario_a = False
@@ -897,6 +1213,22 @@ class SignalEngine:
             return None
 
         if not (scenario_a or scenario_b):
+            LOGGER.info(
+                "signal.e2.scenario_filtered",
+                symbol=event.symbol,
+                timestamp=et_time.isoformat(),
+                scenario_a=scenario_a,
+                scenario_b=scenario_b,
+                time_window=f"{et_time.hour}:{et_time.minute:02d}",
+                rsi6_prev=f"{prev['rsi6']:.2f}" if et_time <= morning_cutoff else "N/A",
+                rsi6_current=f"{current['rsi6']:.2f}" if et_time <= morning_cutoff else "N/A",
+                reason="E2情景不符：既不是RSI30金叉（9:33前），也不是二次探底反弹（10:00-10:30）"
+            )
+            try:
+                if self._metrics_enabled:
+                    record_signal_filtered("E2_SCENARIO")
+            except Exception:
+                pass
             return None
 
         if 12 <= et_time.hour < 14:
@@ -908,14 +1240,55 @@ class SignalEngine:
         mfi_pass = False
         stoch_pass = False
         if self._mfi_stoch_filter:
-            mfi_slope = current["mfi14"] - df.iloc[-4]["mfi14"]
-            mfi_pass = bool(current["mfi14"] > 50 and mfi_slope > 0)
+            # 检查MFI数据有效性
+            current_mfi = current["mfi14"]
+            lag4_mfi = df.iloc[-4]["mfi14"]
+            
+            if pd.isna(current_mfi) or pd.isna(lag4_mfi):
+                LOGGER.warning(
+                    "signal.e2.mfi_data_missing",
+                    symbol=event.symbol,
+                    timestamp=et_time.isoformat(),
+                    current_mfi=str(current_mfi),
+                    lag4_mfi=str(lag4_mfi),
+                    reason="E2 MFI数据缺失，拒绝信号"
+                )
+                try:
+                    if self._metrics_enabled:
+                        record_signal_filtered("E2_MFI_DATA_MISSING")
+                except Exception:
+                    pass
+                return None
+            
+            mfi_slope = current_mfi - lag4_mfi
+            mfi_pass = bool(current_mfi > 50 and mfi_slope > 0)
             stoch_pass = bool(
                 prev["stoch_k"] <= prev["stoch_d"]
                 and current["stoch_k"] > current["stoch_d"]
                 and current["stoch_k"] < 80
             )
+            
             if not (mfi_pass or stoch_pass):
+                LOGGER.info(
+                    "signal.e2.mfi_stoch_filtered",
+                    symbol=event.symbol,
+                    timestamp=et_time.isoformat(),
+                    mfi_pass=mfi_pass,
+                    mfi_current=f"{current_mfi:.2f}",
+                    mfi_lag4=f"{lag4_mfi:.2f}",
+                    mfi_slope=f"{mfi_slope:.2f}",
+                    stoch_pass=stoch_pass,
+                    stoch_k_prev=f"{prev['stoch_k']:.2f}",
+                    stoch_d_prev=f"{prev['stoch_d']:.2f}",
+                    stoch_k_current=f"{current['stoch_k']:.2f}",
+                    stoch_d_current=f"{current['stoch_d']:.2f}",
+                    reason="E2 MFI/Stoch过滤：MFI和Stoch条件均不满足"
+                )
+                try:
+                    if self._metrics_enabled:
+                        record_signal_filtered("E2_MFI_STOCH_FILTER")
+                except Exception:
+                    pass
                 return None
 
         reason = {
@@ -930,8 +1303,21 @@ class SignalEngine:
             "mfi_pass": mfi_pass,
             "stoch_pass": stoch_pass,
             "add_position": addition,
-            "option_liquidity": True,
+            "option_liquidity": self._liquidity_snapshot.get(event.symbol, {"pass": True}),
         }
+        
+        # 成功生成E2买入信号的日志
+        LOGGER.info(
+            "signal.e2.buy_signal_generated",
+            symbol=event.symbol,
+            timestamp=et_time.isoformat(),
+            signal_code="SIG_REBOUND_BUY",
+            scenario="RSI30金叉" if scenario_a else f"二次探底反弹(+{bounce_amount:.2%})",
+            tech_indicators=f"RVOL:{rvol_pass}, OBV_Cross:{obv_cross}, AO+:{ao_positive}",
+            mfi_stoch=f"MFI:{mfi_pass}, Stoch:{stoch_pass}" if self._mfi_stoch_filter else "disabled",
+            reason="所有E2过滤条件已通过，生成反弹买入信号"
+        )
+        
         return self._build_signal(
             symbol=event.symbol,
             signal_code="SIG_REBOUND_BUY",
@@ -988,7 +1374,7 @@ class SignalEngine:
             "ao_positive": ao_cross,
             "cci_positive": cci_positive,
             "add_position": addition,
-            "option_liquidity": True,
+            "option_liquidity": self._liquidity_snapshot.get(event.symbol, {"pass": True}),
         }
         return self._build_signal(
             symbol=event.symbol,
@@ -1036,7 +1422,7 @@ class SignalEngine:
             "dipped": dipped,
             "strong_reversal": strong_reversal,
             "add_position": addition,
-            "option_liquidity": True,
+            "option_liquidity": self._liquidity_snapshot.get(event.symbol, {"pass": True}),
         }
         return self._build_signal(
             symbol=event.symbol,
@@ -1089,7 +1475,7 @@ class SignalEngine:
             "peaks": len(peaks),
             "rebound": str(rebound),
             "add_position": addition,
-            "option_liquidity": True,
+            "option_liquidity": self._liquidity_snapshot.get(event.symbol, {"pass": True}),
         }
         return self._build_signal(
             symbol=event.symbol,
@@ -1288,6 +1674,14 @@ class SignalEngine:
             signal = detector(event, df, trade_date, vix_value, session)
             if signal is None:
                 continue
+            if signal.side == SignalSide.BUY:
+                if not self._passes_buy_priority(trade_date, signal):
+                    if self._metrics_enabled:
+                        try:
+                            record_signal_filtered("PRIORITY_FILTER")
+                        except Exception:
+                            pass
+                    continue
             if not self._should_emit(signal, event.bar_end):
                 continue
             trace_id = event.trace_id or str(uuid4())
@@ -1335,6 +1729,7 @@ class SignalEngine:
         payload["trace_id"] = trace_id
         payload["bar_end"] = ts_end.isoformat()
         payload["strategy_code"] = self._strategy_code
+        payload["status"] = "EMITTED"
         try:
             coro = self._redis_bus.publish("signals", payload, trace_id=trace_id)
             try:
@@ -1485,6 +1880,22 @@ class SignalEngine:
         session: Optional[Session] = None,
         ts_end: Optional[datetime] = None,
     ) -> Tuple[bool, bool]:
+        # 回测模式下跳过位置管理检查
+        if self._is_backtest:
+            LOGGER.info(
+                "position_check.backtest_skip",
+                symbol=symbol,
+                reason="回测模式：跳过位置管理检查（MA60、期权流动性等）"
+            )
+            return True, False
+        
+        LOGGER.info(
+            "position_check.start",
+            symbol=symbol,
+            has_df=df is not None,
+            has_session=session is not None,
+            has_ts_end=ts_end is not None
+        )
         if session is not None and ts_end is not None:
             trade_date = ts_end.astimezone(EASTERN).date()
             try:
@@ -1503,6 +1914,12 @@ class SignalEngine:
                     trade_date=str(trade_date),
                 )
                 preearn_allowed = True
+            LOGGER.info(
+                "position_check.preearn",
+                symbol=symbol,
+                trade_date=str(trade_date),
+                preearn_allowed=preearn_allowed
+            )
             if not preearn_allowed:
                 return False, False
 
@@ -1519,10 +1936,11 @@ class SignalEngine:
             except (InvalidOperation, TypeError, ValueError):
                 current_close = None
             if current_close is None:
-                LOGGER.debug(
-                    "signal_engine.ma60_no_close",
+                LOGGER.info(
+                    "position_check.ma60_no_close",
                     symbol=symbol,
                     ts_end=str(ts_end),
+                    reason="无法获取当前收盘价"
                 )
                 try:
                     if self._metrics_enabled:
@@ -1531,13 +1949,21 @@ class SignalEngine:
                     pass
                 return False, False
             ma60_value = self._daily_ma60_value(session, symbol, ts_end)
+            LOGGER.info(
+                "position_check.ma60",
+                symbol=symbol,
+                current_close=str(current_close),
+                ma60_value=str(ma60_value) if ma60_value is not None else "None",
+                passed=bool(ma60_value is not None and current_close > ma60_value)
+            )
             if ma60_value is None or current_close <= ma60_value:
-                LOGGER.debug(
-                    "signal_engine.ma60_blocked",
+                LOGGER.info(
+                    "position_check.ma60_blocked",
                     symbol=symbol,
                     ts_end=str(ts_end),
                     close=str(current_close),
-                    sma60=str(ma60_value) if ma60_value is not None else None,
+                    sma60=str(ma60_value) if ma60_value is not None else "None",
+                    reason="MA60过滤：当前价格未突破MA60" if ma60_value else "MA60数据缺失"
                 )
                 try:
                     if self._metrics_enabled:
@@ -1548,11 +1974,42 @@ class SignalEngine:
 
         state = self._positions.get(symbol)
         if state is None:
+            LOGGER.info(
+                "position_check.new_position",
+                symbol=symbol,
+                current_positions=len(self._positions),
+                max_positions=int(self._settings.max_concurrent_top)
+            )
             if len(self._positions) >= int(self._settings.max_concurrent_top):
+                LOGGER.info(
+                    "position_check.max_positions",
+                    symbol=symbol,
+                    current=len(self._positions),
+                    max=int(self._settings.max_concurrent_top),
+                    reason="已达到最大持仓数量限制"
+                )
                 return False, False
             if session is not None and ts_end is not None:
-                if not self._option_liquidity_pass(session, symbol, ts_end):
+                passed, snapshot = self._option_liquidity_pass(session, symbol, ts_end)
+                self._liquidity_snapshot[symbol] = snapshot
+                LOGGER.info(
+                    "position_check.option_liquidity",
+                    symbol=symbol,
+                    passed=passed,
+                    snapshot=snapshot
+                )
+                if not passed:
+                    LOGGER.info(
+                        "position_check.liquidity_blocked",
+                        symbol=symbol,
+                        reason="期权流动性不足"
+                    )
                     return False, False
+            LOGGER.info(
+                "position_check.allowed",
+                symbol=symbol,
+                reason="允许开仓"
+            )
             return True, False
 
         if state.additions >= 1:
@@ -1575,63 +2032,85 @@ class SignalEngine:
 
         if not (ao_up and obv_rising and rvol_high):
             return False, False
-        if not self._option_liquidity_pass(session, symbol, ts_end):
+        passed, snapshot = self._option_liquidity_pass(session, symbol, ts_end)
+        self._liquidity_snapshot[symbol] = snapshot
+        if not passed:
             return False, False
         return True, True
 
-    def _option_liquidity_pass(self, session: Session, symbol: str, ts_end: datetime) -> bool:
-        # Temporarily disabled due to missing underlying_price field in bars1m_option
-        return True
+    def _option_liquidity_pass(
+        self, session: Session, symbol: str, ts_end: datetime
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        读取 bars1m_option 数据判定期权流动性，返回 (是否通过, 详情字典)。
+        """
         window_start = ts_end - timedelta(minutes=15)
-        rows = session.execute(
-            text(
-                """
-                SELECT
-                    bid,
-                    ask,
-                    volume,
-                    open_interest,
-                    expiry,
-                    strike,
-                    ts_end
-                FROM bars1m_option
-                WHERE symbol = :symbol
-                  AND "right" = 'CALL'
-                  AND ts_end BETWEEN :start_ts AND :end_ts
-                ORDER BY ts_end DESC, volume DESC NULLS LAST
-                LIMIT 100
-                """
-            ),
-            {"symbol": symbol, "start_ts": window_start, "end_ts": ts_end},
-        ).all()
+        stmt = text(
+            """
+            SELECT
+                bid,
+                ask,
+                volume,
+                open_interest,
+                expiry,
+                strike,
+                ts_end,
+                underlying_price
+            FROM bars1m_option
+            WHERE symbol = :symbol
+              AND "right" = 'CALL'
+              AND ts_end BETWEEN :start_ts AND :end_ts
+            ORDER BY ts_end DESC, volume DESC NULLS LAST
+            LIMIT 200
+            """
+        )
+        try:
+            rows = session.execute(
+                stmt,
+                {"symbol": symbol, "start_ts": window_start, "end_ts": ts_end},
+            ).mappings().all()
+        except Exception:
+            LOGGER.exception("signal_engine.option_liquidity_query_failed", symbol=symbol)
+            return False, {
+                "pass": False,
+                "reason": "query_failed",
+                "window_start": window_start.isoformat(),
+                "window_end": ts_end.isoformat(),
+            }
         if not rows:
-            return False
+            LOGGER.info(
+                "signal_engine.option_liquidity_empty",
+                symbol=symbol,
+                window_start=window_start.isoformat(),
+                window_end=ts_end.isoformat(),
+            )
+            return False, {
+                "pass": False,
+                "reason": "no_option_ticks",
+                "window_start": window_start.isoformat(),
+                "window_end": ts_end.isoformat(),
+            }
 
         trade_date = ts_end.astimezone(EASTERN).date()
+        selected: Optional[Dict[str, Any]] = None
         for row in rows:
-            bid = row.bid
-            ask = row.ask
-            volume = row.volume
-            oi = row.open_interest
-            expiry = row.expiry
-            und_price = row.underlying_price
-            if (
-                bid is None
-                or ask is None
-                or volume is None
-                or oi is None
-                or expiry is None
-                or und_price is None
-            ):
+            bid = row.get("bid")
+            ask = row.get("ask")
+            volume = row.get("volume")
+            oi = row.get("open_interest")
+            expiry = row.get("expiry")
+            strike = row.get("strike")
+            ts_sample = row.get("ts_end")
+            if None in (bid, ask, volume, oi, expiry, strike):
                 continue
-            bid_dec = Decimal(str(bid))
-            ask_dec = Decimal(str(ask))
+            try:
+                bid_dec = Decimal(str(bid))
+                ask_dec = Decimal(str(ask))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
             if bid_dec <= 0 or ask_dec <= 0 or ask_dec <= bid_dec:
                 continue
             if int(volume) < 100 or int(oi) < 500:
-                continue
-            und_dec = Decimal(str(und_price))
-            if und_dec <= 0:
                 continue
             if isinstance(expiry, datetime):
                 expiry_date = expiry.date()
@@ -1647,13 +2126,99 @@ class SignalEngine:
             dte = (expiry_date - trade_date).days
             if dte < 2 or dte > 7:
                 continue
-            mid = (bid_dec + ask_dec) / Decimal(2)
+            mid = (bid_dec + ask_dec) / Decimal("2")
+            if mid <= 0:
+                continue
             spread = ask_dec - bid_dec
             threshold = max(Decimal("0.10"), mid * Decimal("0.05"))
             if spread > threshold:
                 continue
-            return True
-        return False
+            candidate = {
+                "pass": True,
+                "bid": float(bid_dec),
+                "ask": float(ask_dec),
+                "spread": float(spread),
+                "threshold": float(threshold),
+                "volume": int(volume),
+                "open_interest": int(oi),
+                "strike": float(Decimal(str(strike))),
+                "expiry": expiry_date.isoformat(),
+                "dte": int(dte),
+                "ts_sample": ts_sample.isoformat() if isinstance(ts_sample, datetime) else str(ts_sample),
+            }
+            if selected is None or candidate["volume"] > selected.get("volume", 0):
+                selected = candidate
+
+        if selected is None:
+            LOGGER.info(
+                "signal_engine.option_liquidity_blocked",
+                symbol=symbol,
+                window_start=window_start.isoformat(),
+                window_end=ts_end.isoformat(),
+            )
+            return False, {
+                "pass": False,
+                "reason": "threshold_not_met",
+                "window_start": window_start.isoformat(),
+                "window_end": ts_end.isoformat(),
+            }
+
+        LOGGER.debug(
+            "signal_engine.option_liquidity_pass",
+            symbol=symbol,
+            snapshot=selected,
+        )
+        return True, selected
+
+    def _risk_hint_for_signal(
+        self,
+        symbol: str,
+        signal_code: str,
+        side: SignalSide,
+        reason: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """依据信号类型设定风险暴露，默认以 R 倍数描述仓位大小。"""
+        hint = dict(RISK_HINT)
+        if side == SignalSide.BUY:
+            size_map = {
+                "SIG_OPEN_CHASE_BUY": "2R",
+                "SIG_PM_BOTTOM_A4": "2R",
+            }
+            hint["size"] = size_map.get(signal_code, "1R")
+        else:
+            hint["size"] = "exit"
+        priority_source = reason.get("rank_score") or reason.get("rebound") or reason.get("bounce")
+        if priority_source is not None:
+            hint["priority"] = priority_source
+        return hint
+
+    def _option_hint_for_signal(
+        self,
+        symbol: str,
+        signal_code: str,
+        side: SignalSide,
+        reason: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """组合期权筛选提示，例如优先级指标与最近流动性快照。"""
+        hint: Dict[str, Any] = dict(OPTION_HINT)
+        if side == SignalSide.SELL:
+            hint["direction"] = "reduce"
+            return hint
+        priority_metric = None
+        priority_score = None
+        for key in ("rank_score", "rank_metric", "boll_dn_slope", "rebound", "bounce"):
+            if key in reason:
+                priority_metric = key
+                priority_score = reason.get(key)
+                break
+        if priority_metric is not None:
+            hint["priority_metric"] = priority_metric
+            hint["priority_score"] = priority_score
+        liquidity = self._liquidity_snapshot.get(symbol)
+        if liquidity:
+            hint["liquidity"] = liquidity
+        hint["signal_code"] = signal_code
+        return hint
 
     def _register_state(self, signal: SignalEnvelope, ts_end: datetime) -> None:
         key = (signal.symbol, signal.signal_code)
@@ -1698,6 +2263,16 @@ class SignalEngine:
     ) -> SignalEnvelope:
         ttl_value = int(ttl_override) if ttl_override is not None else self._ttl
         cooldown_value = int(cooldown_override) if cooldown_override is not None else self._cooldown
+        # 基于信号类型构建更细化的风险提示与期权筛选提示
+        risk_hint = self._risk_hint_for_signal(symbol, signal_code, side, reason)
+        option_hint = self._option_hint_for_signal(symbol, signal_code, side, reason)
+        LOGGER.debug(
+            "signal_engine.hints_composed",
+            symbol=symbol,
+            signal_code=signal_code,
+            risk_hint=risk_hint,
+            option_hint=option_hint,
+        )
         return SignalEnvelope(
             strategy_code=self._strategy_code,
             symbol=symbol,
@@ -1705,8 +2280,8 @@ class SignalEngine:
             side=side,
             confidence=1.0,
             reason=reason,
-            risk_hint=RISK_HINT,
-            option_hint=OPTION_HINT,
+            risk_hint=risk_hint,
+            option_hint=option_hint,
             ttl_seconds=ttl_value,
             cooldown_seconds=cooldown_value,
             generated_at=generated_at,
@@ -1779,6 +2354,71 @@ class SignalEngine:
             if row["lr_m5_slope"] < 0 or row["lr_boll_dn_slope"] < 0:
                 return False
         return True
+
+    def _passes_buy_priority(self, trade_date: date, signal: SignalEnvelope) -> bool:
+        if self._buy_priority_slots <= 0:
+            return True
+        # 清理过期缓存（仅保留最近3个交易日）
+        if len(self._buy_priority) > 4:
+            for cached_date in list(self._buy_priority.keys()):
+                if (trade_date - cached_date).days > 3:
+                    self._buy_priority.pop(cached_date, None)
+
+        ranking = self._buy_priority.setdefault(trade_date, {})
+        symbol = signal.symbol.upper()
+        score = self._extract_rank_score(signal)
+        if score is None:
+            score = Decimal("-Infinity")
+
+        ranking[symbol] = score
+        sorted_items = sorted(ranking.items(), key=lambda item: item[1], reverse=True)
+        top_symbols = {sym for sym, _ in sorted_items[: self._buy_priority_slots]}
+        # 仅保留排名前N的缓存，防止无限增长
+        self._buy_priority[trade_date] = {
+            sym: val for sym, val in sorted_items[: self._buy_priority_slots]
+        }
+        if symbol in top_symbols:
+            return True
+
+        LOGGER.info(
+            "signal_engine.buy_priority_filtered",
+            symbol=symbol,
+            trade_date=str(trade_date),
+            score=str(score),
+            slots=self._buy_priority_slots,
+        )
+        return False
+
+    @staticmethod
+    def _extract_rank_score(signal: SignalEnvelope) -> Optional[Decimal]:
+        def _to_decimal(value: object) -> Optional[Decimal]:
+            if value is None:
+                return None
+            if isinstance(value, Decimal):
+                return value
+            if isinstance(value, (int, float)):
+                return Decimal(str(value))
+            if isinstance(value, str):
+                stripped = value.strip()
+                if not stripped:
+                    return None
+                try:
+                    return Decimal(stripped)
+                except (InvalidOperation, ValueError):
+                    return None
+            try:
+                return Decimal(str(value))
+            except (InvalidOperation, ValueError, TypeError):
+                return None
+
+        reason = signal.reason or {}
+        for key in ("rank_score", "boll_dn_slope", "dn_slope"):
+            score = _to_decimal(reason.get(key))
+            if score is not None:
+                return score
+
+        option_hint = signal.option_hint or {}
+        return _to_decimal(option_hint.get("priority_score"))
 
     def _macd_components(
         self, close_series: pd.Series
@@ -1995,7 +2635,14 @@ class SignalEngine:
         if cache is None:
             cache = self._top5_source.symbols_for_date(session, trade_date)
             self._top5_today_cache[trade_date] = cache
-        return symbol.upper() in cache
+            LOGGER.info(
+                "top5_cache.loaded",
+                trade_date=trade_date.isoformat(),
+                symbols=sorted(list(cache)),
+                count=len(cache)
+            )
+        result = symbol.upper() in cache
+        return result
 
     def _is_high_open(self, session: Session, symbol: str, trade_date: date) -> bool:
         row = session.execute(

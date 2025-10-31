@@ -47,6 +47,8 @@ from libs.schemas.exec import (
     OrderState,
 )
 
+from .option_selector import OptionSelector
+
 LOGGER = structlog.get_logger(__name__)
 
 settings = get_settings()
@@ -54,6 +56,8 @@ configure_logging(settings)
 
 redis_bus = RedisBus(settings.redis_url)
 ib_client: Optional[IBClient] = None
+# 全局复用的期权合约挑选器，避免重复初始化 IBKR 连接
+option_selector: Optional[OptionSelector] = None
 session_factory = get_session_factory(settings)
 orders_registry: dict[int, OrderState] = {}
 orders_lock = asyncio.Lock()
@@ -178,11 +182,14 @@ def _require_ib_client() -> IBClient:
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    global ib_client, risk_bus, signals_bus, risk_task, signals_task, ib_event_queue, ib_events_task
+    global ib_client, option_selector, risk_bus, signals_bus, risk_task, signals_task, ib_event_queue, ib_events_task
     if settings.app_env == "test":
         LOGGER.debug("Skipping IBKR connection in test environment")
+        option_selector = None
         return
+    # 启动期权执行链路时同步初始化 OptionSelector，后续下单直接复用
     ib_client = build_ibkr_client(settings)
+    option_selector = OptionSelector(ib_client)
     loop = asyncio.get_running_loop()
     ib_event_queue = asyncio.Queue()
     ib_client.register_event_queue(loop, ib_event_queue)
@@ -198,7 +205,7 @@ async def startup_event() -> None:
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
-    global ib_event_queue, ib_events_task
+    global ib_client, option_selector, risk_bus, signals_bus, risk_task, signals_task, ib_event_queue, ib_events_task
     if ib_events_task is not None:
         ib_events_task.cancel()
         try:
@@ -221,11 +228,15 @@ async def shutdown_event() -> None:
             pass
     if risk_bus is not None:
         await risk_bus.close()
+        risk_bus = None
     if signals_bus is not None:
         await signals_bus.close()
+        signals_bus = None
     await redis_bus.close()
     if ib_client is not None:
+        option_selector = None
         ib_client.stop()
+        ib_client = None
 
 
 @app.get(
@@ -498,6 +509,73 @@ def _local_precheck(payload: ExecutionRequest) -> tuple[bool, str, str]:
     if payload.is_exit:
         return True, "OK", "exit-order"
 
+    # 当请求缺少期权关键字段时，尝试使用全局 OptionSelector 自动补全
+    if (
+        payload.side == OrderSide.BUY
+        and (
+            payload.option_right is None
+            or payload.option_strike is None
+            or payload.option_expiry is None
+            or payload.option_open_interest is None
+            or payload.option_volume is None
+            or payload.min_tick is None
+        )
+    ):
+        if option_selector is None:
+            LOGGER.warning(
+                "order.precheck.option_selector_missing",
+                symbol=payload.symbol,
+                side=payload.side.value,
+                code="BLOCK:OPTION_NOT_FOUND",
+            )
+            return False, "BLOCK:OPTION_NOT_FOUND", "option-selector-unavailable"
+        try:
+            # 读取下单请求上的提示信息，缺省时使用策略默认参数
+            otm_values = (
+                [payload.option_otm_steps]
+                if payload.option_otm_steps is not None
+                else None
+            )
+            otm_offsets = tuple(_normalize_int_list(otm_values, default=[2, 3, 4, 5]))
+            dte_values = (
+                [payload.option_dte] if payload.option_dte is not None else None
+            )
+            dte_range = _normalize_int_list(dte_values, default=[2, 7])
+            if len(dte_range) >= 2:
+                dte_min, dte_max = min(dte_range), max(dte_range)
+            elif len(dte_range) == 1:
+                dte_min = dte_max = dte_range[0]
+            else:
+                dte_min, dte_max = 2, 7
+            selection = option_selector.select_call(
+                payload.symbol.upper(),
+                otm_offsets=otm_offsets,
+                dte_range=(dte_min, dte_max),
+                delta_band=(Decimal("0.35"), Decimal("0.45")),
+            )
+        except Exception as exc:  # pragma: no cover - 防御式处理
+            LOGGER.warning(
+                "order.precheck.option_selector_failed",
+                symbol=payload.symbol,
+                side=payload.side.value,
+                code="BLOCK:OPTION_NOT_FOUND",
+                reason=str(exc),
+            )
+            return False, "BLOCK:OPTION_NOT_FOUND", "option-selector-failed"
+
+        strike_val = Decimal(str(selection.contract.strike))
+        payload.option_right = "CALL"
+        payload.option_strike = strike_val
+        payload.option_expiry = selection.expiry.strftime("%Y%m%d")
+        payload.option_dte = selection.dte
+        payload.option_open_interest = selection.quote.open_interest
+        payload.option_volume = selection.quote.volume
+        payload.option_bid = selection.quote.bid
+        payload.option_ask = selection.quote.ask
+        payload.option_mid = selection.quote.mid
+        payload.option_spread = selection.quote.spread
+        payload.min_tick = selection.min_tick
+
     symbol_upper = payload.symbol.upper()
     if symbol_upper in blocked_symbols and payload.side == OrderSide.BUY and not payload.is_exit:
         return False, "BLOCK:RISK_SYMBOL", "risk-blocked"
@@ -538,6 +616,29 @@ async def _risk_precheck(payload: ExecutionRequest, notional: Decimal) -> tuple[
         "signal_code": payload.signal_code,
         "option_right": payload.option_right,
     }
+    # 传递更多期权合约细节，方便风控进行流动性/到期校验
+    extra_fields = [
+        (
+            "option_strike",
+            payload.option_strike,
+        ),
+        ("option_expiry", payload.option_expiry),
+        ("option_open_interest", payload.option_open_interest),
+        ("option_volume", payload.option_volume),
+        ("option_bid", payload.option_bid),
+        ("option_ask", payload.option_ask),
+        ("option_mid", payload.option_mid),
+        ("option_spread", payload.option_spread),
+        ("option_dte", payload.option_dte),
+        ("option_otm_steps", payload.option_otm_steps),
+    ]
+    for key, value in extra_fields:
+        if value is None:
+            continue
+        if isinstance(value, Decimal):
+            request_payload[key] = str(value)
+        else:
+            request_payload[key] = value
 
     url = settings.risk_service_url.rstrip("/") + "/precheck"
     headers = {}
@@ -1226,10 +1327,189 @@ async def _handle_signal_payload(payload: Dict[str, object]) -> None:
     symbol = payload.get("symbol")
     if not symbol:
         return
+    side = str(payload.get("side") or "").upper()
     if signal_code.startswith("SIG_EXIT") or signal_code in {"SIG_TIME_CLEAR_12_14"}:
         strategy = str(payload.get("strategy_code") or "core-vol")
         trace_id = str(payload.get("trace_id") or f"exit-{symbol}")
         await _force_close_symbol(strategy, str(symbol), trace_id)
+        return
+    if side == "BUY":
+        trace_id = str(payload.get("trace_id") or f"entry-{symbol}")
+        await _handle_buy_signal(payload, trace_id)
+
+
+async def _handle_buy_signal(payload: Dict[str, object], trace_id: str) -> None:
+    if option_selector is None:
+        LOGGER.warning("signal.buy.option_selector_unavailable", symbol=payload.get("symbol"))
+        return
+
+    # 从信号中提取限制条件，优先级：信号 hint > 默认值
+    symbol_value = payload.get("symbol")
+    if not symbol_value:
+        return
+    symbol = str(symbol_value).upper()
+    strategy = str(payload.get("strategy_code") or "core-vol")
+    signal_code = str(payload.get("signal_code") or "")
+    generated_at = payload.get("generated_at") or payload.get("bar_end")
+
+    option_hint = payload.get("option_hint") if isinstance(payload.get("option_hint"), dict) else {}
+    risk_hint = payload.get("risk_hint") if isinstance(payload.get("risk_hint"), dict) else {}
+
+    otm_offsets = _normalize_int_list(option_hint.get("otm_steps"), default=[2, 3, 4, 5])
+    if not otm_offsets:
+        otm_offsets = [2, 3, 4, 5]
+
+    dte_values = _normalize_int_list(option_hint.get("dte"), default=[2, 7])
+    if len(dte_values) >= 2:
+        dte_min, dte_max = min(dte_values), max(dte_values)
+    elif len(dte_values) == 1:
+        dte_min = dte_max = dte_values[0]
+    else:
+        dte_min, dte_max = 2, 7
+
+    delta_values = _normalize_decimal_list(option_hint.get("delta"), default=[Decimal("0.35"), Decimal("0.45")])
+    if len(delta_values) >= 2:
+        delta_low, delta_high = min(delta_values), max(delta_values)
+    elif len(delta_values) == 1:
+        delta_low = delta_high = delta_values[0]
+    else:
+        delta_low, delta_high = Decimal("0.35"), Decimal("0.45")
+
+    try:
+        selection = option_selector.select_call(
+            symbol,
+            otm_offsets=tuple(otm_offsets),
+            dte_range=(dte_min, dte_max),
+            delta_band=(delta_low, delta_high),
+        )
+    except Exception as exc:  # pragma: no cover - defensive around IBKR failures
+        LOGGER.warning(
+            "signal.buy.option_select_failed",
+            symbol=symbol,
+            strategy=strategy,
+            signal_code=signal_code,
+            code="BLOCK:OPTION_NOT_FOUND",
+            reason=str(exc),
+        )
+        return
+
+    quantity = _extract_quantity(risk_hint)
+    limit_price = selection.quote.ask if selection.quote.ask > 0 else selection.quote.mid
+    if limit_price is None or limit_price <= 0:
+        LOGGER.warning(
+            "signal.buy.invalid_quote",
+            symbol=symbol,
+            strategy=strategy,
+            signal_code=signal_code,
+        )
+        return
+
+    try:
+        strike_value = Decimal(str(selection.contract.strike))
+    except (InvalidOperation, TypeError, ValueError):
+        LOGGER.warning(
+            "signal.buy.invalid_strike",
+            symbol=symbol,
+            strategy=strategy,
+            signal_code=signal_code,
+            strike=selection.contract.strike,
+        )
+        return
+
+    request = ExecutionRequest(
+        strategy_code=strategy,
+        symbol=symbol,
+        side=OrderSide.BUY,
+        quantity=max(1, quantity),
+        limit_price=limit_price,
+        tif="DAY",
+        signal_code=signal_code or None,
+        option_right="CALL",
+        option_dte=selection.dte,
+        option_otm_steps=None,
+        option_strike=strike_value,
+        option_expiry=selection.expiry.strftime("%Y%m%d"),
+        option_open_interest=selection.quote.open_interest,
+        option_volume=selection.quote.volume,
+        option_bid=selection.quote.bid,
+        option_ask=selection.quote.ask,
+        option_mid=selection.quote.mid,
+        option_spread=selection.quote.spread,
+        implied_vol=None,
+        a1_gate=True,
+        is_exit=False,
+        min_tick=selection.min_tick,
+        execution_mode=ExecutionMode.MARKETABLE,
+        trace_id=trace_id,
+    )
+
+    LOGGER.info(
+        "signal.buy.submit",
+        symbol=symbol,
+        strategy=strategy,
+        signal_code=signal_code,
+        expiry=request.option_expiry,
+        strike=float(request.option_strike),
+        dte=selection.dte,
+        qty=request.quantity,
+        generated_at=str(generated_at) if generated_at else None,
+        trace_id=trace_id,
+    )
+    result = await submit_order(request)
+    if result.ok:
+        LOGGER.info(
+            "signal.buy.submitted",
+            symbol=symbol,
+            strategy=strategy,
+            signal_code=signal_code,
+            trace_id=trace_id,
+        )
+    else:
+        LOGGER.warning(
+            "signal.buy.submit_failed",
+            symbol=symbol,
+            strategy=strategy,
+            signal_code=signal_code,
+            trace_id=trace_id,
+            code=result.code,
+            message=result.message,
+        )
+
+
+def _normalize_int_list(value: Any, *, default: list[int]) -> list[int]:
+    source = value if isinstance(value, (list, tuple, set)) else default
+    result: list[int] = []
+    for item in source:
+        try:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _normalize_decimal_list(value: Any, *, default: list[Decimal]) -> list[Decimal]:
+    source = value if isinstance(value, (list, tuple, set)) else default
+    result: list[Decimal] = []
+    for item in source:
+        try:
+            result.append(Decimal(str(item)))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+    return result
+
+
+def _extract_quantity(risk_hint: Dict[str, Any]) -> int:
+    size = risk_hint.get("size") if isinstance(risk_hint, dict) else None
+    if isinstance(size, int):
+        return max(1, size)
+    if isinstance(size, str):
+        digits = "".join(ch for ch in size if ch.isdigit())
+        if digits:
+            try:
+                return max(1, int(digits))
+            except ValueError:
+                pass
+    return 1
 
 
 def _map_ib_status(status: str) -> str:
