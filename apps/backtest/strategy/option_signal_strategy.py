@@ -4,7 +4,7 @@ import uuid
 from collections import deque, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Callable, Deque, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import backtrader as bt
@@ -33,6 +33,8 @@ class ContractSelection:
     open_interest: int
     volume: int
     dte: int
+    delta: Optional[Decimal] = None
+    underlying_price: Optional[Decimal] = None
 
 
 @dataclass
@@ -89,6 +91,7 @@ class OptionSignalStrategy(bt.Strategy):
         self._pending_orders: Dict[int, ManagedOrder] = {}
         self._positions_qty: Dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
         self._positions_mark: Dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+        self._open_contracts: Dict[str, ContractSelection] = {}
         self._risk_limit: Decimal = Decimal(str(get_settings().risk_notional_cap))
         raw_feeds = self.p.option_feeds or {}
         self._option_feeds: Dict[tuple[str, str], bt.feeds.PandasData] = {}
@@ -180,6 +183,16 @@ class OptionSignalStrategy(bt.Strategy):
                     Decimal(size) * contract.mid * Decimal("100")
                 ),
                 implied_vol=None,
+                option_strike=contract.strike,
+                option_expiry=contract.expiry,
+                option_open_interest=contract.open_interest,
+                option_volume=contract.volume,
+                option_bid=contract.bid,
+                option_ask=contract.ask,
+                option_mid=contract.mid,
+                option_spread=contract.ask - contract.bid,
+                option_dte=contract.dte,
+                option_otm_steps=None,
             )
         )
 
@@ -194,9 +207,9 @@ class OptionSignalStrategy(bt.Strategy):
 
     # ------------------------------------------------------------------
     def _handle_exit_signal(self, signal: SignalEnvelope, trace_id: str, now: datetime) -> None:
-        contract = self.option_selector(signal, now)
+        contract = self._open_contracts.get(signal.symbol.upper())
         if contract is None:
-            self._record_signal(signal, accepted=False, reason="BLOCK:EXIT_OPTION_NOT_FOUND")
+            self._record_signal(signal, accepted=False, reason="BLOCK:EXIT_POSITION_NOT_FOUND")
             return
 
         path = self._build_path(signal, contract, ExecutionMode.FORCE)
@@ -227,6 +240,10 @@ class OptionSignalStrategy(bt.Strategy):
             side = OrderSide.SELL
 
         size = self._parse_size(signal)
+        if side == OrderSide.SELL:
+            open_qty = abs(self._positions_qty.get(contract.symbol, Decimal("0")))
+            if open_qty > 0:
+                size = max(1, int(open_qty))
         if trace_id is None:
             trace_id = str(uuid.uuid4())
 
@@ -329,6 +346,10 @@ class OptionSignalStrategy(bt.Strategy):
 
     def _resubmit(self, managed: ManagedOrder, price: Decimal) -> bt.Order:
         size = self._parse_size(managed.signal)
+        if managed.side == OrderSide.SELL:
+            open_qty = abs(self._positions_qty.get(managed.contract.symbol, Decimal("0")))
+            if open_qty > 0:
+                size = max(1, int(open_qty))
         data_feed = self._resolve_option_feed(managed.contract)
         if managed.side == OrderSide.BUY:
             return self.buy(
@@ -348,8 +369,11 @@ class OptionSignalStrategy(bt.Strategy):
             symbol = managed.contract.symbol
             if managed.side == OrderSide.BUY:
                 self._positions_qty[symbol] += executed_qty
+                self._open_contracts[symbol.upper()] = managed.contract
             else:
                 self._positions_qty[symbol] -= executed_qty
+                if self._positions_qty[symbol] <= 0:
+                    self._open_contracts.pop(symbol.upper(), None)
             self._positions_mark[symbol] = executed_price
             if self.run_id is not None:
                 payload = {
@@ -394,16 +418,23 @@ class OptionSignalStrategy(bt.Strategy):
     def _default_option_selector(
         self, signal: SignalEnvelope, ts: datetime
     ) -> Optional[ContractSelection]:
-        option_right = "CALL" if signal.side == SignalSide.BUY else "PUT"
+        # The live strategy expresses every entry as a CALL and exits by selling the
+        # originally opened CALL. The default backtest selector mirrors the entry side;
+        # exit handling should normally use _open_contracts and not call this fallback.
+        option_right = "CALL"
         trade_date = ts.date()
+        dte_min, dte_max = self._hint_range(signal.option_hint.get("dte"), default=(2, 7))
+        delta_low, delta_high = self._hint_decimal_range(
+            signal.option_hint.get("delta"), default=(Decimal("0.35"), Decimal("0.45"))
+        )
         candidates = self.dao.fetch_option_candidates(
             trade_date=trade_date,
             underlying_symbol=signal.symbol,
             option_right=option_right,
-            dte_min=2,
-            dte_max=7,
+            dte_min=dte_min,
+            dte_max=dte_max,
         )
-        filtered: List[ContractSelection] = []
+        filtered: List[tuple[tuple[Decimal, ...], ContractSelection]] = []
         for candidate in candidates:
             bid = candidate.bid
             ask = candidate.ask
@@ -441,39 +472,105 @@ class OptionSignalStrategy(bt.Strategy):
             except (TypeError, ValueError):
                 continue
 
-            filtered.append(
-                ContractSelection(
-                    conid=conid_int or None,
-                    symbol=candidate.underlying_symbol or signal.symbol,
-                    expiry=expiry,
-                    strike=Decimal(str(strike_value)),
-                    right=option_right,
-                    bid=bid_d,
-                    ask=ask_d,
-                    mid=mid_d,
-                    min_tick=Decimal(str(min_tick)),
-                    option_right=option_right,
-                    open_interest=open_interest_int,
-                    volume=volume_int,
-                    dte=dte_int,
-                )
+            delta_value = Decimal(str(candidate.delta)) if candidate.delta is not None else None
+            underlying = (
+                Decimal(str(candidate.underlying_price))
+                if candidate.underlying_price is not None
+                else None
             )
+            selection = ContractSelection(
+                conid=conid_int or None,
+                symbol=candidate.underlying_symbol or signal.symbol,
+                expiry=expiry,
+                strike=Decimal(str(strike_value)),
+                right=option_right,
+                bid=bid_d,
+                ask=ask_d,
+                mid=mid_d,
+                min_tick=Decimal(str(min_tick)),
+                option_right=option_right,
+                open_interest=open_interest_int,
+                volume=volume_int,
+                dte=dte_int,
+                delta=delta_value,
+                underlying_price=underlying,
+            )
+            strike_distance = abs(selection.strike - underlying) if underlying is not None else Decimal("0")
+            sort_key = (
+                Decimal(-volume_int),
+                self._delta_penalty(delta_value, delta_low, delta_high),
+                spread_d,
+                Decimal(-open_interest_int),
+                strike_distance,
+            )
+            filtered.append((sort_key, selection))
 
         if not filtered:
             return None
 
-        filtered.sort(key=lambda c: (c.ask - c.bid, c.mid))
-        return filtered[0]
+        filtered.sort(key=lambda item: item[0])
+        return filtered[0][1]
 
     def _parse_size(self, signal: SignalEnvelope) -> int:
         if isinstance(signal.risk_hint, dict):
             value = signal.risk_hint.get("size", 1)
+            if isinstance(value, int):
+                return max(1, value)
+            if isinstance(value, str):
+                digits = "".join(ch for ch in value if ch.isdigit())
+                if digits:
+                    try:
+                        return max(1, int(digits))
+                    except ValueError:
+                        return 1
+                return 1
             try:
                 size = int(value)
             except (TypeError, ValueError):
                 size = 1
             return max(1, size)
         return 1
+
+    @staticmethod
+    def _hint_range(value, *, default: tuple[int, int]) -> tuple[int, int]:
+        source = value if isinstance(value, (list, tuple, set)) else default
+        parsed: list[int] = []
+        for item in source:
+            try:
+                parsed.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        if len(parsed) >= 2:
+            return min(parsed), max(parsed)
+        if len(parsed) == 1:
+            return parsed[0], parsed[0]
+        return default
+
+    @staticmethod
+    def _hint_decimal_range(value, *, default: tuple[Decimal, Decimal]) -> tuple[Decimal, Decimal]:
+        source = value if isinstance(value, (list, tuple, set)) else default
+        parsed: list[Decimal] = []
+        for item in source:
+            try:
+                parsed.append(Decimal(str(item)))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+        if len(parsed) >= 2:
+            return min(parsed), max(parsed)
+        if len(parsed) == 1:
+            return parsed[0], parsed[0]
+        return default
+
+    @staticmethod
+    def _delta_penalty(delta: Optional[Decimal], low: Decimal, high: Decimal) -> Decimal:
+        if delta is None:
+            return Decimal("999")
+        abs_delta = abs(delta)
+        if low <= abs_delta <= high:
+            return Decimal("0")
+        if abs_delta < low:
+            return low - abs_delta
+        return abs_delta - high
 
     def _build_exposures(self) -> List[ExposureLike]:
         exposures: List[ExposureLike] = []
