@@ -12,6 +12,48 @@ class SignalSide(str, Enum):
     SELL = "SELL"
 
 
+BUY_SIGNAL_CODES = frozenset(
+    {
+        "SIG_OPEN_CHASE_BUY",
+        "SIG_REBOUND_BUY",
+        "SIG_PM_BOTTOM_A2",
+        "SIG_PM_BOTTOM_A3",
+        "SIG_PM_BOTTOM_A4",
+        "SIG_AM_BOTTOM_A1",
+        "SIG_AM_CONFLUENCE_BUY_A2",
+    }
+)
+
+SELL_SIGNAL_CODES = frozenset(
+    {
+        "SIG_EXIT_UPPER_TAP_X2",
+        "SIG_EXIT_BOX2MID",
+        "SIG_TIME_CLEAR_12_14",
+        "SIG_OVERNIGHT_GAP_EXIT",
+        "SIG_AM_SELL_C1",
+        "SIG_AM_CONFLUENCE_SELL_S2",
+    }
+)
+
+ENTRY_SIGNAL_CODES = BUY_SIGNAL_CODES
+EXIT_SIGNAL_CODES = SELL_SIGNAL_CODES
+ALL_SIGNAL_CODES = BUY_SIGNAL_CODES | SELL_SIGNAL_CODES
+
+
+def is_buy_signal(signal_code: str | None) -> bool:
+    return bool(signal_code and signal_code in BUY_SIGNAL_CODES)
+
+
+def is_sell_signal(signal_code: str | None) -> bool:
+    return bool(signal_code and signal_code in SELL_SIGNAL_CODES)
+
+
+def signal_side_for_code(signal_code: str | None) -> SignalSide:
+    if is_sell_signal(signal_code):
+        return SignalSide.SELL
+    return SignalSide.BUY
+
+
 class SignalInstruction(BaseModel):
     strategy_code: str = Field(..., max_length=32)
     symbol: str = Field(..., max_length=32)
