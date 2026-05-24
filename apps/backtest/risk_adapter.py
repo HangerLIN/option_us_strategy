@@ -36,6 +36,16 @@ class OrderIntent:
     pending_notional: Decimal
     utilisation: float
     implied_vol: float | None = None
+    option_strike: Decimal | None = None
+    option_expiry: str | datetime | None = None
+    option_open_interest: int | None = None
+    option_volume: int | None = None
+    option_bid: Decimal | None = None
+    option_ask: Decimal | None = None
+    option_mid: Decimal | None = None
+    option_spread: Decimal | None = None
+    option_dte: int | None = None
+    option_otm_steps: int | None = None
 
 
 @dataclass
@@ -87,6 +97,20 @@ def _risk_precheck_inproc(ctx: RiskCtx, intent: OrderIntent) -> RiskResult:
         timestamp=intent.timestamp,
         signal_code=intent.signal_code,
         option_right=intent.option_right,
+        option_strike=intent.option_strike,
+        option_expiry=(
+            intent.option_expiry.strftime("%Y%m%d")
+            if isinstance(intent.option_expiry, datetime)
+            else intent.option_expiry
+        ),
+        option_open_interest=intent.option_open_interest,
+        option_volume=intent.option_volume,
+        option_bid=intent.option_bid,
+        option_ask=intent.option_ask,
+        option_mid=intent.option_mid,
+        option_spread=intent.option_spread,
+        option_dte=intent.option_dte,
+        option_otm_steps=intent.option_otm_steps,
     )
 
     decision: ServiceRiskDecision = service.evaluate_order(
@@ -119,6 +143,27 @@ def _risk_precheck_http(ctx: RiskCtx, intent: OrderIntent) -> RiskResult:
         "signal_code": intent.signal_code,
         "option_right": intent.option_right,
     }
+    extra_fields = {
+        "option_strike": intent.option_strike,
+        "option_expiry": (
+            intent.option_expiry.strftime("%Y%m%d")
+            if isinstance(intent.option_expiry, datetime)
+            else intent.option_expiry
+        ),
+        "option_open_interest": intent.option_open_interest,
+        "option_volume": intent.option_volume,
+        "option_bid": intent.option_bid,
+        "option_ask": intent.option_ask,
+        "option_mid": intent.option_mid,
+        "option_spread": intent.option_spread,
+        "option_dte": intent.option_dte,
+        "option_otm_steps": intent.option_otm_steps,
+    }
+    for key, value in extra_fields.items():
+        if value is None:
+            continue
+        payload[key] = str(value) if isinstance(value, Decimal) else value
+
     url = ctx.base_url.rstrip("/") + "/precheck"
     last_exc: Exception | None = None
     for attempt in range(2):
