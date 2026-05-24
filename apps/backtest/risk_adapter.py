@@ -10,8 +10,9 @@ from sqlalchemy.orm import sessionmaker
 
 from apps.risk_svc.service import RiskDecision as ServiceRiskDecision, RiskService, ExposureView
 from libs.core import get_settings
-from libs.schemas.risk import RiskCheckRequest
 from libs.db import StrategyPositionDAO
+from libs.schemas.risk import RiskCheckRequest
+from libs.schemas.signals import BUY_SIGNAL_CODES
 
 
 @dataclass
@@ -71,7 +72,9 @@ class RiskCtx:
     def get_service(self) -> RiskService:
         if self._risk_service is None:
             settings = get_settings()
+            RiskService._BUY_SIGNALS = BUY_SIGNAL_CODES
             self._risk_service = RiskService(self.session_factory, redis_url=settings.redis_url)
+            self._risk_service._BUY_SIGNALS = BUY_SIGNAL_CODES
         return self._risk_service
 
 
