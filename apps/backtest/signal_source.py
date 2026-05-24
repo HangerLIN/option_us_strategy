@@ -12,7 +12,13 @@ from apps.backtest.dao import BacktestDAO
 from apps.signal_svc.engine import SignalEngine
 from apps.signal_svc.top5_source import Top5Source
 from libs.schemas.events import BarsClosed
-from libs.schemas.signals import SignalEnvelope, SignalSide
+from libs.schemas.signals import (
+    ENTRY_SIGNAL_CODES,
+    EXIT_SIGNAL_CODES,
+    SignalEnvelope,
+    SignalSide,
+    signal_side_for_code,
+)
 
 
 @dataclass
@@ -29,23 +35,8 @@ class SignalEvent:
     reason: Dict[str, Any]
 
 
-ENTRY_CODES = {
-    "SIG_OPEN_CHASE_BUY",
-    "SIG_REBOUND_BUY",
-    "SIG_PM_BOTTOM_A2",
-    "SIG_PM_BOTTOM_A3",
-    "SIG_PM_BOTTOM_A4",
-    "SIG_AM_BOTTOM_A1",
-    "SIG_AM_CONFLUENCE_BUY_A2",
-}
-
-EXIT_CODES = {
-    "SIG_EXIT_UPPER_TAP_X2",
-    "SIG_EXIT_BOX2MID",
-    "SIG_TIME_CLEAR_12_14",
-    "SIG_AM_SELL_C1",
-    "SIG_AM_CONFLUENCE_SELL_S2",
-}
+ENTRY_CODES = ENTRY_SIGNAL_CODES
+EXIT_CODES = EXIT_SIGNAL_CODES
 
 
 def load_signals(
@@ -196,6 +187,4 @@ def _envelope_to_event(signal: SignalEnvelope, trace_id: str) -> SignalEvent:
 
 
 def _determine_side(signal_code: str) -> SignalSide:
-    if signal_code in EXIT_CODES:
-        return SignalSide.SELL
-    return SignalSide.BUY
+    return signal_side_for_code(signal_code)
