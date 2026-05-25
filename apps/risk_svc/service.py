@@ -32,6 +32,7 @@ from libs.infra.metrics import (
 from libs.infra import build_ibkr_client, IBClient
 from libs.infra.redis_bus import RedisBus
 from libs.schemas.risk import RiskCheckRequest, RiskLimits
+from libs.schemas.signals import BUY_SIGNAL_CODES
 from .block_store import RedisBlockStore
 from .limits import LimitsCache
 from .publisher import publish_risk_alert, publish_risk_block, publish_risk_unblock
@@ -57,13 +58,7 @@ class ExposureView(Protocol):
 class RiskService:
     """Centralised risk rule evaluation and state updater."""
 
-    _BUY_SIGNALS = {
-        "SIG_OPEN_CHASE_BUY",
-        "SIG_REBOUND_BUY",
-        "SIG_PM_BOTTOM_A2",
-        "SIG_PM_BOTTOM_A3",
-        "SIG_PM_BOTTOM_A4",
-    }
+    _BUY_SIGNALS = BUY_SIGNAL_CODES
 
     _VIX_SENSITIVE = {"SIG_OPEN_CHASE_BUY"}
 

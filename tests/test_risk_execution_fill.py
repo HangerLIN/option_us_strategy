@@ -6,12 +6,13 @@ from decimal import Decimal
 from collections import defaultdict
 import fnmatch
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 
 from risk_svc.block_store import RedisBlockStore  # type: ignore[import-not-found]
 from risk_svc.subscribers import RiskStreamConsumers  # type: ignore[import-not-found]
 from risk_svc.service import RiskService  # type: ignore[import-not-found]
+from libs.core.config import get_settings
 from libs.db import Base
 from libs.db.models import PnLIntraday, RiskEvent, RiskState, StrategyPosition
 from libs.schemas.events import ExecutionFill
@@ -114,9 +115,32 @@ class StubBlockStore:
         self.unblocked.append(symbol.upper())
 
 
+def _sqlite_engine():
+    engine = create_engine("sqlite:///:memory:", future=True)
+
+    @event.listens_for(engine, "connect")
+    def _register_date_trunc(dbapi_connection, connection_record):
+        dbapi_connection.create_function("date_trunc", 2, lambda _part, value: value)
+
+    return engine
+
+
+@pytest.fixture(autouse=True)
+def _settings_env(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///:memory:")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("IB_HOST", "127.0.0.1")
+    monkeypatch.setenv("IB_PORT", "4002")
+    monkeypatch.setenv("IB_CLIENT_ID", "1")
+    monkeypatch.setenv("IB_ACCOUNT", "DU123456")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
 @pytest.mark.asyncio
 async def test_handle_execution_fill_updates_state_and_unblocks() -> None:
-    engine = create_engine("sqlite:///:memory:", future=True)
+    engine = _sqlite_engine()
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, future=True)
 
@@ -196,7 +220,7 @@ async def test_handle_execution_fill_updates_state_and_unblocks() -> None:
 
 @pytest.mark.asyncio
 async def test_update_vix_gate_persists_and_blocks() -> None:
-    engine = create_engine("sqlite:///:memory:", future=True)
+    engine = _sqlite_engine()
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, future=True)
 
@@ -235,7 +259,7 @@ async def test_update_vix_gate_persists_and_blocks() -> None:
 
 
 def test_get_vix_value_prefers_redis_snapshot() -> None:
-    engine = create_engine("sqlite:///:memory:", future=True)
+    engine = _sqlite_engine()
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, future=True)
 
@@ -263,7 +287,7 @@ def test_get_vix_value_prefers_redis_snapshot() -> None:
 
 @pytest.mark.asyncio
 async def test_signal_concurrency_tracking() -> None:
-    engine = create_engine("sqlite:///:memory:", future=True)
+    engine = _sqlite_engine()
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, future=True)
 
@@ -318,7 +342,7 @@ async def test_signal_concurrency_tracking() -> None:
 
 
 def test_list_blocks_snapshot() -> None:
-    engine = create_engine("sqlite:///:memory:", future=True)
+    engine = _sqlite_engine()
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, future=True)
 

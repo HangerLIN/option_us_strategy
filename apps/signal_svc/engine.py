@@ -26,7 +26,13 @@ from libs.infra.metrics import (
 )
 from libs.infra.redis_bus import RedisBus
 from libs.schemas.events import BarsClosed
-from libs.schemas.signals import SignalEnvelope, SignalPushItem, SignalSide
+from libs.schemas.signals import (
+    BUY_SIGNAL_CODES,
+    SELL_SIGNAL_CODES,
+    SignalEnvelope,
+    SignalPushItem,
+    SignalSide,
+)
 
 from .top5_source import PremarketTop5Source, Top5Source
 from apps.risk_svc.limits import LimitsCache
@@ -45,24 +51,8 @@ RISK_HINT = {
     "stop_pct": "-0.08",
 }
 
-BUY_SIGNALS = {
-    "SIG_OPEN_CHASE_BUY",
-    "SIG_REBOUND_BUY",
-    "SIG_PM_BOTTOM_A2",
-    "SIG_PM_BOTTOM_A3",
-    "SIG_PM_BOTTOM_A4",
-    "SIG_AM_BOTTOM_A1",
-    "SIG_AM_CONFLUENCE_BUY_A2",
-}
-
-SELL_SIGNALS = {
-    "SIG_EXIT_UPPER_TAP_X2",
-    "SIG_EXIT_BOX2MID",
-    "SIG_TIME_CLEAR_12_14",
-    "SIG_OVERNIGHT_GAP_EXIT",
-    "SIG_AM_SELL_C1",
-    "SIG_AM_CONFLUENCE_SELL_S2",
-}
+BUY_SIGNALS = BUY_SIGNAL_CODES
+SELL_SIGNALS = SELL_SIGNAL_CODES
 
 
 @dataclass
@@ -1782,6 +1772,42 @@ class SignalEngine:
         except (InvalidOperation, TypeError):
             return None
 
+    def _daily_close_price(
+        self,
+        session: Optional[Session],
+        symbol: str,
+        trade_date: date,
+    ) -> Optional[Decimal]:
+        if session is None:
+            return None
+        try:
+            row = session.execute(
+                text(
+                    """
+                    SELECT close_rth
+                    FROM v_daily_ohlcv_enriched
+                    WHERE symbol = :symbol AND trade_date_et::date = :trade_date
+                    """
+                ),
+                {"symbol": symbol, "trade_date": trade_date},
+            ).fetchone()
+        except Exception:
+            LOGGER.exception(
+                "signal_engine.daily_close_query_failed",
+                symbol=symbol,
+                trade_date=str(trade_date),
+            )
+            return None
+        if not row:
+            return None
+        close_rth = row[0]
+        if close_rth is None:
+            return None
+        try:
+            return Decimal(str(close_rth))
+        except (InvalidOperation, TypeError):
+            return None
+
     def _day_open_price(self, df: pd.DataFrame, trade_date: date) -> Optional[Decimal]:
         if df is None or df.empty:
             return None
@@ -1808,6 +1834,27 @@ class SignalEngine:
             return None
         try:
             return Decimal(str(open_value))
+        except (InvalidOperation, TypeError):
+            return None
+
+    def _day_close_price(self, df: pd.DataFrame, trade_date: date) -> Optional[Decimal]:
+        if df is None or df.empty:
+            return None
+        if "et" in df.columns:
+            et_series = df["et"]
+        else:
+            et_series = df["ts_end"].dt.tz_convert("US/Eastern")
+        mask = et_series.dt.date == trade_date
+        if not mask.any():
+            return None
+        rows = df.loc[mask]
+        if rows.empty:
+            return None
+        close_value = rows.iloc[-1].get("close")
+        if close_value is None:
+            return None
+        try:
+            return Decimal(str(close_value))
         except (InvalidOperation, TypeError):
             return None
 
@@ -1880,21 +1927,13 @@ class SignalEngine:
         session: Optional[Session] = None,
         ts_end: Optional[datetime] = None,
     ) -> Tuple[bool, bool]:
-        # 回测模式下跳过位置管理检查
-        if self._is_backtest:
-            LOGGER.info(
-                "position_check.backtest_skip",
-                symbol=symbol,
-                reason="回测模式：跳过位置管理检查（MA60、期权流动性等）"
-            )
-            return True, False
-        
         LOGGER.info(
             "position_check.start",
             symbol=symbol,
             has_df=df is not None,
             has_session=session is not None,
-            has_ts_end=ts_end is not None
+            has_ts_end=ts_end is not None,
+            is_backtest=self._is_backtest,
         )
         if session is not None and ts_end is not None:
             trade_date = ts_end.astimezone(EASTERN).date()
@@ -2674,62 +2713,154 @@ class SignalEngine:
         trade_date: date,
         ts_end: datetime,
     ) -> bool:
-        # Temporarily disabled due to missing option data fields
-        return False
-        start_et = datetime.combine(trade_date, time(9, 30), EASTERN)
-        start_utc = start_et.astimezone(timezone.utc)
-        window_end = start_utc + timedelta(minutes=5)
-        row = session.execute(
-            text(
-                """
-                SELECT conid, mid
-                FROM bars1m_option
-                WHERE symbol = :symbol
-                  AND "right" = 'CALL'
-                  AND ts_end >= :start_ts
-                  AND ts_end < :end_ts
-                ORDER BY ts_end ASC, volume DESC NULLS LAST
-                LIMIT 1
-                """
-            ),
-            {"symbol": symbol, "start_ts": start_utc, "end_ts": window_end},
-        ).fetchone()
-        if not row:
-            return False
-        conid, open_last = row
-        if conid is None or open_last is None:
-            return False
-        try:
-            open_price = Decimal(str(open_last))
-        except Exception:
-            return False
-
         ts_query = ts_end
         if ts_query.tzinfo is None:
             ts_query = ts_query.replace(tzinfo=timezone.utc)
-        row_latest = session.execute(
-            text(
-                """
-                SELECT mid
-                FROM bars1m_option
-                WHERE conid = :conid
-                  AND ts_end <= :ts_end
-                ORDER BY ts_end DESC
-                LIMIT 1
-                """
-            ),
-            {"conid": conid, "ts_end": ts_query},
-        ).fetchone()
-        if not row_latest:
+        window_start = ts_query - timedelta(minutes=15)
+        trade_date_et = ts_query.astimezone(EASTERN).date()
+        try:
+            current_row = session.execute(
+                text(
+                    """
+                    SELECT
+                        conid,
+                        expiry,
+                        strike,
+                        COALESCE(mid, (bid + ask) / 2, last) AS current_price,
+                        bid,
+                        ask,
+                        volume,
+                        open_interest
+                    FROM bars1m_option
+                    WHERE symbol = :symbol
+                      AND "right" = 'CALL'
+                      AND ts_end BETWEEN :window_start AND :ts_end
+                      AND COALESCE(mid, (bid + ask) / 2, last) IS NOT NULL
+                    ORDER BY ts_end DESC, volume DESC NULLS LAST
+                    LIMIT 200
+                    """
+                ),
+                {"symbol": symbol, "window_start": window_start, "ts_end": ts_query},
+            ).mappings().all()
+        except Exception:
+            LOGGER.exception(
+                "signal_engine.option_price_open_current_query_failed",
+                symbol=symbol,
+                trade_date=str(trade_date),
+            )
             return False
-        latest_last = row_latest[0]
-        if latest_last is None:
+        selected: Optional[Dict[str, Any]] = None
+        for row in current_row:
+            conid = row.get("conid")
+            expiry = row.get("expiry")
+            strike = row.get("strike")
+            bid = row.get("bid")
+            ask = row.get("ask")
+            volume = row.get("volume")
+            oi = row.get("open_interest")
+            current_price = row.get("current_price")
+            if None in (conid, expiry, strike, current_price):
+                continue
+            try:
+                current_price_dec = Decimal(str(current_price))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            if current_price_dec <= 0:
+                continue
+            try:
+                bid_dec = Decimal(str(bid)) if bid is not None else None
+                ask_dec = Decimal(str(ask)) if ask is not None else None
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            if bid_dec is not None and ask_dec is not None:
+                if bid_dec <= 0 or ask_dec <= 0 or ask_dec <= bid_dec:
+                    continue
+                spread = ask_dec - bid_dec
+                threshold = max(Decimal("0.10"), current_price_dec * Decimal("0.05"))
+                if spread > threshold:
+                    continue
+            try:
+                if volume is not None and int(volume) < 100:
+                    continue
+                if oi is not None and int(oi) < 500:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if isinstance(expiry, datetime):
+                expiry_date = expiry.date()
+            elif isinstance(expiry, str):
+                try:
+                    expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+            else:
+                expiry_date = expiry
+            if not isinstance(expiry_date, date):
+                continue
+            dte = (expiry_date - trade_date_et).days
+            if dte < 2 or dte > 7:
+                continue
+            selected = {
+                "conid": conid,
+                "current_price": current_price_dec,
+                "expiry": expiry_date,
+                "strike": strike,
+            }
+            break
+        if selected is None:
+            LOGGER.info(
+                "signal_engine.option_price_open_missing_current",
+                symbol=symbol,
+                trade_date=str(trade_date),
+                ts_end=ts_query.isoformat(),
+            )
+            return False
+
+        start_et = datetime.combine(trade_date, time(9, 30), EASTERN)
+        start_utc = start_et.astimezone(timezone.utc)
+        window_end = start_utc + timedelta(minutes=5)
+        try:
+            row = session.execute(
+                text(
+                    """
+                    SELECT COALESCE(mid, (bid + ask) / 2, last) AS open_price
+                    FROM bars1m_option
+                    WHERE conid = :conid
+                      AND ts_end >= :start_ts
+                      AND ts_end < :end_ts
+                      AND COALESCE(mid, (bid + ask) / 2, last) IS NOT NULL
+                    ORDER BY ts_end ASC
+                    LIMIT 1
+                    """
+                ),
+                {"conid": selected["conid"], "start_ts": start_utc, "end_ts": window_end},
+            ).fetchone()
+        except Exception:
+            LOGGER.exception(
+                "signal_engine.option_price_open_open_query_failed",
+                symbol=symbol,
+                conid=selected["conid"],
+                trade_date=str(trade_date),
+            )
+            return False
+        if not row:
+            LOGGER.info(
+                "signal_engine.option_price_open_missing_open",
+                symbol=symbol,
+                conid=selected["conid"],
+                trade_date=str(trade_date),
+            )
+            return False
+        open_last = row[0]
+        if open_last is None:
             return False
         try:
-            latest_price = Decimal(str(latest_last))
-        except Exception:
+            open_price = Decimal(str(open_last))
+        except (InvalidOperation, TypeError, ValueError):
             return False
-        return latest_price > open_price
+        if open_price <= 0:
+            return False
+        return selected["current_price"] > open_price
 
     def _current_vix(self, session: Session, ts_end: datetime) -> Optional[Decimal]:
         cached_value, cached_ts = self._vix_cache

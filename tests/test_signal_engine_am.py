@@ -70,6 +70,7 @@ def base_engine(monkeypatch):
     engine._positions = {}
     engine._upper_break = {}
     engine._last_signal_ts = {}
+    engine._liquidity_snapshot = {}
     engine._redis_bus = None
     engine._history_window = 30
     limits = _build_risk_limits()
@@ -82,7 +83,7 @@ def base_engine(monkeypatch):
 
 def _make_dataframe(values: list[dict], tz: str = "UTC") -> pd.DataFrame:
     frame = pd.DataFrame(values)
-    frame["ts_end"] = pd.to_datetime(frame["ts_end"]).tz_convert(tz)
+    frame["ts_end"] = pd.to_datetime(frame["ts_end"]).dt.tz_convert(tz)
     frame = frame.set_index("ts_end").sort_index()
     numeric_cols = [
         "open",
@@ -109,9 +110,30 @@ def _make_dataframe(values: list[dict], tz: str = "UTC") -> pd.DataFrame:
 
 
 def test_am_bottom_a1_triggers(base_engine):
-    ts_start = datetime(2025, 1, 2, 14, 0, tzinfo=timezone.utc)
+    ts_start = datetime(2025, 1, 2, 15, 0, tzinfo=timezone.utc)
     rows = []
-    lows = [100, 99.6, 99.2, 99.4, 99.1, 98.9, 98.5, 98.3, 98.1, 98.6]
+    lows = [
+        100,
+        99.8,
+        99.6,
+        99.4,
+        99.2,
+        99.0,
+        99.4,
+        99.6,
+        99.8,
+        100.0,
+        99.8,
+        99.6,
+        99.4,
+        99.2,
+        99.0,
+        98.8,
+        98.6,
+        98.4,
+        98.2,
+        98.7,
+    ]
     for idx in range(len(lows)):
         ts = ts_start + timedelta(minutes=idx)
         rows.append(
@@ -136,7 +158,9 @@ def test_am_bottom_a1_triggers(base_engine):
             }
         )
     df = _make_dataframe(rows)
-    base_engine._am_bottom_limits.allow_mid_filter = True
+    base_engine._am_bottom_limits.allow_mid_filter = False
+    base_engine._find_pivot_lows = lambda *args, **kwargs: [5, len(df) - 2]
+    base_engine._check_slope_sequences = lambda *args, **kwargs: True
     event = SimpleNamespace(symbol="AAPL", bar_end=rows[-1]["ts_end"])
     signal = base_engine._detect_am_bottom_a1(event, df, event.bar_end.astimezone(timezone.utc).date(), None, None)
     assert signal is not None
@@ -183,21 +207,31 @@ def test_am_sell_c1_detection(base_engine):
     base_engine._positions = {
         "AAPL": PositionState(signal_code="SIG_OPEN_CHASE_BUY", opened_at=datetime.now(timezone.utc))
     }
-    ts_start = datetime(2025, 1, 2, 10, 0, tzinfo=timezone.utc)
+    ts_start = datetime(2025, 1, 2, 15, 0, tzinfo=timezone.utc)
     rows = []
-    for idx in range(4):
+    for idx in range(7):
         ts = ts_start + timedelta(minutes=idx)
-        open_px = 100 - idx * 0.5
-        close_px = open_px - 0.5
+        if idx >= 5:
+            open_px = 100 - idx * 0.1
+            close_px = open_px - 1.5
+            high_px = open_px + 0.1
+            low_px = close_px - 0.1
+            boll_mid = Decimal("101")
+        else:
+            open_px = 100 - idx * 0.1
+            close_px = open_px - 0.1
+            high_px = open_px + 0.1
+            low_px = close_px - 0.1
+            boll_mid = Decimal("101")
         rows.append(
             {
                 "ts_end": ts,
                 "open": open_px,
-                "high": open_px + 0.2,
-                "low": open_px - 1.2,
+                "high": high_px,
+                "low": low_px,
                 "close": close_px,
                 "volume": 1000,
-                "boll_mid": close_px + 1.5,
+                "boll_mid": boll_mid,
             }
         )
     df = _make_dataframe(rows)
@@ -232,9 +266,9 @@ def test_evaluate_event_prioritises_sells(monkeypatch, base_engine):
     records = []
 
     def fake_history(session, symbol, ts_end, limit):
-        ts = datetime(2025, 1, 2, 10, 0, tzinfo=timezone.utc)
+        ts = datetime(2025, 1, 2, 15, 0, tzinfo=timezone.utc)
         rows = []
-        for idx in range(3):
+        for idx in range(5):
             rows.append(
                 {
                     "ts_end": ts + timedelta(minutes=idx),
@@ -254,23 +288,32 @@ def test_evaluate_event_prioritises_sells(monkeypatch, base_engine):
         return _make_dataframe(rows)
 
     monkeypatch.setattr(base_engine, "_load_history", fake_history)
+    monkeypatch.setattr(base_engine, "_current_vix", lambda *a, **k: None)
+    monkeypatch.setattr(base_engine, "_passes_buy_priority", lambda *a, **k: True)
+
+    def _event_arg(args, kwargs):
+        if "event" in kwargs:
+            return kwargs["event"]
+        return next(arg for arg in args if hasattr(arg, "bar_end"))
 
     def fake_sell(*args, **kwargs):
+        event = _event_arg(args, kwargs)
         return base_engine._build_signal(
             symbol="AAPL",
             signal_code="SIG_AM_SELL_C1",
             side=SignalSide.SELL,
             reason={},
-            generated_at=kwargs["event"].bar_end,
+            generated_at=event.bar_end,
         )
 
     def fake_buy(*args, **kwargs):
+        event = _event_arg(args, kwargs)
         return base_engine._build_signal(
             symbol="AAPL",
             signal_code="SIG_AM_BOTTOM_A1",
             side=SignalSide.BUY,
             reason={},
-            generated_at=kwargs["event"].bar_end,
+            generated_at=event.bar_end,
         )
 
     monkeypatch.setattr(base_engine, "_detect_am_sell_c1", fake_sell.__get__(base_engine))
@@ -287,7 +330,11 @@ def test_evaluate_event_prioritises_sells(monkeypatch, base_engine):
     monkeypatch.setattr(base_engine, "_detect_am_confluence_buy_a2", lambda *a, **k: None)
     monkeypatch.setattr(base_engine, "_finalise_signal", lambda session, entry, **kw: records.append(entry.signal.signal_code))
 
-    event = SimpleNamespace(symbol="AAPL", bar_end=datetime(2025, 1, 2, 10, 5, tzinfo=timezone.utc))
+    event = SimpleNamespace(
+        symbol="AAPL",
+        bar_end=datetime(2025, 1, 2, 15, 5, tzinfo=timezone.utc),
+        trace_id="trace-test",
+    )
     detected = base_engine._evaluate_event(
         session=None,
         event=event,

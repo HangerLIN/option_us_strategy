@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 from statistics import mean, median
-from typing import Deque, Dict, Iterable, List, Mapping, Tuple
+from typing import Any, Deque, Dict, Iterable, List, Mapping, Tuple
 
 import backtrader as bt
 from sqlalchemy import text
@@ -115,6 +115,7 @@ class MetricsWriter(bt.Analyzer):
         rows = self._fetch_bt_trades()
         opportunities = self._fetch_signal_opportunities()
         realized: dict[str, list[float]] = defaultdict(list)
+        forward_5m: dict[str, list[float]] = defaultdict(list)
         open_legs: dict[tuple[object, ...], Deque[_OpenLeg]] = defaultdict(deque)
 
         for row in rows:
@@ -140,6 +141,9 @@ class MetricsWriter(bt.Analyzer):
                         fees=fees,
                     )
                 )
+                forward_return = self._option_forward_return_5m(row, price)
+                if forward_return is not None:
+                    forward_5m[signal_code].append(forward_return)
                 continue
             if side != "SELL":
                 continue
@@ -158,9 +162,12 @@ class MetricsWriter(bt.Analyzer):
                     open_legs[key].popleft()
 
         metrics: list[dict[str, float | int]] = []
-        all_codes = sorted(set(BUY_SIGNAL_CODES) | set(opportunities) | set(realized))
+        all_codes = sorted(
+            set(BUY_SIGNAL_CODES) | set(opportunities) | set(realized) | set(forward_5m)
+        )
         for code in all_codes:
             values = realized.get(code, [])
+            returns_5m = forward_5m.get(code, [])
             count = len(values)
             pnl_total = sum(values)
             wins = [v for v in values if v > 0]
@@ -186,9 +193,98 @@ class MetricsWriter(bt.Analyzer):
                     {"run_id": self.run_id, "metric_code": f"RET_SIG_{suffix}_TFE_P90", "metric_value": self._percentile(values, 0.90)},
                     {"run_id": self.run_id, "metric_code": f"COUNT_EXEC_SIG_{suffix}_FIXED", "metric_value": count},
                     {"run_id": self.run_id, "metric_code": f"COUNT_OPP_SIG_{suffix}_TFE", "metric_value": opp_count},
+                    {"run_id": self.run_id, "metric_code": f"RET_SIG_{suffix}_5M", "metric_value": mean(returns_5m) if returns_5m else 0.0},
+                    {"run_id": self.run_id, "metric_code": f"RET_SIG_{suffix}_5M_P50", "metric_value": median(returns_5m) if returns_5m else 0.0},
+                    {"run_id": self.run_id, "metric_code": f"RET_SIG_{suffix}_5M_P90", "metric_value": self._percentile(returns_5m, 0.90)},
+                    {"run_id": self.run_id, "metric_code": f"COUNT_EXEC_SIG_{suffix}_5M", "metric_value": len(returns_5m)},
                 ]
             )
         return metrics
+
+    def _option_forward_return_5m(
+        self, row: Mapping[str, object], entry_price: float
+    ) -> float | None:
+        if entry_price <= 0:
+            return None
+        trade_ts = self._normalise_datetime(row.get("trade_ts"))
+        if trade_ts is None:
+            return None
+        symbol = str(row.get("symbol") or "").upper()
+        option_right = str(row.get("option_right") or "").upper()
+        strike = row.get("strike")
+        expiry = self._normalise_expiry(row.get("expiry"))
+        if not symbol or not option_right or strike is None or expiry is None:
+            return None
+        target_ts = trade_ts + timedelta(minutes=5)
+        window_end = target_ts + timedelta(minutes=2)
+        option_bar_table = getattr(self.dao, "_option_bar_table", "bars1m_option")
+        session = self.dao._session
+        try:
+            forward_price = session.execute(
+                text(
+                    f"""
+                    SELECT COALESCE(mid, (bid + ask) / 2, last) AS mark_price
+                    FROM {option_bar_table}
+                    WHERE symbol = :symbol
+                      AND "right" = :option_right
+                      AND strike = :strike
+                      AND expiry = :expiry
+                      AND ts_end >= :target_ts
+                      AND ts_end < :window_end
+                      AND COALESCE(mid, (bid + ask) / 2, last) IS NOT NULL
+                    ORDER BY ts_end ASC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "symbol": symbol,
+                    "option_right": option_right,
+                    "strike": strike,
+                    "expiry": expiry,
+                    "target_ts": target_ts,
+                    "window_end": window_end,
+                },
+            ).scalar()
+        except Exception:
+            return None
+        if forward_price is None:
+            return None
+        try:
+            forward_value = float(forward_price)
+        except (TypeError, ValueError):
+            return None
+        if forward_value <= 0:
+            return None
+        return (forward_value - entry_price) / entry_price
+
+    @staticmethod
+    def _normalise_expiry(value: Any) -> date | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.strptime(value[:10], "%Y-%m-%d").date()
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _normalise_datetime(value: Any) -> datetime | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            raw = value.replace("Z", "+00:00")
+            try:
+                return datetime.fromisoformat(raw)
+            except ValueError:
+                return None
+        return None
 
     def _fetch_bt_trades(self) -> list[Mapping[str, object]]:
         session = self.dao._session  # BacktestDAO owns the run transaction.

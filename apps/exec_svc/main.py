@@ -46,6 +46,7 @@ from libs.schemas.exec import (
     OrderSide,
     OrderState,
 )
+from libs.schemas.signals import is_sell_signal
 
 from .option_selector import OptionSelector
 
@@ -1328,7 +1329,7 @@ async def _handle_signal_payload(payload: Dict[str, object]) -> None:
     if not symbol:
         return
     side = str(payload.get("side") or "").upper()
-    if signal_code.startswith("SIG_EXIT") or signal_code in {"SIG_TIME_CLEAR_12_14"}:
+    if side == "SELL" or is_sell_signal(signal_code):
         strategy = str(payload.get("strategy_code") or "core-vol")
         trace_id = str(payload.get("trace_id") or f"exit-{symbol}")
         await _force_close_symbol(strategy, str(symbol), trace_id)
