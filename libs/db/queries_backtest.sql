@@ -139,7 +139,7 @@ DO UPDATE SET
 SELECT
     ts_end,
     conid,
-    symbol,
+    underlying_symbol AS symbol,
     expiry,
     strike,
     "right",
@@ -158,7 +158,7 @@ ORDER BY ts_end;
 SELECT
     ts_end,
     conid,
-    symbol,
+    underlying_symbol AS symbol,
     expiry,
     strike,
     "right",
@@ -168,7 +168,7 @@ SELECT
     volume,
     open_interest
 FROM {option_bar_table}
-WHERE symbol = :underlying_symbol
+WHERE underlying_symbol = :underlying_symbol
   AND expiry = :expiry
   AND strike = :strike
   AND "right" = :right

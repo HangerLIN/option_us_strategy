@@ -17,12 +17,15 @@ def get_engine(settings: Settings) -> Engine:
     """Initialise (or return cached) SQLAlchemy engine."""
     global _engine
     if _engine is None:
+        connect_args = {}
+        if settings.database_url.startswith(("postgresql://", "postgresql+psycopg://")):
+            connect_args["options"] = "-c timezone=America/New_York"
         _engine = create_engine(
             settings.database_url,
             pool_pre_ping=True,
             pool_size=5,
             max_overflow=10,
-            connect_args={"options": "-c timezone=America/New_York"},
+            connect_args=connect_args,
             future=True,
         )
     return _engine

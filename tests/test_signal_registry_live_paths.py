@@ -9,9 +9,17 @@ from types import SimpleNamespace
 from typing import Dict
 
 import pandas as pd
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session
 
 from apps.signal_svc.engine import SignalEngine
-from libs.schemas.signals import BUY_SIGNAL_CODES, is_sell_signal
+from libs.schemas.signals import (
+    BUY_SIGNAL_CODES,
+    SignalEnvelope,
+    SignalPushItem,
+    SignalSide,
+    is_sell_signal,
+)
 
 
 def _load_handle_signal_payload():
@@ -163,6 +171,67 @@ def test_option_price_exceeds_open_fails_open_when_data_missing() -> None:
     assert not engine._option_price_exceeds_open(session, "AAPL", ts_end.date(), ts_end)
 
 
+def test_option_price_exceeds_open_uses_underlying_symbol_column() -> None:
+    db = create_engine("sqlite:///:memory:", future=True)
+    with Session(db, future=True) as session:
+        session.execute(
+            text(
+                """
+                CREATE TABLE bars1m_option (
+                    conid INTEGER,
+                    ts_end TIMESTAMP,
+                    underlying_symbol TEXT,
+                    expiry DATE,
+                    strike NUMERIC,
+                    "right" TEXT,
+                    bid NUMERIC,
+                    ask NUMERIC,
+                    mid NUMERIC,
+                    last NUMERIC,
+                    volume INTEGER,
+                    open_interest INTEGER,
+                    delta NUMERIC,
+                    underlying_price NUMERIC
+                )
+                """
+            )
+        )
+        trade_date = datetime(2025, 1, 2, tzinfo=timezone.utc).date()
+        expiry = "2025-01-08"
+        session.execute(
+            text(
+                """
+                INSERT INTO bars1m_option (
+                    conid, ts_end, underlying_symbol, expiry, strike, "right",
+                    bid, ask, mid, last, volume, open_interest, delta, underlying_price
+                ) VALUES (
+                    1001, :open_ts, 'AAPL', :expiry, 105, 'CALL',
+                    1.45, 1.55, 1.50, NULL, 1000, 2000, 0.40, 100
+                ), (
+                    1001, :current_ts, 'AAPL', :expiry, 105, 'CALL',
+                    1.95, 2.05, 2.00, NULL, 1000, 2000, 0.40, 100
+                )
+                """
+            ),
+            {
+                "open_ts": datetime(2025, 1, 2, 14, 31, tzinfo=timezone.utc),
+                "current_ts": datetime(2025, 1, 2, 20, 0, tzinfo=timezone.utc),
+                "expiry": expiry,
+            },
+        )
+        session.commit()
+
+        engine = SignalEngine.__new__(SignalEngine)
+        engine._option_symbol_columns = {}
+
+        assert engine._option_price_exceeds_open(
+            session,
+            "AAPL",
+            trade_date,
+            datetime(2025, 1, 2, 20, 0, tzinfo=timezone.utc),
+        )
+
+
 def test_backtest_can_open_position_runs_data_filters() -> None:
     engine = SignalEngine.__new__(SignalEngine)
     engine._is_backtest = True
@@ -193,3 +262,50 @@ def test_backtest_can_open_position_runs_data_filters() -> None:
     )
 
     assert (allowed, addition) == (False, False)
+
+
+class _PushSession:
+    def commit(self) -> None:
+        pass
+
+    def rollback(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def test_push_signals_passes_context_to_can_open_position() -> None:
+    engine = SignalEngine.__new__(SignalEngine)
+    session = _PushSession()
+    ts_end = datetime(2025, 1, 2, 20, 0, tzinfo=timezone.utc)
+    df = pd.DataFrame([{"close": Decimal("100")}])
+    calls = []
+
+    engine._session_factory = lambda: session
+    engine._history_window = 180
+    engine._load_history = lambda *args: df
+
+    def can_open(symbol, passed_df=None, passed_session=None, passed_ts=None):
+        calls.append((symbol, passed_df, passed_session, passed_ts))
+        return False, False
+
+    engine._can_open_position = can_open
+    signal = SignalEnvelope(
+        strategy_code="core-vol",
+        symbol="AAPL",
+        signal_code="SIG_AM_BOTTOM_A1",
+        side=SignalSide.BUY,
+        confidence=0.9,
+        generated_at=ts_end,
+    )
+
+    result = engine.push_signals([SignalPushItem(signal=signal)])
+
+    assert result[0]["accepted"] is False
+    assert result[0]["reason"] == "portfolio_limit"
+    assert len(calls) == 1
+    assert calls[0][0] == "AAPL"
+    assert calls[0][1] is df
+    assert calls[0][2] is session
+    assert calls[0][3] == ts_end

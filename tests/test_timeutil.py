@@ -1,5 +1,8 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 
+import pytest
+
+import libs.core.timeutil as timeutil
 from libs.core.timeutil import (
     EASTERN,
     is_half_day,
@@ -8,6 +11,21 @@ from libs.core.timeutil import (
     trading_session_window,
     ts_end,
 )
+from libs.db.dim_trading_calendar import TradingSession
+
+
+@pytest.fixture(autouse=True)
+def _stub_trading_calendar(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_get_trading_session(session_date: date) -> TradingSession:
+        close_time = time(13, 0) if session_date == date(2024, 7, 3) else time(16, 0)
+        return TradingSession(
+            session_date=session_date,
+            open_time=time(9, 30),
+            close_time=close_time,
+            session_type="HALF_DAY" if close_time == time(13, 0) else "REGULAR",
+        )
+
+    monkeypatch.setattr(timeutil, "get_trading_session", fake_get_trading_session)
 
 
 def test_to_utc_and_back_roundtrip() -> None:

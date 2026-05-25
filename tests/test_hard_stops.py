@@ -98,6 +98,7 @@ def hard_stop_env() -> Iterable[Tuple[Session, HardStopRules, StubRedisBus]]:
             )
             """
         )
+        conn.exec_driver_sql("DROP TABLE IF EXISTS bars1m_option")
         conn.exec_driver_sql(
             """
             CREATE TABLE bars1m_option (

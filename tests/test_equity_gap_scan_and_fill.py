@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, time
 from decimal import Decimal
 from typing import Any, Dict, List
 from unittest.mock import Mock, patch
@@ -14,6 +14,23 @@ from apps.backtest.datafeed.timescale_equity import (
     _fill_equity_gaps_via_ibkr,
     _scan_equity_gaps,
 )
+from libs.db.dim_trading_calendar import TradingSession
+
+
+@pytest.fixture(autouse=True)
+def _stub_trading_calendar(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_get_trading_session(session_date: date) -> TradingSession:
+        return TradingSession(
+            session_date=session_date,
+            open_time=time(9, 30),
+            close_time=time(16, 0),
+            session_type="REGULAR",
+        )
+
+    monkeypatch.setattr(
+        "apps.backtest.datafeed.timescale_equity.get_trading_session",
+        fake_get_trading_session,
+    )
 
 
 class FakeDAO:

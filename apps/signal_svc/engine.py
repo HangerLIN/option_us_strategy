@@ -12,7 +12,7 @@ from uuid import uuid4
 
 import pandas as pd
 import structlog
-from sqlalchemy import text
+from sqlalchemy import inspect as sa_inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from libs.core import EASTERN, get_settings
@@ -110,6 +110,7 @@ class SignalEngine:
         self._vix_gate_mode = risk_limits.gate.vix.mode
         self._vix_gate = Decimal(str(risk_limits.gate.vix.thresh))
         self._ma60_cache: Dict[Tuple[str, date], Optional[Decimal]] = {}
+        self._option_symbol_columns: Dict[str, str] = {}
         # 记录最近一次期权流动性筛选结果，供 reason / option_hint 使用
         self._liquidity_snapshot: Dict[str, Dict[str, Any]] = {}
         # 当日买入信号优先级缓存：按布林下轨斜率排名选前N只
@@ -262,8 +263,12 @@ class SignalEngine:
                 if (
                     signal.signal_code in BUY_SIGNALS
                     and not item.force
-                    and not self._can_open_position(signal.symbol)[0]
                 ):
+                    df = self._load_history(session, signal.symbol, ts_end, self._history_window)
+                    allowed, _ = self._can_open_position(signal.symbol, df, session, ts_end)
+                else:
+                    allowed = True
+                if signal.signal_code in BUY_SIGNALS and not item.force and not allowed:
                     results.append(
                         {
                             "accepted": False,
@@ -1920,6 +1925,27 @@ class SignalEngine:
         self._ma60_cache[key] = ma60_value
         return ma60_value
 
+    def _option_symbol_column(self, session: Session, table_name: str = "bars1m_option") -> str:
+        """Return the underlying symbol column used by the configured option bar table."""
+        cache = getattr(self, "_option_symbol_columns", None)
+        if cache is None:
+            cache = {}
+            self._option_symbol_columns = cache
+        if table_name in cache:
+            return cache[table_name]
+        column_name = "symbol"
+        try:
+            bind = session.get_bind()
+            columns = {col["name"] for col in sa_inspect(bind).get_columns(table_name)}
+            if "underlying_symbol" in columns:
+                column_name = "underlying_symbol"
+            elif "symbol" in columns:
+                column_name = "symbol"
+        except Exception:
+            column_name = "symbol"
+        cache[table_name] = column_name
+        return column_name
+
     def _can_open_position(
         self,
         symbol: str,
@@ -2084,8 +2110,9 @@ class SignalEngine:
         读取 bars1m_option 数据判定期权流动性，返回 (是否通过, 详情字典)。
         """
         window_start = ts_end - timedelta(minutes=15)
+        symbol_column = self._option_symbol_column(session)
         stmt = text(
-            """
+            f"""
             SELECT
                 bid,
                 ask,
@@ -2096,7 +2123,7 @@ class SignalEngine:
                 ts_end,
                 underlying_price
             FROM bars1m_option
-            WHERE symbol = :symbol
+            WHERE {symbol_column} = :symbol
               AND "right" = 'CALL'
               AND ts_end BETWEEN :start_ts AND :end_ts
             ORDER BY ts_end DESC, volume DESC NULLS LAST
@@ -2718,10 +2745,11 @@ class SignalEngine:
             ts_query = ts_query.replace(tzinfo=timezone.utc)
         window_start = ts_query - timedelta(minutes=15)
         trade_date_et = ts_query.astimezone(EASTERN).date()
+        symbol_column = self._option_symbol_column(session)
         try:
             current_row = session.execute(
                 text(
-                    """
+                    f"""
                     SELECT
                         conid,
                         expiry,
@@ -2730,9 +2758,12 @@ class SignalEngine:
                         bid,
                         ask,
                         volume,
-                        open_interest
+                        open_interest,
+                        delta,
+                        underlying_price,
+                        ts_end
                     FROM bars1m_option
-                    WHERE symbol = :symbol
+                    WHERE {symbol_column} = :symbol
                       AND "right" = 'CALL'
                       AND ts_end BETWEEN :window_start AND :ts_end
                       AND COALESCE(mid, (bid + ask) / 2, last) IS NOT NULL
@@ -2749,7 +2780,7 @@ class SignalEngine:
                 trade_date=str(trade_date),
             )
             return False
-        selected: Optional[Dict[str, Any]] = None
+        candidates: List[Dict[str, Any]] = []
         for row in current_row:
             conid = row.get("conid")
             expiry = row.get("expiry")
@@ -2758,6 +2789,8 @@ class SignalEngine:
             ask = row.get("ask")
             volume = row.get("volume")
             oi = row.get("open_interest")
+            delta = row.get("delta")
+            underlying_price = row.get("underlying_price")
             current_price = row.get("current_price")
             if None in (conid, expiry, strike, current_price):
                 continue
@@ -2772,6 +2805,7 @@ class SignalEngine:
                 ask_dec = Decimal(str(ask)) if ask is not None else None
             except (InvalidOperation, TypeError, ValueError):
                 continue
+            spread = Decimal("Infinity")
             if bid_dec is not None and ask_dec is not None:
                 if bid_dec <= 0 or ask_dec <= 0 or ask_dec <= bid_dec:
                     continue
@@ -2780,9 +2814,11 @@ class SignalEngine:
                 if spread > threshold:
                     continue
             try:
-                if volume is not None and int(volume) < 100:
+                volume_int = int(volume or 0)
+                oi_int = int(oi or 0)
+                if volume_int < 100:
                     continue
-                if oi is not None and int(oi) < 500:
+                if oi_int < 500:
                     continue
             except (TypeError, ValueError):
                 continue
@@ -2800,13 +2836,41 @@ class SignalEngine:
             dte = (expiry_date - trade_date_et).days
             if dte < 2 or dte > 7:
                 continue
-            selected = {
-                "conid": conid,
-                "current_price": current_price_dec,
-                "expiry": expiry_date,
-                "strike": strike,
-            }
-            break
+            try:
+                strike_dec = Decimal(str(strike))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            try:
+                delta_dec = Decimal(str(delta)) if delta is not None else None
+            except (InvalidOperation, TypeError, ValueError):
+                delta_dec = None
+            try:
+                underlying_dec = (
+                    Decimal(str(underlying_price)) if underlying_price is not None else None
+                )
+            except (InvalidOperation, TypeError, ValueError):
+                underlying_dec = None
+            strike_distance = (
+                abs(strike_dec - underlying_dec)
+                if underlying_dec is not None
+                else Decimal("Infinity")
+            )
+            candidates.append(
+                {
+                    "conid": conid,
+                    "current_price": current_price_dec,
+                    "expiry": expiry_date,
+                    "strike": strike,
+                    "selection_key": (
+                        -volume_int,
+                        self._option_delta_penalty(delta_dec),
+                        spread,
+                        -oi_int,
+                        strike_distance,
+                    ),
+                }
+            )
+        selected = min(candidates, key=lambda item: item["selection_key"]) if candidates else None
         if selected is None:
             LOGGER.info(
                 "signal_engine.option_price_open_missing_current",
@@ -2861,6 +2925,13 @@ class SignalEngine:
         if open_price <= 0:
             return False
         return selected["current_price"] > open_price
+
+    @staticmethod
+    def _option_delta_penalty(delta: Optional[Decimal]) -> int:
+        if delta is None:
+            return 1
+        abs_delta = abs(delta)
+        return 0 if Decimal("0.35") <= abs_delta <= Decimal("0.45") else 1
 
     def _current_vix(self, session: Session, ts_end: datetime) -> Optional[Decimal]:
         cached_value, cached_ts = self._vix_cache

@@ -7,7 +7,7 @@ from statistics import mean, median
 from typing import Any, Deque, Dict, Iterable, List, Mapping, Tuple
 
 import backtrader as bt
-from sqlalchemy import text
+from sqlalchemy import inspect as sa_inspect, text
 
 from apps.backtest.dao import BacktestDAO
 from libs.schemas.signals import BUY_SIGNAL_CODES
@@ -218,6 +218,7 @@ class MetricsWriter(bt.Analyzer):
         target_ts = trade_ts + timedelta(minutes=5)
         window_end = target_ts + timedelta(minutes=2)
         option_bar_table = getattr(self.dao, "_option_bar_table", "bars1m_option")
+        symbol_column = self._option_symbol_column(option_bar_table)
         session = self.dao._session
         try:
             forward_price = session.execute(
@@ -225,7 +226,7 @@ class MetricsWriter(bt.Analyzer):
                     f"""
                     SELECT COALESCE(mid, (bid + ask) / 2, last) AS mark_price
                     FROM {option_bar_table}
-                    WHERE symbol = :symbol
+                    WHERE {symbol_column} = :symbol
                       AND "right" = :option_right
                       AND strike = :strike
                       AND expiry = :expiry
@@ -256,6 +257,28 @@ class MetricsWriter(bt.Analyzer):
         if forward_value <= 0:
             return None
         return (forward_value - entry_price) / entry_price
+
+    def _option_symbol_column(self, table_name: str) -> str:
+        cache = getattr(self.dao, "_option_bar_symbol_columns", None)
+        if cache is None:
+            cache = {}
+            setattr(self.dao, "_option_bar_symbol_columns", cache)
+        if table_name in cache:
+            return cache[table_name]
+        column_name = "symbol"
+        try:
+            columns = {
+                col["name"]
+                for col in sa_inspect(self.dao._session.get_bind()).get_columns(table_name)
+            }
+            if "underlying_symbol" in columns:
+                column_name = "underlying_symbol"
+            elif "symbol" in columns:
+                column_name = "symbol"
+        except Exception:
+            column_name = "symbol"
+        cache[table_name] = column_name
+        return column_name
 
     @staticmethod
     def _normalise_expiry(value: Any) -> date | None:
