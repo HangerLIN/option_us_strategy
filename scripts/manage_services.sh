@@ -48,6 +48,41 @@ get_service_config() {
     esac
 }
 
+resolve_client_id() {
+    local name=$1
+    local configured_client_id=$2
+    local override_var=""
+
+    case "$name" in
+        md_gw)
+            override_var="MD_GW_IB_CLIENT_ID"
+            ;;
+        rt_api)
+            override_var="RT_API_IB_CLIENT_ID"
+            ;;
+        exec_svc)
+            override_var="EXEC_IB_CLIENT_ID"
+            ;;
+        *)
+            ;;
+    esac
+
+    if [ -n "$override_var" ]; then
+        local override_value="${!override_var:-}"
+        if [ -n "$override_value" ]; then
+            echo "$override_value"
+            return 0
+        fi
+    fi
+
+    echo "$configured_client_id"
+}
+
+find_listening_pid() {
+    local port=$1
+    lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -n 1
+}
+
 # 启动单个服务
 start_service() {
     local name=$1
@@ -59,6 +94,7 @@ start_service() {
     fi
     
     IFS='|' read -r module port client_id <<< "$config"
+    client_id=$(resolve_client_id "$name" "$client_id")
     
     if [ -f "$LOG_DIR/${name}.pid" ]; then
         local pid=$(cat "$LOG_DIR/${name}.pid")
@@ -66,6 +102,14 @@ start_service() {
             echo -e "${YELLOW}⚠️  ${name} 已在运行 (PID: $pid)${NC}"
             return 0
         fi
+    fi
+
+    local existing_pid
+    existing_pid=$(find_listening_pid "$port")
+    if [ -n "$existing_pid" ] && curl -s -m 1 "http://localhost:$port/healthz" > /dev/null 2>&1; then
+        echo "$existing_pid" > "$LOG_DIR/${name}.pid"
+        echo -e "${YELLOW}⚠️  ${name} 已在运行 (PID: $existing_pid, 通过端口检测)${NC}"
+        return 0
     fi
     
     echo -e "${GREEN}▶️  启动 ${name}...${NC}"
@@ -75,12 +119,12 @@ start_service() {
         nohup .venv/bin/python -m "$module" \
             > "$LOG_DIR/${name}.log" 2>&1 &
     elif [ -n "$client_id" ]; then
-        IB_CLIENT_ID=$client_id nohup .venv/bin/uvicorn "$module" \
+        IB_CLIENT_ID=$client_id nohup .venv/bin/python -m uvicorn "$module" \
             --port "$port" \
             --env-file .env \
             > "$LOG_DIR/${name}.log" 2>&1 &
     else
-        nohup .venv/bin/uvicorn "$module" \
+        nohup .venv/bin/python -m uvicorn "$module" \
             --port "$port" \
             --env-file .env \
             > "$LOG_DIR/${name}.log" 2>&1 &
@@ -135,6 +179,15 @@ check_service() {
             return 0
         fi
     fi
+
+    local port_pid
+    port_pid=$(find_listening_pid "$port")
+    if [ -n "$port_pid" ] && curl -s -m 1 "http://localhost:$port/healthz" > /dev/null 2>&1; then
+        echo "$port_pid" > "$LOG_DIR/${name}.pid"
+        echo -e "${GREEN}✅${NC} $name (端口 $port, PID: $port_pid) - 运行正常 (端口检测)"
+        return 0
+    fi
+
     echo -e "${RED}❌${NC} $name - 未运行"
     return 1
 }

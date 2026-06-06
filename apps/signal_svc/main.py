@@ -73,7 +73,7 @@ bars_closed_consumer_task: asyncio.Task | None = None
 async def _consume_bars_closed() -> None:
     try:
         await redis_bus.ensure_group("bars_closed", "signal_svc", start_id="0")
-        LOGGER.info("signal_svc.consumer_started", stream="bars_closed")
+        LOGGER.info("signal_svc.consumer_started stream=%s", "bars_closed")
         while True:
             try:
                 entries = await redis_bus.consume(
@@ -98,14 +98,14 @@ async def _consume_bars_closed() -> None:
                 try:
                     event = BarsClosed(**payload)
                 except Exception:
-                    LOGGER.exception("signal_svc.parse_failed", payload=payload)
+                    LOGGER.exception("signal_svc.parse_failed payload=%r", payload)
                     continue
 
                 bind_trace_context(trace_id, symbol=event.symbol)
                 try:
                     signals = signal_engine.process_bar(event)
                 except Exception:
-                    LOGGER.exception("signal_svc.process_failed", symbol=event.symbol)
+                    LOGGER.exception("signal_svc.process_failed symbol=%s", event.symbol)
                     continue
 
                 if signals:
