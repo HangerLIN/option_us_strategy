@@ -6,11 +6,14 @@ from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, Field
 
+from libs.schemas.assets import AssetType
+
 
 class MarketDataEvent(BaseModel):
     """Top-of-book update received from the market data gateway."""
 
     symbol: str = Field(..., max_length=32)
+    asset_type: AssetType = AssetType.EQUITY
     bid: Decimal = Field(..., gt=0)
     ask: Decimal = Field(..., gt=0)
     timestamp: datetime
@@ -21,6 +24,7 @@ class BarsClosed(BaseModel):
 
     trace_id: str
     symbol: str = Field(..., max_length=32)
+    asset_type: AssetType = AssetType.EQUITY
     bar_start: datetime
     bar_end: datetime
     timeframe: str = Field("1m", max_length=8)
@@ -39,6 +43,7 @@ class Signal(BaseModel):
     strategy_code: str = Field(..., max_length=64)
     signal_code: str = Field(..., max_length=64)
     symbol: str = Field(..., max_length=32)
+    asset_type: AssetType = AssetType.OPTION
     side: str = Field(..., pattern="^(BUY|SELL|FLAT)$")
     confidence: Decimal = Field(..., ge=0, le=1)
     reason: str = Field(..., max_length=256)
@@ -50,6 +55,7 @@ class ExecutionFill(BaseModel):
     order_id: int
     client_order_id: str
     symbol: str = Field(..., max_length=32)
+    asset_type: AssetType = AssetType.OPTION
     side: str = Field(..., pattern="^(BUY|SELL)$")
     fill_quantity: Decimal
     fill_price: Decimal
@@ -105,6 +111,7 @@ class ForceCloseEvent(BaseModel):
     trace_id: str
     strategy_code: str = Field(..., max_length=64)
     symbol: str = Field(..., max_length=32)
+    asset_type: AssetType = AssetType.OPTION
     option_right: Optional[str] = Field(default=None, pattern="^(CALL|PUT)$")
     reason: str = Field(..., max_length=256)
     triggered_at: datetime

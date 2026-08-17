@@ -1,6 +1,7 @@
 """Pydantic schemas shared by services."""
 
 from .common import ApiResult, ServiceHealth
+from .assets import AssetType, BarEvent, InstrumentRef, MarketQuote, PositionSnapshot
 from .events import (
     BarsClosed,
     ExecutionFill,
@@ -37,6 +38,11 @@ from .backtest import BacktestRunRequest, BacktestRunRecord, BacktestMetrics
 __all__ = [
     "ApiResult",
     "ServiceHealth",
+    "AssetType",
+    "InstrumentRef",
+    "MarketQuote",
+    "BarEvent",
+    "PositionSnapshot",
     "MarketDataEvent",
     "BarsClosed",
     "Signal",

@@ -53,6 +53,13 @@ def upgrade() -> None:
             quantity NUMERIC(18, 6) NOT NULL,
             price NUMERIC(18, 6) NOT NULL,
             trade_ts TIMESTAMPTZ NOT NULL,
+            trace_id TEXT,
+            option_right TEXT,
+            strike NUMERIC(18, 6),
+            expiry DATE,
+            fees NUMERIC(18, 6) NOT NULL DEFAULT 0,
+            slippage NUMERIC(18, 6) NOT NULL DEFAULT 0,
+            reason_code TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         """
@@ -87,8 +94,9 @@ def upgrade() -> None:
             run_id BIGINT NOT NULL REFERENCES bt_runs(run_id) ON DELETE CASCADE,
             symbol TEXT NOT NULL,
             signal_code TEXT NOT NULL,
-            signal_ts TIMESTAMPTZ NOT NULL,
-            payload JSONB,
+            ts_end TIMESTAMPTZ NOT NULL,
+            accepted BOOLEAN,
+            reason TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         """
@@ -108,7 +116,7 @@ def upgrade() -> None:
         """
         DO $$
         BEGIN
-            EXECUTE 'CREATE INDEX IF NOT EXISTS idx_bt_signals_ts ON bt_signals (signal_ts DESC)';
+            EXECUTE 'CREATE INDEX IF NOT EXISTS idx_bt_signals_ts ON bt_signals (ts_end DESC)';
         EXCEPTION
             WHEN insufficient_privilege THEN
                 RAISE NOTICE 'Skipping idx_bt_signals_ts due to insufficient privileges';
@@ -176,8 +184,8 @@ def upgrade() -> None:
                     SELECT run_id, 'AAPL', 'BUY', 10, 150.5, now() FROM base_run
                     RETURNING trade_id, run_id
                 ), signals AS (
-                    INSERT INTO bt_signals (run_id, symbol, signal_code, signal_ts)
-                    SELECT run_id, 'AAPL', 'enter-long', now() FROM base_run
+                    INSERT INTO bt_signals (run_id, symbol, signal_code, ts_end, accepted, reason)
+                    SELECT run_id, 'AAPL', 'enter-long', now(), TRUE, 'PASS' FROM base_run
                     RETURNING signal_id, run_id
                 ), metrics_daily AS (
                     INSERT INTO bt_metrics_daily (run_id, trade_date, metric_code, metric_value)
@@ -188,10 +196,6 @@ def upgrade() -> None:
                     SELECT run_id, 'sharpe', 1.8 FROM base_run
                     RETURNING run_id
                 )
-                DELETE FROM bt_metrics_total WHERE run_id IN (SELECT run_id FROM metrics_total);
-                DELETE FROM bt_metrics_daily WHERE run_id IN (SELECT run_id FROM metrics_daily);
-                DELETE FROM bt_signals WHERE run_id IN (SELECT run_id FROM signals);
-                DELETE FROM bt_trades WHERE run_id IN (SELECT run_id FROM trades);
                 DELETE FROM bt_runs WHERE run_id IN (SELECT run_id FROM base_run);
             EXCEPTION
                 WHEN insufficient_privilege THEN

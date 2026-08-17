@@ -6,10 +6,13 @@ from typing import Any, Dict, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from libs.schemas.assets import AssetType
+
 
 class RiskCheckRequest(BaseModel):
     strategy_code: str = Field(..., max_length=32)
     symbol: str = Field(..., max_length=32)
+    asset_type: AssetType = AssetType.OPTION
     notional: Decimal = Field(..., gt=0)
     implied_vol: float = Field(..., ge=0)
     timestamp: datetime
@@ -26,6 +29,8 @@ class RiskCheckRequest(BaseModel):
     option_dte: int | None = Field(default=None, ge=0)
     option_otm_steps: int | None = Field(default=None, ge=0)
     option_liquidity: Dict[str, Any] | None = Field(default=None)
+    option_quote_ts: datetime | None = Field(default=None)
+    allow_missing_option_liquidity_metrics: bool = False
 
 
 class RiskCheckResult(BaseModel):
@@ -50,13 +55,15 @@ class PreCheckSummary(BaseModel):
 class ForceCloseRequest(BaseModel):
     strategy_code: str = Field(..., max_length=32)
     symbol: str = Field(..., max_length=32)
-    option_right: str = Field(..., pattern="^(CALL|PUT)$")
+    asset_type: AssetType = AssetType.OPTION
+    option_right: str | None = Field(default=None, pattern="^(CALL|PUT)$")
 
 
 class ForceCloseResult(BaseModel):
     strategy_code: str
     symbol: str
-    option_right: str
+    asset_type: AssetType = AssetType.OPTION
+    option_right: str | None = None
     was_open: bool
     closed_quantity: int = Field(..., ge=0)
     timestamp: datetime
@@ -131,7 +138,8 @@ class RiskLimits(BaseModel):
 class ExposureSnapshot(BaseModel):
     strategy_code: str
     symbol: str
-    option_right: str
+    asset_type: AssetType = AssetType.OPTION
+    option_right: str | None = None
     open_quantity: int
     mark_price: Decimal
     notional: Decimal

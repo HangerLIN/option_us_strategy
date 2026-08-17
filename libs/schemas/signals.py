@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from libs.schemas.assets import AssetType
+
 
 class SignalSide(str, Enum):
     BUY = "BUY"
@@ -15,6 +17,11 @@ class SignalSide(str, Enum):
 BUY_SIGNAL_CODES = frozenset(
     {
         "SIG_OPEN_CHASE_BUY",
+        "SIG_OPEN_CHASE_ORB_BUY",
+        "SIG_1030_REVERSAL_CALL_BUY",
+        "SIG_1030_V8A_LOW_REVERSAL_CALL_BUY",
+        "SIG_1030_V8B_RECLAIM_CALL_BUY",
+        "SIG_1030_BOLL_MID_RECLAIM_CALL_BUY",
         "SIG_REBOUND_BUY",
         "SIG_PM_BOTTOM_A2",
         "SIG_PM_BOTTOM_A3",
@@ -28,6 +35,27 @@ SELL_SIGNAL_CODES = frozenset(
     {
         "SIG_EXIT_UPPER_TAP_X2",
         "SIG_EXIT_BOX2MID",
+        "OPEN_CHASE_FAILURE_BELOW_VWAP",
+        "OPEN_CHASE_FAILURE_BELOW_ORL",
+        "OPEN_CHASE_FAILURE_BELOW_ENTRY_LOW",
+        "OPEN_CHASE_FAILURE_NO_FOLLOW_THROUGH",
+        "OPEN_CHASE_FAILURE_OPTION_LOSS",
+        "OPEN_CHASE_TAKE_PROFIT_25",
+        "OPEN_CHASE_TAKE_PROFIT_50",
+        "OPEN_CHASE_UPPER_TAP_PROFIT_TAKE",
+        "OPEN_CHASE_TIME_STOP_NO_PROFIT",
+        "OPEN_CHASE_TIME_STOP_NO_TREND_CONFIRM",
+        "OPEN_CHASE_EOD_EXIT",
+        "SIG_1030_REVERSAL_BOLL_UP_EXIT",
+        "SIG_1030_REVERSAL_BOLL_UP_TRUE_EXIT",
+        "SIG_1030_REVERSAL_BOLL_UP_WEAK_EXIT",
+        "SIG_1030_REVERSAL_BOLL_UP_REBOUND_FAILURE_EXIT",
+        "SIG_1030_REVERSAL_CONTINUATION_TARGET_EXIT",
+        "SIG_1030_REVERSAL_CONTINUATION_STRUCTURE_LOST_EXIT",
+        "SIG_1030_REVERSAL_FAILURE_ENTRY_LOW_EXIT",
+        "SIG_1030_REVERSAL_EARLY_NO_FOLLOW_THROUGH_EXIT",
+        "SIG_1030_REVERSAL_FAILURE_RECLAIM_LOST_EXIT",
+        "SIG_1030_REVERSAL_TIME_EXIT",
         "SIG_TIME_CLEAR_12_14",
         "SIG_OVERNIGHT_GAP_EXIT",
         "SIG_AM_SELL_C1",
@@ -66,6 +94,7 @@ class SignalInstruction(BaseModel):
 class SignalEnvelope(BaseModel):
     strategy_code: str = Field(..., max_length=32)
     symbol: str = Field(..., max_length=32)
+    asset_type: AssetType = AssetType.OPTION
     signal_code: str = Field(..., max_length=64)
     side: SignalSide
     confidence: float = Field(..., ge=0.0, le=1.0)

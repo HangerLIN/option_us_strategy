@@ -218,7 +218,7 @@ def upgrade() -> None:
         """
         DO $$
         BEGIN
-            EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS idx_v_daily_ohlcv_bucket_symbol ON v_daily_ohlcv (bucket, symbol)';
+            EXECUTE 'CREATE INDEX IF NOT EXISTS idx_v_daily_ohlcv_bucket_symbol ON v_daily_ohlcv (bucket, symbol)';
         EXCEPTION
             WHEN insufficient_privilege THEN
                 RAISE NOTICE 'Skipping idx_v_daily_ohlcv_bucket_symbol due to insufficient privileges';
@@ -234,8 +234,7 @@ def upgrade() -> None:
         BEGIN
             BEGIN
                 EXECUTE $sql$
-                CREATE MATERIALIZED VIEW IF NOT EXISTS v_daily_atr_pct
-                WITH (timescaledb.continuous) AS
+                CREATE OR REPLACE VIEW v_daily_atr_pct AS
                 SELECT
                     time_bucket('1 day', ind.ts_end, 'America/New_York') AS bucket,
                     ind.symbol,
@@ -249,27 +248,15 @@ def upgrade() -> None:
                 JOIN bars1m_equity AS b
                   ON b.symbol = ind.symbol
                  AND b.ts_end = ind.ts_end
-                GROUP BY bucket, ind.symbol
-                WITH NO DATA;
+                GROUP BY bucket, ind.symbol;
                 $sql$;
             EXCEPTION
                 WHEN undefined_function THEN
-                    RAISE NOTICE 'TimescaleDB not available, skipping v_daily_atr_pct materialized view';
+                    RAISE NOTICE 'TimescaleDB not available, skipping v_daily_atr_pct view';
+                WHEN undefined_table THEN
+                    RAISE NOTICE 'Skipping v_daily_atr_pct view because source tables are unavailable';
             END;
         END $migration$;
-        """
-    )
-    op.execute(
-        """
-        DO $$
-        BEGIN
-            EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS idx_v_daily_atr_bucket_symbol ON v_daily_atr_pct (bucket, symbol)';
-        EXCEPTION
-            WHEN insufficient_privilege THEN
-                RAISE NOTICE 'Skipping idx_v_daily_atr_bucket_symbol due to insufficient privileges';
-            WHEN undefined_table THEN
-                RAISE NOTICE 'Skipping idx_v_daily_atr_bucket_symbol because v_daily_atr_pct is unavailable';
-        END $$;
         """
     )
 
@@ -277,29 +264,14 @@ def upgrade() -> None:
         """
         DO $migration$
         BEGIN
-            BEGIN
-                EXECUTE 'CALL refresh_continuous_aggregate(''v_daily_ohlcv''::regclass, NULL, NULL);';
-            EXCEPTION
-                WHEN undefined_function THEN
-                    RAISE NOTICE 'TimescaleDB not available, skipping v_daily_ohlcv refresh';
-                WHEN undefined_table THEN
-                    RAISE NOTICE 'Skipping v_daily_ohlcv refresh because materialized view is unavailable';
-            END;
-            BEGIN
-                EXECUTE 'CALL refresh_continuous_aggregate(''v_daily_atr_pct''::regclass, NULL, NULL);';
-            EXCEPTION
-                WHEN undefined_function THEN
-                    RAISE NOTICE 'TimescaleDB not available, skipping v_daily_atr_pct refresh';
-                WHEN undefined_table THEN
-                    RAISE NOTICE 'Skipping v_daily_atr_pct refresh because materialized view is unavailable';
-            END;
+            RAISE NOTICE 'Skipping continuous aggregate refresh during transactional migration';
         END $migration$;
         """
     )
 
 
 def downgrade() -> None:
-    op.execute("DROP MATERIALIZED VIEW IF EXISTS v_daily_atr_pct;")
+    op.execute("DROP VIEW IF EXISTS v_daily_atr_pct;")
     op.execute("DROP MATERIALIZED VIEW IF EXISTS v_daily_ohlcv;")
 
     op.execute("DROP TABLE IF EXISTS rvol_baseline_eq;")

@@ -1,7 +1,7 @@
 """create premarket leaders lagged table
 
-Revision ID: 20251110_120000_create_premarket_leaders_lagged
-Revises: 20251107_110000_add_ingestion_progress_and_mv
+Revision ID: 20251110_120000
+Revises: 20251107_110000
 Create Date: 2025-11-10 12:00:00.000000
 """
 
@@ -11,8 +11,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "20251110_120000_create_premarket_leaders_lagged"
-down_revision = "20251107_110000_add_ingestion_progress_and_mv"
+revision = "20251110_120000"
+down_revision = "20251107_110000"
 branch_labels = None
 depends_on = None
 
@@ -58,4 +58,3 @@ def downgrade() -> None:
     op.drop_index("ix_premarket_leaders_lagged_symbol", table_name="premarket_leaders_lagged")
     op.drop_index("ix_premarket_leaders_lagged_trade_date", table_name="premarket_leaders_lagged")
     op.drop_table("premarket_leaders_lagged")
-

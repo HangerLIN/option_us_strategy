@@ -32,10 +32,22 @@ def upgrade() -> None:
                     SELECT
                         symbol,
                         time_bucket('1 day', ts_end, 'US/Eastern') AS bucket_start_et,
-                        MIN(CASE WHEN session = 'RTH' THEN ts_end END) AS first_ts_rth,
-                        MAX(CASE WHEN session = 'RTH' THEN ts_end END) AS last_ts_rth,
-                        MAX(high) FILTER (WHERE session = 'RTH') AS high_rth,
-                        MIN(low)  FILTER (WHERE session = 'RTH') AS low_rth
+                        MIN(ts_end) FILTER (
+                            WHERE (ts_end AT TIME ZONE 'US/Eastern')::time >= TIME '09:30'
+                              AND (ts_end AT TIME ZONE 'US/Eastern')::time <  TIME '16:00'
+                        ) AS first_ts_rth,
+                        MAX(ts_end) FILTER (
+                            WHERE (ts_end AT TIME ZONE 'US/Eastern')::time >= TIME '09:30'
+                              AND (ts_end AT TIME ZONE 'US/Eastern')::time <  TIME '16:00'
+                        ) AS last_ts_rth,
+                        MAX(high) FILTER (
+                            WHERE (ts_end AT TIME ZONE 'US/Eastern')::time >= TIME '09:30'
+                              AND (ts_end AT TIME ZONE 'US/Eastern')::time <  TIME '16:00'
+                        ) AS high_rth,
+                        MIN(low) FILTER (
+                            WHERE (ts_end AT TIME ZONE 'US/Eastern')::time >= TIME '09:30'
+                              AND (ts_end AT TIME ZONE 'US/Eastern')::time <  TIME '16:00'
+                        ) AS low_rth
                     FROM bars1m_equity
                     GROUP BY symbol, time_bucket('1 day', ts_end, 'US/Eastern')
                     WITH NO DATA;
@@ -56,6 +68,14 @@ def upgrade() -> None:
         """
         DO $$
         BEGIN
+            IF to_regclass('v_daily_ohlcv') IS NOT NULL THEN
+                BEGIN
+                    EXECUTE 'DROP MATERIALIZED VIEW v_daily_ohlcv CASCADE';
+                EXCEPTION
+                    WHEN wrong_object_type OR undefined_table THEN
+                        EXECUTE 'DROP VIEW v_daily_ohlcv CASCADE';
+                END;
+            END IF;
             IF to_regclass('mv_daily_ohlcv_bounds') IS NULL THEN
                 RAISE NOTICE 'mv_daily_ohlcv_bounds 不存在，跳过 v_daily_ohlcv 创建';
             ELSE
@@ -122,6 +142,9 @@ def upgrade() -> None:
             IF to_regclass('mv_daily_ind_last') IS NULL OR to_regclass('v_daily_ohlcv') IS NULL THEN
                 RAISE NOTICE '缺少依赖视图，跳过 v_daily_atr_pct 创建';
             ELSE
+                IF to_regclass('v_daily_atr_pct') IS NOT NULL THEN
+                    EXECUTE 'DROP VIEW v_daily_atr_pct CASCADE';
+                END IF;
                 EXECUTE $BODY$
                     CREATE OR REPLACE VIEW v_daily_atr_pct AS
                     SELECT

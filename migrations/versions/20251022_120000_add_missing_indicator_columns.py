@@ -6,7 +6,6 @@ Create Date: 2025-10-22 12:00:00
 
 """
 from alembic import op
-import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
@@ -18,26 +17,18 @@ depends_on = None
 
 def upgrade() -> None:
     """添加 indicators_eq_1m 表中缺失的指标列"""
-    
-    # 添加 Stochastic RSI 指标
-    op.add_column('indicators_eq_1m', 
-                  sa.Column('stoch_rsi_k', sa.Double(), nullable=True))
-    op.add_column('indicators_eq_1m', 
-                  sa.Column('stoch_rsi_d', sa.Double(), nullable=True))
-    
-    # 添加 SMA5 和斜率指标
-    op.add_column('indicators_eq_1m', 
-                  sa.Column('sma5', sa.Double(), nullable=True))
-    op.add_column('indicators_eq_1m', 
-                  sa.Column('lr_m5_slope', sa.Double(), nullable=True))
-    op.add_column('indicators_eq_1m', 
-                  sa.Column('lr_boll_dn_slope', sa.Double(), nullable=True))
-    op.add_column('indicators_eq_1m', 
-                  sa.Column('lr_obv_slope', sa.Double(), nullable=True))
-    
-    # 添加 OBV MA6 指标
-    op.add_column('indicators_eq_1m', 
-                  sa.Column('obv_ma6', sa.Double(), nullable=True))
+    op.execute(
+        """
+        ALTER TABLE indicators_eq_1m
+            ADD COLUMN IF NOT EXISTS stoch_rsi_k DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS stoch_rsi_d DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS sma5 DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS lr_m5_slope DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS lr_boll_dn_slope DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS lr_obv_slope DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS obv_ma6 DOUBLE PRECISION;
+        """
+    )
 
 
 def downgrade() -> None:
@@ -49,4 +40,3 @@ def downgrade() -> None:
     op.drop_column('indicators_eq_1m', 'lr_boll_dn_slope')
     op.drop_column('indicators_eq_1m', 'lr_obv_slope')
     op.drop_column('indicators_eq_1m', 'obv_ma6')
-

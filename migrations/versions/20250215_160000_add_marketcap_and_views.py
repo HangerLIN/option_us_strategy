@@ -121,11 +121,14 @@ def upgrade() -> None:
         DO $migration$
         BEGIN
             BEGIN
+                IF to_regclass('v_daily_ohlcv') IS NOT NULL THEN
+                    EXECUTE 'DROP MATERIALIZED VIEW v_daily_ohlcv CASCADE';
+                END IF;
                 EXECUTE $sql$
-                CREATE MATERIALIZED VIEW IF NOT EXISTS v_daily_ohlcv
+                CREATE MATERIALIZED VIEW v_daily_ohlcv
                 WITH (timescaledb.continuous) AS
                 SELECT
-                    time_bucket_ng('1 day', ts_end, 'America/New_York') AS trade_date_et,
+                    time_bucket('1 day', ts_end, 'America/New_York') AS trade_date_et,
                     symbol,
                     first(close, ts_end) FILTER (
                         WHERE (ts_end AT TIME ZONE 'America/New_York')::time >= TIME '09:30'
@@ -159,7 +162,7 @@ def upgrade() -> None:
         """
         DO $$
         BEGIN
-            EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS idx_v_daily_ohlcv_symbol_date ON v_daily_ohlcv (trade_date_et, symbol)';
+            EXECUTE 'CREATE INDEX IF NOT EXISTS idx_v_daily_ohlcv_symbol_date ON v_daily_ohlcv (trade_date_et, symbol)';
         EXCEPTION
             WHEN insufficient_privilege THEN
                 RAISE NOTICE 'Skipping idx_v_daily_ohlcv_symbol_date due to insufficient privileges';
@@ -239,16 +242,7 @@ def upgrade() -> None:
         """
         DO $migration$
         BEGIN
-            BEGIN
-                IF to_regclass('v_daily_ohlcv') IS NOT NULL THEN
-                    EXECUTE 'CALL refresh_continuous_aggregate(''v_daily_ohlcv''::regclass, NULL, NULL);';
-                ELSE
-                    RAISE NOTICE 'Skipping v_daily_ohlcv refresh because view is unavailable';
-                END IF;
-            EXCEPTION
-                WHEN undefined_function THEN
-                    RAISE NOTICE 'TimescaleDB not available, skipping v_daily_ohlcv refresh';
-            END;
+            RAISE NOTICE 'Skipping continuous aggregate refresh during transactional migration';
         END $migration$;
         """
     )

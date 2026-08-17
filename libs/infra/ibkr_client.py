@@ -5,17 +5,21 @@ import itertools
 import logging
 import math
 import random
+import socket
 import threading
 import time as _time
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from queue import Queue
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, TypeVar
 
+from ibapi import comm
 from ibapi.client import EClient
+from ibapi.client import MAX_CLIENT_VER, MIN_CLIENT_VER
 from ibapi.common import BarData, HistoricalTickBidAsk
 from ibapi.contract import Contract, ContractDetails
+from ibapi.order import Order
 from ibapi.scanner import ScannerSubscription
 from ibapi.wrapper import EWrapper
 from ibapi.ticktype import TickTypeEnum
@@ -26,6 +30,13 @@ from libs.core.timeutil import EASTERN, trading_session_window, utc_now
 LOGGER = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+def _ib_make_msg(text: str) -> bytes:
+    try:
+        return comm.make_msg(text)
+    except TypeError:
+        return comm.make_msg(0, False, text)
 
 
 @dataclass
@@ -167,7 +178,7 @@ class IBClient(EWrapper, EClient):
         self._snapshot_requests: Dict[int, MarketDataSnapshot] = {}
         self._historical_tick_requests: Dict[int, HistoricalTickRequest] = {}
 
-        self._contract_cache: Dict[tuple[str, str, str, str], ContractDetails] = {}
+        self._contract_cache: Dict[tuple[Any, ...], ContractDetails] = {}
         self._market_rule_cache: Dict[int, list[Any]] = {}
 
         self._reconnect_lock = threading.Lock()
@@ -247,9 +258,57 @@ class IBClient(EWrapper, EClient):
     # ---------------------------------------------------------------------
     # Connection management
     # ---------------------------------------------------------------------
+    def _verify_api_handshake(self, timeout: float) -> None:
+        probe_timeout = min(3.0, max(1.0, timeout))
+        try:
+            with socket.create_connection(
+                (self._settings.ib_host, int(self._settings.ib_port)),
+                timeout=min(2.0, probe_timeout),
+            ) as sock:
+                sock.settimeout(probe_timeout)
+                version = f"v{MIN_CLIENT_VER}..{MAX_CLIENT_VER}"
+                sock.sendall(b"API\0" + _ib_make_msg(version))
+                buffer = b""
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    _, message, _ = comm.read_msg(buffer)
+                    if message:
+                        fields = comm.read_fields(message)
+                        if len(fields) >= 2:
+                            first = fields[0]
+                            if isinstance(first, bytes):
+                                first = first.decode("ascii", errors="ignore")
+                            if str(first).isdigit():
+                                return
+                        raise ConnectionError(
+                            "IBKR API socket returned an unexpected handshake response: "
+                            f"{fields!r}"
+                        )
+        except TimeoutError as exc:
+            raise TimeoutError(
+                "IBKR API socket accepted TCP but did not respond to the API handshake at "
+                f"{self._settings.ib_host}:{self._settings.ib_port}. "
+                "Verify TWS/IB Gateway is fully logged in and API socket clients are enabled."
+            ) from exc
+        except OSError as exc:
+            raise ConnectionError(
+                "IBKR API socket is not reachable at "
+                f"{self._settings.ib_host}:{self._settings.ib_port}. "
+                "Enable ActiveX and Socket EClients in TWS/IB Gateway and verify the socket port."
+            ) from exc
+        raise ConnectionError(
+            "IBKR API socket closed before completing the API handshake at "
+            f"{self._settings.ib_host}:{self._settings.ib_port}."
+        )
+
     def connect_and_wait(self, timeout: float = 30.0) -> None:
         if self.isConnected():
             return
+
+        self._verify_api_handshake(timeout)
 
         LOGGER.info(
             "Connecting to IBKR host=%s port=%s clientId=%s",
@@ -298,6 +357,10 @@ class IBClient(EWrapper, EClient):
         with self._reconnect_lock:
             if self.isConnected() or self._shutting_down:
                 return
+            try:
+                super().disconnect()
+            except Exception:
+                LOGGER.debug("Ignoring disconnect error before reconnect", exc_info=True)
             backoff = 2
             while not self._shutting_down:
                 try:
@@ -373,17 +436,24 @@ class IBClient(EWrapper, EClient):
         contract.currency = currency
         contract.lastTradeDateOrContractMonth = expiry
         contract.strike = float(strike)
-        contract.right = right.upper()
+        right_upper = right.upper()
+        contract.right = {"CALL": "C", "PUT": "P"}.get(right_upper, right_upper)
         contract.multiplier = multiplier
         contract.includeExpired = include_expired
         if conid is not None:
             contract.conId = int(conid)
         return contract
 
-    def _cache_key(self, contract: Contract) -> tuple[str, str, str, str]:
+    def _cache_key(self, contract: Contract) -> tuple[Any, ...]:
         return (
+            int(contract.conId or 0),
             contract.symbol,
             contract.secType,
+            contract.lastTradeDateOrContractMonth or "",
+            float(contract.strike or 0),
+            contract.right or "",
+            contract.multiplier or "",
+            contract.tradingClass or "",
             contract.exchange or "SMART",
             contract.currency or "USD",
         )
@@ -921,9 +991,15 @@ class IBClient(EWrapper, EClient):
         currency: str = "USD",
     ) -> list[Mapping[str, Any]]:
         """
-        Convenience wrapper that fetches a full US RTH session (09:30-16:00 ET) in 1 minute bars.
+        Convenience wrapper that fetches US equity minute bars for a trade date.
+
+        When ``rth_only`` is false we intentionally widen the request window to
+        include the premarket session so the caller receives 09:xx bars and can
+        compute indicators on that context as part of the same pipeline.
         """
         start_et, end_et = trading_session_window(session_date, tz=EASTERN)
+        if not rth_only:
+            start_et = datetime.combine(session_date, time(8, 0), tzinfo=EASTERN)
         # include the last minute by shifting end forward 1 minute
         start_utc = start_et.astimezone(timezone.utc)
         end_utc = (end_et + timedelta(minutes=1)).astimezone(timezone.utc)
@@ -1316,23 +1392,36 @@ class IBClient(EWrapper, EClient):
         theta: float,
         undPrice: float,
     ) -> None:
+        def _valid_number(value: Any, *, positive: bool = False) -> bool:
+            if value is None:
+                return False
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return False
+            if math.isnan(numeric):
+                return False
+            if positive and numeric <= 0:
+                return False
+            return True
+
         payload: dict[str, Any] = {"type": "greeks"}
-        if not math.isnan(impliedVol) and impliedVol > 0:
+        if _valid_number(impliedVol, positive=True):
             self._record_snapshot_value(reqId, "implied_vol", impliedVol)
             payload["implied_vol"] = impliedVol
-        if not math.isnan(delta):
+        if _valid_number(delta):
             self._record_snapshot_value(reqId, "delta", delta)
             payload["delta"] = delta
-        if not math.isnan(gamma):
+        if _valid_number(gamma):
             self._record_snapshot_value(reqId, "gamma", gamma)
             payload["gamma"] = gamma
-        if not math.isnan(vega):
+        if _valid_number(vega):
             self._record_snapshot_value(reqId, "vega", vega)
             payload["vega"] = vega
-        if not math.isnan(theta):
+        if _valid_number(theta):
             self._record_snapshot_value(reqId, "theta", theta)
             payload["theta"] = theta
-        if not math.isnan(undPrice) and undPrice > 0:
+        if _valid_number(undPrice, positive=True):
             self._record_snapshot_value(reqId, "underlying_price", undPrice)
             payload["underlying_price"] = undPrice
         alias = self._req_symbol.get(reqId)
@@ -1347,7 +1436,7 @@ class IBClient(EWrapper, EClient):
             snapshot.done.set()
 
     def historicalData(self, reqId: int, bar: BarData) -> None:  # noqa: N802
-        LOGGER.info(f"🔔 historicalData callback reqId={reqId} bar.date={bar.date} close={bar.close}")
+        LOGGER.debug("historicalData callback reqId=%s bar.date=%s close=%s", reqId, bar.date, bar.close)
         future = self._historical_requests.get(reqId)
         if future is None:
             LOGGER.warning(f"historicalData: reqId={reqId} not found in _historical_requests")
@@ -1480,36 +1569,58 @@ class IBClient(EWrapper, EClient):
         else:
             self._market_rule_cache[marketRuleId] = priceIncrements
 
-    def error(self, reqId: int, errorCode: int, errorString: str) -> None:  # noqa: N802
-        LOGGER.warning("IBKR error reqId=%s code=%s message=%s", reqId, errorCode, errorString)
+    def error(  # noqa: N802
+        self,
+        reqId: int,
+        errorTime: int | None = None,
+        errorCode: int | None = None,
+        errorString: str | None = None,
+        advancedOrderRejectJson: str = "",
+    ) -> None:
+        if errorString is None and isinstance(errorCode, str):
+            errorString = errorCode
+            errorCode = int(errorTime or -1)
+            errorTime = None
+        normalized_code = int(errorCode or -1)
+        normalized_text = str(errorString or "")
+        LOGGER.warning(
+            "IBKR error reqId=%s errorTime=%s code=%s message=%s advanced=%s",
+            reqId,
+            errorTime,
+            normalized_code,
+            normalized_text,
+            bool(advancedOrderRejectJson),
+        )
         
         # 2176是小数股警告，数据仍会返回，不应终止请求
         # 2100-2199很多是警告，不是致命错误
-        is_warning = errorCode in (2176,) or (2100 <= errorCode < 2200 and errorCode in (2103, 2104, 2106, 2107, 2158))
+        is_warning = normalized_code in (2176,) or (
+            2100 <= normalized_code < 2200 and normalized_code in (2103, 2104, 2106, 2107, 2157, 2158)
+        )
         
         if reqId in self._historical_requests and not is_warning:
             hist_future = self._historical_requests.pop(reqId)
-            hist_future.error = errorString
+            hist_future.error = normalized_text
             hist_future.done.set()
         if reqId in self._contract_requests and not is_warning:
             contract_future = self._contract_requests.pop(reqId)
-            contract_future.error = errorString
+            contract_future.error = normalized_text
             contract_future.done.set()
         if reqId in self._scanner_requests and not is_warning:
             scanner_future = self._scanner_requests.pop(reqId)
-            scanner_future.error = errorString
+            scanner_future.error = normalized_text
             scanner_future.done.set()
         if reqId in self._option_requests and not is_warning:
             option_future = self._option_requests.pop(reqId)
-            option_future.error = errorString
+            option_future.error = normalized_text
             option_future.done.set()
         if reqId in self._historical_tick_requests and not is_warning:
             tick_future = self._historical_tick_requests.pop(reqId)
-            tick_future.error = errorString
+            tick_future.error = normalized_text
             tick_future.done.set()
         if reqId in self._snapshot_requests:
             snapshot_future = self._snapshot_requests[reqId]
-            snapshot_future.error = errorString
+            snapshot_future.error = normalized_text
             snapshot_future.done.set()
 
         if errorCode in {1100, 1101, 1102} and not self._shutting_down:
@@ -1554,7 +1665,9 @@ class IBClient(EWrapper, EClient):
         start_utc = start.astimezone(timezone.utc)
         attempts = 0
         while current_end > start_utc:
-            self._historical_bucket.consume()
+            self._historical_bucket.consume(
+                timeout=max(75.0, float(self._settings.ib_historical_refill_seconds) + 15.0)
+            )
             req_id = next(self._req_id_counter)
             future = HistoricalTickRequest()
             self._historical_tick_requests[req_id] = future
@@ -1875,9 +1988,33 @@ class IBClient(EWrapper, EClient):
 
 
 def build_ibkr_client(settings: Settings) -> IBClient:
-    client = IBClient(settings)
-    client.connect_and_wait()
-    return client
+    delay_seconds = 1.0
+    attempts = 3
+    last_error: TimeoutError | None = None
+    for attempt in range(1, attempts + 1):
+        client = IBClient(settings)
+        try:
+            client.connect_and_wait()
+            return client
+        except TimeoutError as exc:
+            client.disconnect_and_stop()
+            last_error = exc
+            if attempt >= attempts:
+                raise
+            LOGGER.warning(
+                "IBKR connect timed out on attempt %s/%s; retrying in %.1fs",
+                attempt,
+                attempts,
+                delay_seconds,
+            )
+            _time.sleep(delay_seconds)
+            delay_seconds = min(delay_seconds * 2, 5.0)
+        except Exception:
+            client.disconnect_and_stop()
+            raise
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("IBKR client initialization exhausted retries without returning a client")
 
 
 def get_next_order_id(client: IBClient) -> int:

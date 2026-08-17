@@ -13,6 +13,10 @@ from .models import (
     BacktestMetricTotal,
     BacktestRun,
     BacktestTop5,
+    CalibrationArtifact,
+    CalibrationMetric,
+    CalibrationParam,
+    CalibrationRun,
     ComplianceWhitelistLargecap,
     Fill,
     Order,
@@ -41,24 +45,36 @@ class StrategyPositionDAO:
         strategy_code: str | None = None,
         symbol: str | None = None,
         option_right: str | None = None,
+        asset_type: str | None = None,
     ) -> Sequence[StrategyPosition]:
         query = select(StrategyPosition)
         if strategy_code:
             query = query.where(StrategyPosition.strategy_code == strategy_code)
         if symbol:
             query = query.where(StrategyPosition.symbol == symbol)
+        if asset_type:
+            query = query.where(StrategyPosition.asset_type == self._asset_type_value(asset_type))
         if option_right:
             query = query.where(StrategyPosition.option_right == option_right)
         return self._session.execute(query).scalars().all()
 
     def get_position(
-        self, strategy_code: str, symbol: str, option_right: str
+        self,
+        strategy_code: str,
+        symbol: str,
+        option_right: str | None,
+        asset_type: str = "OPTION",
     ) -> StrategyPosition | None:
+        asset_type_value = self._asset_type_value(asset_type)
         stmt = select(StrategyPosition).where(
             StrategyPosition.strategy_code == strategy_code,
             StrategyPosition.symbol == symbol,
-            StrategyPosition.option_right == option_right,
+            StrategyPosition.asset_type == asset_type_value,
         )
+        if option_right is None:
+            stmt = stmt.where(StrategyPosition.option_right.is_(None))
+        else:
+            stmt = stmt.where(StrategyPosition.option_right == option_right)
         return self._session.execute(stmt).scalar_one_or_none()
 
     def apply_option_fill(
@@ -78,19 +94,62 @@ class StrategyPositionDAO:
         signal_code: str | None,
         filled_at: datetime,
     ) -> tuple[Decimal, StrategyPosition]:
+        return self.apply_fill(
+            strategy_code=strategy_code,
+            symbol=symbol,
+            asset_type="OPTION",
+            option_right=option_right,
+            side=side,
+            quantity=quantity,
+            price=price,
+            fees=fees,
+            delta=delta,
+            conid=conid,
+            strike=strike,
+            expiry=expiry,
+            signal_code=signal_code,
+            filled_at=filled_at,
+        )
+
+    def apply_fill(
+        self,
+        *,
+        strategy_code: str,
+        symbol: str,
+        asset_type: str = "OPTION",
+        option_right: str | None = None,
+        side: str,
+        quantity: Decimal,
+        price: Decimal,
+        fees: Decimal,
+        delta: float | None = None,
+        conid: int | None = None,
+        strike: Decimal | None = None,
+        expiry: date | None = None,
+        signal_code: str | None = None,
+        filled_at: datetime,
+    ) -> tuple[Decimal, StrategyPosition]:
+        asset_type_value = self._asset_type_value(asset_type)
+        if asset_type_value == "OPTION" and option_right is None:
+            raise ValueError("OPTION fill requires option_right")
         quantity = Decimal(str(quantity))
         price = Decimal(str(price))
         signed_qty = quantity if side.upper() == "BUY" else -quantity
         stmt = select(StrategyPosition).where(
             StrategyPosition.strategy_code == strategy_code,
             StrategyPosition.symbol == symbol,
-            StrategyPosition.option_right == option_right,
+            StrategyPosition.asset_type == asset_type_value,
         )
+        if option_right is None:
+            stmt = stmt.where(StrategyPosition.option_right.is_(None))
+        else:
+            stmt = stmt.where(StrategyPosition.option_right == option_right)
         position = self._session.execute(stmt).scalar_one_or_none()
         if position is None:
             position = StrategyPosition(
                 strategy_code=strategy_code,
                 symbol=symbol,
+                asset_type=asset_type_value,
                 option_right=option_right,
                 open_quantity=0,
                 avg_open_price=Decimal("0"),
@@ -147,14 +206,22 @@ class StrategyPositionDAO:
         return realized, position
 
     def close_position(
-        self, strategy_code: str, symbol: str, option_right: str
+        self,
+        strategy_code: str,
+        symbol: str,
+        option_right: str | None,
+        asset_type: str = "OPTION",
     ) -> StrategyPosition | None:
-        position = self.get_position(strategy_code, symbol, option_right)
+        position = self.get_position(strategy_code, symbol, option_right, asset_type=asset_type)
         if position is None:
             return None
         position.open_quantity = 0
         self._session.add(position)
         return position
+
+    @staticmethod
+    def _asset_type_value(asset_type: object) -> str:
+        return str(getattr(asset_type, "value", asset_type)).upper()
 
 
 class OrdersDAO:
@@ -270,6 +337,10 @@ class BacktestResultDAO:
         strategy_code: str,
         started_at: datetime,
         status: str,
+        strategy_version: str | None = None,
+        calibration_version: str | None = None,
+        data_window_start: datetime | None = None,
+        data_window_end: datetime | None = None,
         parameters: Mapping[str, Any] | None = None,
         notes: str | None = None,
     ) -> BacktestRun:
@@ -277,6 +348,10 @@ class BacktestResultDAO:
             strategy_code=strategy_code,
             started_at=started_at,
             status=status,
+            strategy_version=strategy_version,
+            calibration_version=calibration_version,
+            data_window_start=data_window_start,
+            data_window_end=data_window_end,
             parameters=dict(parameters) if parameters else None,
             notes=notes,
         )
@@ -484,6 +559,7 @@ class PnLDAO:
         *,
         strategy_code: str,
         symbol: str,
+        asset_type: str = "OPTION",
         side: str,
         quantity: Decimal,
         price: Decimal,
@@ -495,11 +571,15 @@ class PnLDAO:
         fees = Decimal(fees)
         signed_qty = quantity if side.upper() == "BUY" else -quantity
 
-        position = self._session.get(Position, {"strategy_code": strategy_code, "symbol": symbol})
+        position = self._session.get(
+            Position,
+            {"strategy_code": strategy_code, "asset_type": asset_type, "symbol": symbol},
+        )
         if position is None:
             position = Position(
                 strategy_code=strategy_code,
                 symbol=symbol,
+                asset_type=asset_type,
                 quantity=Decimal("0"),
                 avg_price=Decimal("0"),
                 unrealized_pnl=Decimal("0"),
@@ -540,6 +620,7 @@ class PnLDAO:
             ts=filled_at,
             strategy_code=strategy_code,
             symbol=symbol,
+            asset_type=asset_type,
             realized=net_realized,
             unrealized=Decimal("0"),
             fees=fees,
@@ -548,6 +629,7 @@ class PnLDAO:
             ts=filled_at,
             strategy_code=strategy_code,
             symbol=symbol,
+            asset_type=asset_type,
             realized=net_realized,
             unrealized=Decimal("0"),
             fees=fees,
@@ -561,18 +643,26 @@ class PnLDAO:
         ts: datetime,
         strategy_code: str,
         symbol: str,
+        asset_type: str,
         realized: Decimal,
         unrealized: Decimal,
         fees: Decimal,
     ) -> None:
         record = self._session.get(
-            PnLIntraday, {"ts": ts, "strategy_code": strategy_code, "symbol": symbol}
+            PnLIntraday,
+            {
+                "ts": ts,
+                "strategy_code": strategy_code,
+                "asset_type": asset_type,
+                "symbol": symbol,
+            },
         )
         if record is None:
             record = PnLIntraday(
                 ts=ts,
                 strategy_code=strategy_code,
                 symbol=symbol,
+                asset_type=asset_type,
                 realized=realized,
                 unrealized=unrealized,
                 fees=fees,
@@ -589,6 +679,7 @@ class PnLDAO:
         ts: datetime,
         strategy_code: str,
         symbol: str,
+        asset_type: str,
         realized: Decimal,
         unrealized: Decimal,
         fees: Decimal,
@@ -596,13 +687,19 @@ class PnLDAO:
         trade_date = ts.astimezone(timezone.utc).date()
         record = self._session.get(
             PnLDaily,
-            {"trade_date": trade_date, "strategy_code": strategy_code, "symbol": symbol},
+            {
+                "trade_date": trade_date,
+                "strategy_code": strategy_code,
+                "asset_type": asset_type,
+                "symbol": symbol,
+            },
         )
         if record is None:
             record = PnLDaily(
                 trade_date=trade_date,
                 strategy_code=strategy_code,
                 symbol=symbol,
+                asset_type=asset_type,
                 realized=realized,
                 unrealized=unrealized,
                 fees=fees,
@@ -669,12 +766,14 @@ class SignalLogDAO:
         symbol: str,
         signal_code: str,
         ts_end: datetime,
+        asset_type: str = "OPTION",
         accepted: bool | None = None,
         reason: str | None = None,
     ) -> BacktestSignal:
         entry = BacktestSignal(
             run_id=run_id,
             symbol=symbol,
+            asset_type=asset_type,
             signal_code=signal_code,
             ts_end=ts_end,
             accepted=accepted,

@@ -6,6 +6,8 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
+from libs.schemas.assets import AssetType
+
 
 class OrderSide(str, Enum):
     BUY = "BUY"
@@ -13,6 +15,7 @@ class OrderSide(str, Enum):
 
 
 class ExecutionMode(str, Enum):
+    ADAPTIVE = "ADAPTIVE"
     PASSIVE = "PASSIVE"
     MARKETABLE = "MARKETABLE"
     FORCE = "FORCE"
@@ -21,6 +24,7 @@ class ExecutionMode(str, Enum):
 class ExecutionRequest(BaseModel):
     strategy_code: str = Field(..., max_length=32)
     symbol: str = Field(..., max_length=32)
+    asset_type: AssetType = AssetType.OPTION
     side: OrderSide
     quantity: int = Field(..., gt=0)
     limit_price: Decimal = Field(..., gt=0)
