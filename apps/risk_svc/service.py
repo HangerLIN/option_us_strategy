@@ -31,6 +31,7 @@ from libs.infra.metrics import (
 )
 from libs.infra import build_ibkr_client, IBClient
 from libs.infra.redis_bus import RedisBus
+from libs.schemas.assets import AssetType
 from libs.schemas.risk import RiskCheckRequest, RiskLimits
 from libs.schemas.signals import BUY_SIGNAL_CODES
 from .block_store import RedisBlockStore
@@ -87,6 +88,7 @@ class RiskService:
         self._preearn_days_min = int(settings.preearn_days_min)
         self._preearn_days_max = int(settings.preearn_days_max)
         self._preearn_atr_pct_max = Decimal(str(settings.preearn_atr_pct_max))
+        self._option_liquidity_required = bool(settings.option_liquidity_required)
         self._sync_limits()
         self._concurrency_window = timedelta(minutes=10)
         self._opening_time = time(9, 30)
@@ -538,7 +540,7 @@ class RiskService:
         reasons: Dict[str, object] = {}
         symbol_block_until: Optional[datetime] = None
         option_snapshot: Dict[str, Any] | None = None
-        if payload.signal_code in self._BUY_SIGNALS:
+        if payload.asset_type == AssetType.OPTION and payload.signal_code in self._BUY_SIGNALS:
             passed, snapshot = self._check_option_liquidity(payload)
             option_snapshot = snapshot
             if not passed:
@@ -672,7 +674,13 @@ class RiskService:
     def _check_option_liquidity(self, payload: RiskCheckRequest) -> Tuple[bool, Dict[str, Any]]:
         """基于风控请求中附带的合约细节判断期权流动性是否达标。"""
         snapshot: Dict[str, Any] = {"pass": True, "reason": "insufficient_data"}
+        if payload.asset_type != AssetType.OPTION:
+            snapshot["reason"] = "non_option_asset"
+            return True, snapshot
         if payload.signal_code not in self._BUY_SIGNALS:
+            return True, snapshot
+        if not self._option_liquidity_required:
+            snapshot["reason"] = "disabled_by_config"
             return True, snapshot
         bid = payload.option_bid
         ask = payload.option_ask
@@ -683,6 +691,7 @@ class RiskService:
         mid = payload.option_mid
         spread = payload.option_spread
         dte = payload.option_dte
+        quote_ts = payload.option_quote_ts
         snapshot.update(
             {
                 "bid": float(bid) if bid is not None else None,
@@ -694,6 +703,7 @@ class RiskService:
                 "mid": float(mid) if mid is not None else None,
                 "spread": float(spread) if spread is not None else None,
                 "dte": dte,
+                "quote_ts": quote_ts.isoformat() if quote_ts is not None else None,
             }
         )
         if None in (bid, ask, oi, volume):
@@ -707,6 +717,27 @@ class RiskService:
             snapshot["spread"] = float(spread)
         threshold = max(Decimal("0.10"), mid * Decimal("0.05"))
         snapshot["threshold"] = float(threshold)
+        if quote_ts is not None:
+            age_seconds = max(0.0, (payload.timestamp - quote_ts).total_seconds())
+            snapshot["quote_age_seconds"] = age_seconds
+            if age_seconds > 60:
+                snapshot["pass"] = False
+                snapshot["reason"] = "stale_quote"
+                LOGGER.info(
+                    "risk_service.option_liquidity_stale_quote",
+                    symbol=payload.symbol,
+                    snapshot=snapshot,
+                )
+                return False, snapshot
+        if (
+            payload.allow_missing_option_liquidity_metrics
+            and oi == 0
+            and volume == 0
+            and spread <= threshold
+        ):
+            snapshot["reason"] = "quote_only_missing_oi_volume"
+            snapshot["missing_metrics_fallback"] = True
+            return True, snapshot
         if oi < 500 or volume < 100 or spread > threshold:
             snapshot["pass"] = False
             snapshot["reason"] = "volume_or_spread"

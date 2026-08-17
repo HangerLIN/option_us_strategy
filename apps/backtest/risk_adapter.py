@@ -4,13 +4,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Iterable
+from collections import defaultdict
+import fnmatch
 
 import httpx
 from sqlalchemy.orm import sessionmaker
 
 from apps.risk_svc.service import RiskDecision as ServiceRiskDecision, RiskService, ExposureView
+from apps.risk_svc.block_store import RedisBlockStore
 from libs.core import get_settings
 from libs.db import StrategyPositionDAO
+from libs.schemas.assets import AssetType
 from libs.schemas.risk import RiskCheckRequest
 from libs.schemas.signals import BUY_SIGNAL_CODES
 
@@ -29,13 +33,14 @@ class OrderIntent:
     side: str
     quantity: Decimal
     limit_price: Decimal
-    option_right: str
+    option_right: str | None
     timestamp: datetime
     trace_id: str
     exposures: Iterable[ExposureLike]
     current_notional: Decimal
     pending_notional: Decimal
     utilisation: float
+    asset_type: AssetType = AssetType.OPTION
     implied_vol: float | None = None
     option_strike: Decimal | None = None
     option_expiry: str | datetime | None = None
@@ -47,6 +52,8 @@ class OrderIntent:
     option_spread: Decimal | None = None
     option_dte: int | None = None
     option_otm_steps: int | None = None
+    option_quote_ts: datetime | None = None
+    allow_missing_option_liquidity_metrics: bool = False
 
 
 @dataclass
@@ -62,6 +69,7 @@ class RiskCtx:
     mode: str
     session_factory: sessionmaker
     base_url: str | None = None
+    allow_missing_option_liquidity_metrics: bool = False
 
     def __post_init__(self) -> None:
         self.mode = self.mode.lower()
@@ -75,7 +83,44 @@ class RiskCtx:
             RiskService._BUY_SIGNALS = BUY_SIGNAL_CODES
             self._risk_service = RiskService(self.session_factory, redis_url=settings.redis_url)
             self._risk_service._BUY_SIGNALS = BUY_SIGNAL_CODES
+            if self.mode == "inproc":
+                fake_redis = _EphemeralRedis()
+                self._risk_service._redis = None
+                self._risk_service._blocks = RedisBlockStore(None, client=fake_redis)
         return self._risk_service
+
+
+class _EphemeralRedis:
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+        self.zsets: dict[str, dict[str, float]] = defaultdict(dict)
+        self.ttl: dict[str, int] = {}
+
+    def get(self, key: str) -> str | None:
+        return self.store.get(key)
+
+    def set(self, key: str, value: str, ex: int | None = None) -> None:
+        self.store[key] = value
+        if ex is not None:
+            self.ttl[key] = ex
+
+    def setex(self, key: str, ttl: int, value: str) -> None:
+        self.set(key, value, ex=ttl)
+
+    def delete(self, key: str) -> None:
+        self.store.pop(key, None)
+        self.zsets.pop(key, None)
+
+    def expire(self, key: str, ttl: int) -> None:
+        self.ttl[key] = ttl
+
+    def scan(
+        self, cursor: int = 0, match: str | None = None, count: int | None = None
+    ) -> tuple[int, list[str]]:
+        keys = list(self.store.keys())
+        if match is not None:
+            keys = [key for key in keys if fnmatch.fnmatch(key, match)]
+        return 0, keys
 
 
 def build_risk_precheck(ctx: RiskCtx):
@@ -95,6 +140,7 @@ def _risk_precheck_inproc(ctx: RiskCtx, intent: OrderIntent) -> RiskResult:
     request = RiskCheckRequest(
         strategy_code=intent.strategy_code,
         symbol=intent.symbol,
+        asset_type=intent.asset_type,
         notional=intent.pending_notional,
         implied_vol=float(intent.implied_vol or 0.0),
         timestamp=intent.timestamp,
@@ -114,6 +160,8 @@ def _risk_precheck_inproc(ctx: RiskCtx, intent: OrderIntent) -> RiskResult:
         option_spread=intent.option_spread,
         option_dte=intent.option_dte,
         option_otm_steps=intent.option_otm_steps,
+        option_quote_ts=intent.option_quote_ts,
+        allow_missing_option_liquidity_metrics=intent.allow_missing_option_liquidity_metrics,
     )
 
     decision: ServiceRiskDecision = service.evaluate_order(
@@ -140,6 +188,7 @@ def _risk_precheck_http(ctx: RiskCtx, intent: OrderIntent) -> RiskResult:
     payload = {
         "strategy_code": intent.strategy_code,
         "symbol": intent.symbol,
+        "asset_type": intent.asset_type.value,
         "notional": str(intent.pending_notional),
         "implied_vol": intent.implied_vol or 0.0,
         "timestamp": intent.timestamp.isoformat(),
@@ -161,6 +210,8 @@ def _risk_precheck_http(ctx: RiskCtx, intent: OrderIntent) -> RiskResult:
         "option_spread": intent.option_spread,
         "option_dte": intent.option_dte,
         "option_otm_steps": intent.option_otm_steps,
+        "option_quote_ts": intent.option_quote_ts.isoformat() if intent.option_quote_ts else None,
+        "allow_missing_option_liquidity_metrics": intent.allow_missing_option_liquidity_metrics,
     }
     for key, value in extra_fields.items():
         if value is None:

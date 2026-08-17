@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
-from datetime import date, datetime, time, timezone
+import logging
+import time as time_module
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Iterable, Sequence
 
+from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker
 
 from apps.backtest.dao import BacktestDAO
@@ -15,6 +18,8 @@ from apps.backtest.data_prep.ingest_equity_1m_ibkr import (
     _recompute_indicators,
     _store_equity_rows,
 )
+
+LOGGER = logging.getLogger("backfill_window")
 
 
 def _parse_time(value: str) -> time:
@@ -67,13 +72,18 @@ def parse_args() -> argparse.Namespace:
         "--window-end",
         default="09:31",
         type=_parse_time,
-        help="Premarket window end time in ET, exclusive (default 09:31).",
+        help="Premarket window end time in ET, inclusive (default 09:31).",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=10,
         help="Number of symbols processed per IB connection batch (default 10).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-fetch the window even when bars and indicators already look complete.",
     )
     return parser.parse_args()
 
@@ -96,6 +106,41 @@ def _resolve_symbols(
         return universe.symbols
 
 
+def _window_bounds_utc(trade_date: date, start_time: time, end_time: time) -> tuple[datetime, datetime]:
+    start_et = datetime.combine(trade_date, start_time, tzinfo=EASTERN)
+    end_et = datetime.combine(trade_date, end_time, tzinfo=EASTERN)
+    return start_et.astimezone(timezone.utc), end_et.astimezone(timezone.utc)
+
+
+def _expected_minutes(start_utc: datetime, end_utc: datetime) -> int:
+    return max(1, int((end_utc - start_utc).total_seconds() // 60))
+
+
+def _count_rows(
+    session_factory: sessionmaker,
+    table_name: str,
+    symbol: str,
+    start_utc: datetime,
+    end_utc: datetime,
+) -> int:
+    with session_factory() as session:
+        return int(
+            session.execute(
+                text(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {table_name}
+                    WHERE symbol = :symbol
+                      AND ts_end > :start_ts
+                      AND ts_end <= :end_ts
+                    """
+                ),
+                {"symbol": symbol, "start_ts": start_utc, "end_ts": end_utc},
+            ).scalar()
+            or 0
+        )
+
+
 def _backfill_window(
     *,
     session_factory: sessionmaker,
@@ -104,15 +149,34 @@ def _backfill_window(
     trade_date: date,
     start_time: time,
     end_time: time,
+    force: bool,
 ) -> int:
-    from datetime import timedelta
-    start_et = datetime.combine(trade_date, start_time, tzinfo=EASTERN)
-    end_et = datetime.combine(trade_date, end_time, tzinfo=EASTERN)
-    # IBKR endDateTime 包含该分钟，所以需要减1分钟以获取正确的范围
-    # 例如：要获取 [09:25, 09:30]，需要 endDateTime = 09:30（而不是 09:31）
-    end_et = end_et - timedelta(minutes=1)
-    start_utc = start_et.astimezone(timezone.utc)
-    end_utc = end_et.astimezone(timezone.utc)
+    start_utc, end_utc = _window_bounds_utc(trade_date, start_time, end_time)
+    expected = _expected_minutes(start_utc, end_utc)
+
+    existing_bars = _count_rows(session_factory, "bars1m_equity", symbol, start_utc, end_utc)
+    existing_indicators = _count_rows(
+        session_factory, "indicators_eq_1m", symbol, start_utc, end_utc
+    )
+    if not force and existing_bars >= expected:
+        if existing_indicators < expected:
+            LOGGER.info(
+                "recompute indicators symbol=%s trade_date=%s indicators=%d expected=%d",
+                symbol,
+                trade_date.isoformat(),
+                existing_indicators,
+                expected,
+            )
+            _recompute_indicators(session_factory, symbol, trade_date)
+        else:
+            LOGGER.info(
+                "skip complete symbol=%s trade_date=%s bars=%d expected=%d",
+                symbol,
+                trade_date.isoformat(),
+                existing_bars,
+                expected,
+            )
+        return 0
 
     bars: Sequence[dict[str, object]] = client.req_historical_1m(
         symbol=symbol,
@@ -123,13 +187,61 @@ def _backfill_window(
     records = _bars_to_records(bars)
     if not records:
         return 0
-    # Filter once more inside the window (IB may return trailing minute equal to end_ts)
-    filtered = [row for row in records if start_utc <= row["ts_end"] < end_utc]
+    start_et_naive = start_utc.astimezone(EASTERN).replace(tzinfo=None)
+    end_et_naive = end_utc.astimezone(EASTERN).replace(tzinfo=None)
+    filtered = [row for row in records if start_et_naive < row["ts_end"] <= end_et_naive]
     if not filtered:
         return 0
     _store_equity_rows(session_factory, symbol, filtered)
     _recompute_indicators(session_factory, symbol, trade_date)
+    LOGGER.info(
+        "backfilled symbol=%s trade_date=%s records=%d",
+        symbol,
+        trade_date.isoformat(),
+        len(filtered),
+    )
     return len(filtered)
+
+
+def _backfill_window_with_retry(
+    *,
+    session_factory: sessionmaker,
+    client,
+    symbol: str,
+    trade_date: date,
+    start_time: time,
+    end_time: time,
+    force: bool,
+    max_attempts: int = 4,
+) -> int:
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _backfill_window(
+                session_factory=session_factory,
+                client=client,
+                symbol=symbol,
+                trade_date=trade_date,
+                start_time=start_time,
+                end_time=end_time,
+                force=force,
+            )
+        except Exception as exc:
+            last_exc = exc
+            wait_seconds = 5 * attempt
+            LOGGER.warning(
+                "backfill retry symbol=%s trade_date=%s attempt=%d/%d wait=%ds error=%s",
+                symbol,
+                trade_date.isoformat(),
+                attempt,
+                max_attempts,
+                wait_seconds,
+                exc,
+            )
+            if attempt == max_attempts:
+                break
+            time_module.sleep(wait_seconds)
+    raise RuntimeError(f"Failed to backfill {symbol} {trade_date}: {last_exc}")
 
 
 def _batched(iterable: Sequence[str], batch_size: int) -> Iterable[Sequence[str]]:
@@ -166,18 +278,19 @@ def main() -> int:
             for symbol in batch:
                 batch_total = 0
                 for trade_date in trade_dates:
-                    inserted = _backfill_window(
+                    inserted = _backfill_window_with_retry(
                         session_factory=session_factory,
                         client=client,
                         symbol=symbol,
                         trade_date=trade_date,
                         start_time=args.window_start,
                         end_time=args.window_end,
+                        force=args.force,
                     )
                     batch_total += inserted
                 total_records += batch_total
         finally:
-            client.disconnect()
+            client.disconnect_and_stop()
     print(f"Backfill complete. Total records inserted: {total_records}")
     return 0
 

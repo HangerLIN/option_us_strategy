@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 import structlog
 
 from libs.infra.redis_bus import RedisBus
+from libs.schemas.assets import AssetType
 from libs.schemas.events import ExecutionFill, RiskParamReload
 from libs.schemas.risk import RiskLimits
 from libs.db.dao import PnLIntradayDAO, RiskStateDAO, StrategyPositionDAO
@@ -185,7 +186,7 @@ class RiskStreamConsumers:
                 execution_id=fill.execution_id,
             )
         option_right = fill.option_right
-        if option_right is None:
+        if fill.asset_type == AssetType.OPTION and option_right is None:
             LOGGER.warning(
                 "risk_subscriber.fill_missing_option",
                 trace_id=trace_id,
@@ -203,9 +204,10 @@ class RiskStreamConsumers:
         session: Session = self._session_factory()
         try:
             position_dao = StrategyPositionDAO(session)
-            realized, position = position_dao.apply_option_fill(
+            realized, position = position_dao.apply_fill(
                 strategy_code=strategy_code,
                 symbol=fill.symbol,
+                asset_type=fill.asset_type.value,
                 option_right=option_right,
                 side=fill.side,
                 quantity=fill.fill_quantity,
@@ -227,6 +229,7 @@ class RiskStreamConsumers:
                         "ts": filled_at,
                         "strategy_code": strategy_code,
                         "symbol": fill.symbol,
+                        "asset_type": fill.asset_type.value,
                         "realized": realized,
                         "unrealized": Decimal("0"),
                         "fees": fees,
@@ -245,7 +248,8 @@ class RiskStreamConsumers:
             realized_total = realized_previous + realized_delta
             net_qty = Decimal(str(position.open_quantity))
             mark_price = Decimal(str(position.mark_price))
-            notional = abs(net_qty) * mark_price * _OPTION_MULTIPLIER
+            multiplier = _OPTION_MULTIPLIER if fill.asset_type == AssetType.OPTION else Decimal("1")
+            notional = abs(net_qty) * mark_price * multiplier
 
             risk_state_dao.insert_states(
                 [
@@ -256,6 +260,7 @@ class RiskStreamConsumers:
                         "metric_value": net_qty,
                         "detail": {
                             "strategy_code": strategy_code,
+                            "asset_type": fill.asset_type.value,
                             "option_right": option_right,
                             "conid": fill.conid,
                         },
@@ -267,6 +272,7 @@ class RiskStreamConsumers:
                         "metric_value": notional,
                         "detail": {
                             "strategy_code": strategy_code,
+                            "asset_type": fill.asset_type.value,
                             "option_right": option_right,
                         },
                     },

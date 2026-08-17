@@ -290,6 +290,24 @@ def _resolve_underlying_price(
     return None
 
 
+def _select_option_entry(params: Sequence[Mapping], symbol: str) -> Mapping:
+    symbol_up = symbol.upper()
+
+    def score(entry: Mapping) -> tuple[int, int, int, int]:
+        trading_class = str(entry.get("trading_class") or entry.get("tradingClass") or "").upper()
+        exchange = str(entry.get("exchange") or "").upper()
+        expirations = entry.get("expirations") or []
+        strikes = entry.get("strikes") or []
+        return (
+            1 if trading_class == symbol_up else 0,
+            1 if exchange == "SMART" else 0,
+            len(expirations),
+            len(strikes),
+        )
+
+    return max(params, key=score)
+
+
 def _filter_otm_levels(
     candidates: list[tuple[int, Decimal, str, date]],
     spot_price: Decimal,
@@ -382,9 +400,7 @@ def _collect_option_metadata(
         LOGGER.warning("secdef.empty", symbol=symbol)
         return []
     
-    # 使用返回的第一个entry（通常是CBOE或其他主要交易所）
-    # 注意：使用空字符串请求时，返回的exchange不一定是"SMART"
-    smart_entry = params[0]
+    smart_entry = _select_option_entry(params, symbol)
     returned_exchange = smart_entry.get("exchange", "UNKNOWN")
     LOGGER.debug("secdef.returned_exchange", symbol=symbol, exchange=returned_exchange)
     expirations = sorted(set(smart_entry.get("expirations") or []))
@@ -752,8 +768,7 @@ def _persist_option_chain_meta(session: Session, records: Sequence[OptionMetaRec
             COALESCE(:volume, 0),
             COALESCE(:min_tick, 0.01)
         )
-        ON CONFLICT (conid) DO UPDATE SET
-            trade_date = EXCLUDED.trade_date,
+        ON CONFLICT (trade_date, conid) DO UPDATE SET
             underlying_symbol = EXCLUDED.underlying_symbol,
             expiry = EXCLUDED.expiry,
             strike = EXCLUDED.strike,

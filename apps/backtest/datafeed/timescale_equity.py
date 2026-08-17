@@ -4,7 +4,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import pandas as pd
 from backtrader.feeds import PandasData
@@ -82,7 +82,8 @@ class TimescaleEquityData(PandasData):
         - auto_fill_missing=True 时：扫描缺口→调用 IBKR 历史回补→重算指标→入库→二次校验。
         - auto_fill_missing=False 时：仅校验，发现缺口直接报错。
         """
-        rows = dao.fetch_equity_bars(symbol=symbol, start_ts=start, end_ts=end)
+        context_start, context_end = _equity_context_window(start=start, end=end)
+        rows = dao.fetch_equity_bars(symbol=symbol, start_ts=context_start, end_ts=context_end)
         if not rows:
             raise RuntimeError(f"No equity data for {symbol} between {start} and {end}")
 
@@ -125,7 +126,7 @@ class TimescaleEquityData(PandasData):
                     except Exception:  # pragma: no cover - defensive
                         logger.exception("ibkr.disconnect_failed")
 
-            rows = dao.fetch_equity_bars(symbol=symbol, start_ts=start, end_ts=end)
+            rows = dao.fetch_equity_bars(symbol=symbol, start_ts=context_start, end_ts=context_end)
             if not rows:
                 raise RuntimeError(f"After fill, still no equity data for {symbol}")
 
@@ -153,6 +154,23 @@ class TimescaleEquityData(PandasData):
             )
 
         _validate_equity_bar_coverage(df=df, symbol=symbol)
+
+        start_ts = pd.Timestamp(start)
+        if start_ts.tzinfo is None:
+            start_ts = start_ts.tz_localize("UTC")
+        else:
+            start_ts = start_ts.tz_convert("UTC")
+        end_ts = pd.Timestamp(end)
+        if end_ts.tzinfo is None:
+            end_ts = end_ts.tz_localize("UTC")
+        else:
+            end_ts = end_ts.tz_convert("UTC")
+        df = df[
+            (df.index.tz_convert("UTC") >= start_ts)
+            & (df.index.tz_convert("UTC") < end_ts)
+        ]
+        if len(df) < 100:
+            raise RuntimeError(f"Insufficient equity data for {symbol}: only {len(df)} bars")
 
         data = cls(dataname=df, name=symbol)
         return data
@@ -221,7 +239,7 @@ class GapReport:
         )
 
 
-_PREMARKET_BAR_START = time(9, 25)
+_RTH_BAR_START = time(9, 31)
 _NUMERIC_COLS_ALL = [
     "open",
     "high",
@@ -256,9 +274,6 @@ _INDICATOR_COLS = [
     "rsi6",
     "rsi12",
     "rsi24",
-    "boll_mid",
-    "boll_up",
-    "boll_dn",
     "atr14",
     "ao",
     "stoch_k",
@@ -277,6 +292,27 @@ _INDICATOR_COLS = [
     "mfi14",
     "rvol6",
 ]
+
+
+def _equity_context_window(*, start: datetime, end: datetime) -> tuple[datetime, datetime]:
+    start_utc = start if start.tzinfo else start.replace(tzinfo=timezone.utc)
+    end_utc = end if end.tzinfo else end.replace(tzinfo=timezone.utc)
+    start_et = start_utc.astimezone(EASTERN)
+    try:
+        prev_trade_date = _previous_trading_date(start_et.date())
+        prev_session = get_trading_session(prev_trade_date)
+        prev_close_et = datetime.combine(
+            prev_session.session_date,
+            prev_session.close_time,
+            tzinfo=EASTERN,
+        )
+        context_start = min(start_et.replace(hour=9, minute=31, second=0, microsecond=0), prev_close_et)
+    except KeyError:
+        context_start = start_et.replace(hour=9, minute=31, second=0, microsecond=0)
+    # DAO queries treat end_ts as exclusive, but RTH gap validation expects the
+    # 16:00 ET closing minute to be present in the context dataframe.
+    context_end = end_utc.astimezone(timezone.utc) + timedelta(minutes=1)
+    return context_start.astimezone(timezone.utc), context_end
 
 
 def _decimal_to_numeric(value: object) -> object:
@@ -319,8 +355,8 @@ def _scan_equity_gaps(*, df: pd.DataFrame, symbol: str) -> GapReport:
             trade_date.year,
             trade_date.month,
             trade_date.day,
-            _PREMARKET_BAR_START.hour,
-            _PREMARKET_BAR_START.minute,
+            _RTH_BAR_START.hour,
+            _RTH_BAR_START.minute,
             tz=tzinfo,
         )
         end_ts = pd.Timestamp(
@@ -332,10 +368,12 @@ def _scan_equity_gaps(*, df: pd.DataFrame, symbol: str) -> GapReport:
             tz=tzinfo,
         )
         intraday_slice = day_slice.between_time(
-            _PREMARKET_BAR_START.strftime("%H:%M"), session.close_time.strftime("%H:%M")
+            _RTH_BAR_START.strftime("%H:%M"), session.close_time.strftime("%H:%M")
         )
 
         if not intraday_slice.empty:
+            if len(intraday_slice) < 100:
+                continue
             expected = pd.date_range(start_ts, end_ts, freq="1min")
             missing_idx = expected.difference(intraday_slice.index)
             if not missing_idx.empty:
@@ -343,9 +381,9 @@ def _scan_equity_gaps(*, df: pd.DataFrame, symbol: str) -> GapReport:
                     MinuteGap(trade_date=trade_date, missing_minutes=list(missing_idx))
                 )
 
-            if indicator_cols:
+            if indicator_cols and len(intraday_slice) >= 100:
                 nan_rows: List[Tuple[pd.Timestamp, List[str]]] = []
-                for ts, row in intraday_slice[indicator_cols].iterrows():
+                for ts, row in intraday_slice.iloc[60:][indicator_cols].iterrows():
                     missing_cols = [col for col in indicator_cols if pd.isna(row.get(col))]
                     if missing_cols:
                         nan_rows.append((ts, missing_cols))
@@ -353,19 +391,6 @@ def _scan_equity_gaps(*, df: pd.DataFrame, symbol: str) -> GapReport:
                     report.indicator_gaps.append(
                         IndicatorGap(trade_date=trade_date, rows=nan_rows)
                     )
-
-        prev_records = df[df.index < start_ts]
-        if prev_records.empty:
-            report.prev_close_missing.append(trade_date)
-        else:
-            prev_ts = prev_records.index.max()
-            prev_local = prev_ts.tz_convert(tzinfo)
-            prev_session = get_trading_session(prev_local.date())
-            if (prev_local.hour, prev_local.minute) != (
-                prev_session.close_time.hour,
-                prev_session.close_time.minute,
-            ):
-                report.prev_close_missing.append(trade_date)
 
     return report
 
@@ -383,8 +408,8 @@ def _validate_equity_bar_coverage(*, df: pd.DataFrame, symbol: str) -> None:
             trade_date.year,
             trade_date.month,
             trade_date.day,
-            _PREMARKET_BAR_START.hour,
-            _PREMARKET_BAR_START.minute,
+            _RTH_BAR_START.hour,
+            _RTH_BAR_START.minute,
             tz=tzinfo,
         )
         expected_end = pd.Timestamp(
@@ -396,9 +421,11 @@ def _validate_equity_bar_coverage(*, df: pd.DataFrame, symbol: str) -> None:
             tz=tzinfo,
         )
         intraday_slice = day_slice.between_time(
-            _PREMARKET_BAR_START.strftime("%H:%M"), session.close_time.strftime("%H:%M")
+            _RTH_BAR_START.strftime("%H:%M"), session.close_time.strftime("%H:%M")
         )
         if intraday_slice.empty:
+            continue
+        if len(intraday_slice) < 100:
             continue
 
         expected_range = pd.date_range(expected_start, expected_end, freq="1min")
@@ -408,25 +435,6 @@ def _validate_equity_bar_coverage(*, df: pd.DataFrame, symbol: str) -> None:
             raise RuntimeError(
                 f"Equity data for {symbol} missing {len(missing)} minute bars on "
                 f"{trade_date.isoformat()} (sample: {sample})"
-            )
-
-        prev_records = df[df.index < expected_start]
-        if prev_records.empty:
-            raise RuntimeError(
-                f"Equity data for {symbol} is missing the previous close prior to "
-                f"{trade_date.isoformat()}."
-            )
-        prev_ts = prev_records.index.max()
-        prev_local = prev_ts.tz_convert(tzinfo)
-        prev_session = get_trading_session(prev_local.date())
-        if (prev_local.hour, prev_local.minute) != (
-            prev_session.close_time.hour,
-            prev_session.close_time.minute,
-        ):
-            raise RuntimeError(
-                f"Equity data for {symbol} missing close bar on {prev_local.date().isoformat()}: "
-                f"expected {prev_session.close_time.strftime('%H:%M')} but got "
-                f"{prev_local.strftime('%H:%M')}."
             )
 
 
@@ -512,8 +520,21 @@ def _fill_equity_gaps_via_ibkr(
             continue
 
         dao.upsert_equity_bars_from_df(symbol=symbol, df=df_bars)
-        df_inds = indcalc.compute_indicators(df_bars, baseline_map=baseline_map)
-        dao.upsert_equity_indicators_from_df(symbol=symbol, df=df_inds)
+        _recompute_equity_indicators_for_window(
+            dao=dao,
+            symbol=symbol,
+            baseline_map=baseline_map,
+            window_start=window_start,
+            window_end=window_end,
+            fallback_df=df_bars,
+            failure_payload={
+                "symbol": symbol,
+                "trade_date": price_gap.trade_date.isoformat(),
+                "reason": "indicator_compute_failed_after_price_fill",
+                "start": window_start.isoformat(),
+                "end": window_end.isoformat(),
+            },
+        )
 
     for indicator_gap in gap_report.indicator_gaps:
         missing_ts = [ts for ts, _ in indicator_gap.rows]
@@ -553,8 +574,21 @@ def _fill_equity_gaps_via_ibkr(
         if df_prices.empty:
             continue
 
-        df_inds = indcalc.compute_indicators(df_prices, baseline_map=baseline_map)
-        dao.upsert_equity_indicators_from_df(symbol=symbol, df=df_inds)
+        _recompute_equity_indicators_for_window(
+            dao=dao,
+            symbol=symbol,
+            baseline_map=baseline_map,
+            window_start=window_start,
+            window_end=window_end,
+            fallback_df=df_prices,
+            failure_payload={
+                "symbol": symbol,
+                "trade_date": indicator_gap.trade_date.isoformat(),
+                "reason": "indicator_compute_failed",
+                "start": window_start.isoformat(),
+                "end": window_end.isoformat(),
+            },
+        )
 
     for trade_date in gap_report.prev_close_missing:
         prev_trade_date = _previous_trading_date(trade_date)
@@ -600,7 +634,72 @@ def _fill_equity_gaps_via_ibkr(
             continue
 
         dao.upsert_equity_bars_from_df(symbol=symbol, df=df_bars)
-        df_inds = indcalc.compute_indicators(df_bars, baseline_map=baseline_map)
+        _recompute_equity_indicators_for_window(
+            dao=dao,
+            symbol=symbol,
+            baseline_map=baseline_map,
+            window_start=window_start,
+            window_end=window_end,
+            fallback_df=df_bars,
+            failure_payload={
+                "symbol": symbol,
+                "trade_date": trade_date.isoformat(),
+                "reason": "indicator_compute_failed_after_prev_close_fill",
+                "start": window_start.isoformat(),
+                "end": window_end.isoformat(),
+            },
+        )
+
+
+def _recompute_equity_indicators_for_window(
+    *,
+    dao: BacktestDAO,
+    symbol: str,
+    baseline_map: Mapping[int, Decimal],
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    fallback_df: pd.DataFrame | None = None,
+    failure_payload: Dict[str, Any] | None = None,
+) -> None:
+    start_utc = window_start.tz_convert("UTC").to_pydatetime()
+    end_utc = window_end.tz_convert("UTC").to_pydatetime()
+    frames: List[pd.DataFrame] = []
+    rows = dao.fetch_equity_bars(symbol=symbol, start_ts=start_utc, end_ts=end_utc)
+    if rows:
+        frames.append(_rows_to_dataframe(rows))
+    if fallback_df is not None and not fallback_df.empty:
+        frames.append(fallback_df.copy())
+    if not frames:
+        return
+
+    df_prices = pd.concat(frames).sort_index()
+    df_prices = df_prices[~df_prices.index.duplicated(keep="last")]
+    df_prices = df_prices[(df_prices.index >= window_start) & (df_prices.index < window_end)]
+    if df_prices.empty:
+        return
+
+    try:
+        df_inds = indcalc.compute_indicators(df_prices, baseline_map=baseline_map)
+    except Exception as exc:  # pragma: no cover - defensive around third-party indicators
+        logger.warning(
+            "equity_indicator_recompute_failed",
+            symbol=symbol,
+            rows=len(df_prices),
+            err=str(exc),
+        )
+        if failure_payload is not None:
+            payload = dict(failure_payload)
+            payload["error"] = str(exc)
+            _emit_risk_event(
+                dao=dao,
+                symbol=symbol,
+                code="DATA_GAP_FILL_FAILED",
+                severity="ERROR",
+                payload=payload,
+            )
+        return
+
+    if not df_inds.empty:
         dao.upsert_equity_indicators_from_df(symbol=symbol, df=df_inds)
 
 

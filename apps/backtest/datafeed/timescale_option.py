@@ -12,7 +12,7 @@ from apps.backtest.dao import BacktestDAO, OptionBarRow
 
 
 class TimescaleOptionData(PandasData):
-    lines = ("bid", "ask")
+    lines = ("bid", "ask", "quote_age_seconds")
     params = (
         ("datetime", None),
         ("high", -1),
@@ -23,6 +23,7 @@ class TimescaleOptionData(PandasData):
         ("openinterest", -1),
         ("bid", -1),
         ("ask", -1),
+        ("quote_age_seconds", -1),
     )
 
     @classmethod
@@ -62,16 +63,32 @@ class TimescaleOptionData(PandasData):
             raise RuntimeError("Option feed contains null bid/ask")
 
         df["ts_end"] = pd.to_datetime(df["ts_end"], utc=True).dt.tz_convert("US/Eastern")
+        df["source_quote_ts"] = df["ts_end"]
         numeric_cols = ["bid", "ask", "mid", "volume", "open_interest", "strike"]
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col].apply(_decimal_to_numeric), errors="coerce")
+        # Backtrader brokers execute limit orders against OHLC lines, so option
+        # feeds must expose a price series even when the source table only stores
+        # quote snapshots. Use mid as the canonical synthetic bar price.
+        df["open"] = df["mid"]
+        df["high"] = df["mid"]
+        df["low"] = df["mid"]
+        df["close"] = df["mid"]
+        df["openinterest"] = df["open_interest"]
         df = df.set_index("ts_end").sort_index()
-        expected_minutes = int((df.index[-1] - df.index[0]).total_seconds() / 60) + 1
-        if len(df) != expected_minutes:
-            raise RuntimeError("Option feed has missing minutes")
+        expected_index = pd.date_range(df.index[0], df.index[-1], freq="1min", tz=df.index.tz)
+        if len(df.index) != len(expected_index) or not df.index.equals(expected_index):
+            df = df.reindex(expected_index).ffill()
+            if df[["bid", "ask", "mid"]].isna().any().any():
+                raise RuntimeError("Option feed has missing minutes")
+        source_index = pd.DatetimeIndex(pd.to_datetime(df["source_quote_ts"], utc=True)).tz_convert(
+            df.index.tz
+        )
+        df["quote_age_seconds"] = (df.index - source_index).total_seconds()
 
         data = cls(dataname=df, name=f"OPT-{contract.get('conid', '')}")
+        data.p.contract = dict(contract)
         return data
 
 

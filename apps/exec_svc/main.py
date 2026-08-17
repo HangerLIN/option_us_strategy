@@ -4,7 +4,7 @@ import asyncio
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal, ROUND_DOWN, ROUND_UP, InvalidOperation
+from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable, Dict, Optional, Set
 
 import httpx
@@ -26,6 +26,11 @@ from libs.core import (
     utc_now,
 )
 from libs.db.dao import StrategyPositionDAO
+from libs.execution.pricing import (
+    ExecutionPath,
+    build_execution_path,
+    round_to_tick,
+)
 from libs.infra import IBClient, RedisBus, build_ibkr_client, get_next_order_id
 from libs.infra.db import get_session_factory
 from libs.infra.metrics import (
@@ -37,6 +42,7 @@ from libs.infra.metrics import (
     set_orders_by_status,
     set_pending_order_age,
 )
+from libs.schemas.assets import AssetType
 from libs.schemas.common import ApiResult, ServiceHealth
 from libs.schemas.events import ExecutionFill, ForceCloseEvent, RiskAlert, RiskBlock, RiskUnblock
 from libs.schemas.exec import (
@@ -54,6 +60,8 @@ LOGGER = structlog.get_logger(__name__)
 
 settings = get_settings()
 configure_logging(settings)
+ADAPTIVE_ORDER_MODES = {ExecutionMode.ADAPTIVE, ExecutionMode.PASSIVE}
+OPTION_GENERIC_TICKS = "100,101,106"
 
 redis_bus = RedisBus(settings.redis_url)
 ib_client: Optional[IBClient] = None
@@ -64,6 +72,14 @@ orders_registry: dict[int, OrderState] = {}
 orders_lock = asyncio.Lock()
 trace_registry: Dict[str, int] = {}
 METRICS_ENABLED = bool(settings.monitoring_enabled)
+
+
+def _coerce_asset_type(value: object) -> AssetType:
+    raw = str(getattr(value, "value", value) or "OPTION").upper()
+    try:
+        return AssetType(raw)
+    except ValueError:
+        return AssetType.OPTION
 
 
 class _OrderStreamBroker:
@@ -282,8 +298,14 @@ def _build_contract(symbol: str, payload: ExecutionRequest | None = None) -> Con
     contract.exchange = "SMART"
     contract.currency = "USD"
     
-    # If option parameters are provided, build option contract
-    if payload and payload.option_right and payload.option_strike and payload.option_expiry:
+    # If option parameters are provided, build option contract. ETFs use STK in IBKR.
+    if (
+        payload
+        and payload.asset_type == AssetType.OPTION
+        and payload.option_right
+        and payload.option_strike
+        and payload.option_expiry
+    ):
         contract.secType = "OPT"
         contract.right = payload.option_right
         contract.strike = float(payload.option_strike)
@@ -340,7 +362,8 @@ async def submit_order(payload: ExecutionRequest) -> ApiResult:
         )
         return _reject_response(local_code, local_message, payload)
 
-    notional = payload.limit_price * Decimal(payload.quantity) * OPTION_MULTIPLIER
+    multiplier = OPTION_MULTIPLIER if payload.asset_type == AssetType.OPTION else Decimal("1")
+    notional = _risk_notional_price(payload) * Decimal(payload.quantity) * multiplier
     risk_ok, risk_code, risk_message = await _risk_precheck(payload, notional)
     if not risk_ok:
         _emit_metric(record_order_block, "risk", risk_code)
@@ -498,12 +521,90 @@ def _current_spread(payload: ExecutionRequest) -> Optional[Decimal]:
 
 
 def _round_to_tick(price: Decimal, min_tick: Optional[Decimal], side: OrderSide) -> Decimal:
-    if min_tick is None or min_tick <= 0:
-        return price
-    ticks = price / min_tick
-    rounding = ROUND_UP if side == OrderSide.BUY else ROUND_DOWN
-    ticks = ticks.quantize(Decimal("1"), rounding=rounding)
-    return ticks * min_tick
+    return round_to_tick(price, min_tick, side)
+
+
+def _valid_quote_values(
+    bid: Decimal | None, ask: Decimal | None
+) -> tuple[Decimal, Decimal, Decimal, Decimal] | None:
+    if bid is None or ask is None or bid <= 0 or ask <= 0 or ask <= bid:
+        return None
+    mid = (bid + ask) / Decimal("2")
+    return bid, ask, mid, ask - bid
+
+
+def _quote_snapshot_for_contract(contract: Contract) -> tuple[Decimal, Decimal, Decimal, Decimal] | None:
+    if getattr(contract, "secType", "") != "OPT":
+        return None
+    try:
+        client = _require_ib_client()
+        snapshot = client.market_data_snapshot(
+            contract,
+            generic_ticks=OPTION_GENERIC_TICKS,
+            timeout=2.0,
+        )
+    except Exception:  # pragma: no cover - external IBKR interaction
+        LOGGER.exception("order.quote_refresh_failed", symbol=getattr(contract, "symbol", None))
+        return None
+
+    bid = _to_decimal(snapshot.get("bid"))
+    ask = _to_decimal(snapshot.get("ask"))
+    return _valid_quote_values(bid, ask)
+
+
+def _refresh_meta_quote(meta: TraceMeta) -> None:
+    quote = _quote_snapshot_for_contract(meta.contract)
+    if quote is None:
+        return
+    bid, ask, mid, spread = quote
+    meta.bid = bid
+    meta.ask = ask
+    meta.base_mid = mid
+    meta.spread = spread
+    meta.payload.option_bid = bid
+    meta.payload.option_ask = ask
+    meta.payload.option_mid = mid
+    meta.payload.option_spread = spread
+
+
+def _execution_path(meta: TraceMeta, mode: ExecutionMode | None = None) -> ExecutionPath:
+    if meta.payload.asset_type != AssetType.OPTION:
+        raise ValueError("quote-aware execution path is option-only")
+    return build_execution_path(
+        mode=mode or meta.mode,
+        side=meta.side,
+        min_tick=meta.min_tick,
+        mid=meta.base_mid,
+        spread=meta.spread,
+        bid=meta.bid,
+        ask=meta.ask,
+    )
+
+
+def _risk_notional_price(payload: ExecutionRequest) -> Decimal:
+    if payload.asset_type != AssetType.OPTION:
+        return payload.limit_price
+    mode = payload.execution_mode
+    if payload.side != OrderSide.BUY or mode not in ADAPTIVE_ORDER_MODES | {ExecutionMode.MARKETABLE}:
+        return payload.limit_price
+
+    mid = _current_mid(payload)
+    spread = _current_spread(payload)
+    bid = _to_decimal(payload.option_bid)
+    ask = _to_decimal(payload.option_ask)
+    try:
+        path = build_execution_path(
+            mode=ExecutionMode.MARKETABLE,
+            side=payload.side,
+            min_tick=_to_decimal(payload.min_tick),
+            mid=mid,
+            spread=spread,
+            bid=bid,
+            ask=ask,
+        )
+        return max(payload.limit_price, path.steps[0].price)
+    except ValueError:
+        return max(payload.limit_price, ask or payload.limit_price)
 
 
 def _local_precheck(payload: ExecutionRequest) -> tuple[bool, str, str]:
@@ -512,6 +613,8 @@ def _local_precheck(payload: ExecutionRequest) -> tuple[bool, str, str]:
 
     # 当请求缺少期权关键字段时，尝试使用全局 OptionSelector 自动补全
     if (
+        payload.asset_type == AssetType.OPTION
+        and
         payload.side == OrderSide.BUY
         and (
             payload.option_right is None
@@ -587,20 +690,27 @@ def _local_precheck(payload: ExecutionRequest) -> tuple[bool, str, str]:
     if payload.a1_gate is not None and payload.a1_gate is False:
         return False, "BLOCK:A1_GATE", "a1-gate-disabled"
 
-    if payload.option_dte is not None and not (2 <= payload.option_dte <= 7):
-        return False, "BLOCK:DTE", f"dte={payload.option_dte}"
+    if payload.asset_type == AssetType.OPTION:
+        if payload.option_dte is not None and not (2 <= payload.option_dte <= 7):
+            return False, "BLOCK:DTE", f"dte={payload.option_dte}"
 
-    if payload.option_otm_steps is not None and not (2 <= payload.option_otm_steps <= 5):
-        return False, "BLOCK:OTM_RANGE", f"otm_steps={payload.option_otm_steps}"
+        if payload.option_otm_steps is not None and not (2 <= payload.option_otm_steps <= 5):
+            return False, "BLOCK:OTM_RANGE", f"otm_steps={payload.option_otm_steps}"
 
-    open_interest = payload.option_open_interest
-    volume = payload.option_volume
-    mid = _current_mid(payload)
-    spread = _current_spread(payload)
-    if open_interest is not None and volume is not None and mid is not None and spread is not None:
-        threshold = max(Decimal("0.10"), mid * Decimal("0.05"))
-        if open_interest < 500 or volume < 100 or spread > threshold:
-            return False, "BLOCK:LIQUIDITY", "liquidity-threshold"
+        open_interest = payload.option_open_interest
+        volume = payload.option_volume
+        mid = _current_mid(payload)
+        spread = _current_spread(payload)
+        if (
+            settings.option_liquidity_required
+            and open_interest is not None
+            and volume is not None
+            and mid is not None
+            and spread is not None
+        ):
+            threshold = max(Decimal("0.10"), mid * Decimal("0.05"))
+            if open_interest < 500 or volume < 100 or spread > threshold:
+                return False, "BLOCK:LIQUIDITY", "liquidity-threshold"
 
     return True, "OK", "local-pass"
 
@@ -611,6 +721,7 @@ async def _risk_precheck(payload: ExecutionRequest, notional: Decimal) -> tuple[
     request_payload = {
         "strategy_code": payload.strategy_code,
         "symbol": payload.symbol,
+        "asset_type": payload.asset_type.value,
         "notional": str(notional),
         "implied_vol": payload.implied_vol or 0.0,
         "timestamp": utc_now().isoformat(),
@@ -735,51 +846,110 @@ async def _cancel_pending_buys(symbol: str, reason_code: str) -> None:
             LOGGER.exception("order.cancel_failed", order_id=order_id)
 
 
-async def _force_close_symbol(strategy_code: str, symbol: str, trace_id: str) -> None:
+def _position_contract(position: Any) -> Contract | None:
+    if position.strike is None or position.expiry is None or position.option_right is None:
+        return None
+    contract = Contract()
+    contract.symbol = position.symbol
+    contract.secType = "OPT"
+    contract.exchange = "SMART"
+    contract.currency = "USD"
+    contract.lastTradeDateOrContractMonth = position.expiry.strftime("%Y%m%d")
+    contract.strike = float(position.strike)
+    contract.right = str(position.option_right)
+    contract.multiplier = "100"
+    return contract
+
+
+def _quote_for_position(position: Any) -> tuple[Decimal, Decimal, Decimal, Decimal] | None:
+    contract = _position_contract(position)
+    if contract is None:
+        return None
+    return _quote_snapshot_for_contract(contract)
+
+
+async def _force_close_symbol(
+    strategy_code: str,
+    symbol: str,
+    trace_id: str,
+    *,
+    asset_type: AssetType | None = None,
+) -> None:
+    await _close_symbol_positions(
+        strategy_code=strategy_code,
+        symbol=symbol,
+        trace_id=trace_id,
+        mode=ExecutionMode.FORCE,
+        signal_code="FORCE_CLOSE",
+        asset_type=asset_type,
+    )
+
+
+async def _close_symbol_positions(
+    *,
+    strategy_code: str,
+    symbol: str,
+    trace_id: str,
+    mode: ExecutionMode,
+    signal_code: str,
+    asset_type: AssetType | None = None,
+) -> None:
     symbol_upper = symbol.upper()
     exit_priority.add(symbol_upper)
     session = session_factory()
     try:
         dao = StrategyPositionDAO(session)
-        positions = dao.list_positions(strategy_code=strategy_code, symbol=symbol)
+        positions = dao.list_positions(
+            strategy_code=strategy_code,
+            symbol=symbol,
+            asset_type=asset_type.value if asset_type is not None else None,
+        )
         for position in positions:
             quantity = int(abs(position.open_quantity))
             if quantity == 0:
                 continue
             side = OrderSide.SELL if position.open_quantity > 0 else OrderSide.BUY
             mark_price = position.mark_price if position.mark_price else Decimal("0.01")
-            limit_price = Decimal(mark_price)
+            quote = _quote_for_position(position)
+            if quote is None:
+                bid = ask = mid = spread = None
+                limit_price = Decimal(mark_price)
+            else:
+                bid, ask, mid, spread = quote
+                limit_price = mid if mode in ADAPTIVE_ORDER_MODES else (bid if side == OrderSide.SELL else ask)
             request = ExecutionRequest(
                 strategy_code=strategy_code,
                 symbol=position.symbol,
+                asset_type=_coerce_asset_type(getattr(position, "asset_type", "OPTION")),
                 side=side,
                 quantity=quantity,
                 limit_price=limit_price,
                 tif="DAY",
-                signal_code="FORCE_CLOSE",
+                signal_code=signal_code,
                 option_right=position.option_right,
                 option_dte=None,
                 option_otm_steps=None,
                 option_open_interest=None,
                 option_volume=None,
-                option_bid=None,
-                option_ask=None,
-                option_mid=None,
-                option_spread=None,
+                option_bid=bid,
+                option_ask=ask,
+                option_mid=mid,
+                option_spread=spread,
                 implied_vol=None,
                 a1_gate=True,
                 is_exit=True,
                 min_tick=Decimal("0.01"),
-                execution_mode=ExecutionMode.FORCE,
-                trace_id=f"{trace_id}-force-{position.symbol}-{position.option_right or 'NA'}",
+                execution_mode=mode,
+                trace_id=f"{trace_id}-{mode.value.lower()}-{position.symbol}-{position.option_right or 'NA'}",
             )
             result = await submit_order(request)
             LOGGER.info(
-                "force_close.submitted",
+                "close_position.submitted",
                 symbol=symbol,
                 strategy=strategy_code,
                 side=side.value,
                 qty=quantity,
+                mode=mode.value,
                 ok=result.ok,
             )
     finally:
@@ -833,7 +1003,7 @@ async def _handle_force_close_event(event: ForceCloseEvent) -> None:
         strategy=strategy,
         reason=event.reason,
     )
-    await _force_close_symbol(strategy, symbol, event.trace_id)
+    await _force_close_symbol(strategy, symbol, event.trace_id, asset_type=event.asset_type)
 
 
 def _compute_initial_price(meta: TraceMeta) -> Decimal:
@@ -845,8 +1015,13 @@ def _compute_initial_price(meta: TraceMeta) -> Decimal:
     bid = meta.bid
     ask = meta.ask
 
-    if mode == ExecutionMode.PASSIVE and mid is not None:
-        price = mid
+    if payload.asset_type != AssetType.OPTION:
+        price = payload.limit_price
+    elif mode in ADAPTIVE_ORDER_MODES:
+        try:
+            return _execution_path(meta).steps[0].price
+        except ValueError:
+            price = mid or payload.limit_price
     elif mode == ExecutionMode.FORCE:
         if side == OrderSide.BUY and ask is not None:
             price = ask
@@ -872,18 +1047,6 @@ def _compute_initial_price(meta: TraceMeta) -> Decimal:
     return _round_to_tick(price, meta.min_tick, side)
 
 
-def _compute_passive_adjust(meta: TraceMeta) -> Optional[Decimal]:
-    mid = meta.base_mid
-    spread = meta.spread
-    if mid is None or spread is None:
-        return None
-    if meta.side == OrderSide.BUY:
-        price = mid + spread * Decimal("0.2")
-    else:
-        price = mid - spread * Decimal("0.2")
-    return _round_to_tick(price, meta.min_tick, meta.side)
-
-
 def _compute_force_jump(meta: TraceMeta) -> Optional[Decimal]:
     min_tick = meta.min_tick
     if min_tick is None:
@@ -900,13 +1063,11 @@ def _compute_force_jump(meta: TraceMeta) -> Optional[Decimal]:
 
 
 def _compute_retry_price(meta: TraceMeta) -> Decimal:
-    # 第二次尝试时，PASSIVE 升级为可成交价，其他保持原策略
-    if meta.mode == ExecutionMode.PASSIVE:
-        original_mode = meta.mode
-        meta.mode = ExecutionMode.MARKETABLE
-        price = _compute_initial_price(meta)
-        meta.mode = original_mode
-        return price
+    if meta.mode in ADAPTIVE_ORDER_MODES:
+        try:
+            return _execution_path(meta, ExecutionMode.MARKETABLE).steps[0].price
+        except ValueError:
+            return _compute_initial_price(meta)
     return _compute_initial_price(meta)
 
 
@@ -916,6 +1077,7 @@ async def _place_attempt(meta: TraceMeta, trace_id: str, *, retry: bool) -> tupl
         meta.attempts += 1
         order_id = get_next_order_id(client)
 
+    _refresh_meta_quote(meta)
     price = _compute_retry_price(meta) if retry else _compute_initial_price(meta)
     meta.last_price = price
     meta.payload.limit_price = price
@@ -956,37 +1118,67 @@ async def _place_attempt(meta: TraceMeta, trace_id: str, *, retry: bool) -> tupl
 
 def _schedule_tasks(order_id: int, trace_id: str, meta: TraceMeta) -> None:
     tasks: list[asyncio.Task[Any]] = []
-    if meta.mode == ExecutionMode.PASSIVE and meta.attempts == 1:
-        tasks.append(asyncio.create_task(_passive_adjust(order_id, trace_id)))
+    if meta.mode in ADAPTIVE_ORDER_MODES and meta.attempts == 1:
+        tasks.append(asyncio.create_task(_adaptive_adjust(order_id, trace_id)))
     if meta.mode == ExecutionMode.FORCE and meta.attempts == 1:
         tasks.append(asyncio.create_task(_force_adjust(order_id, trace_id)))
     tasks.append(asyncio.create_task(_ttl_watch(order_id, trace_id)))
     order_tasks[order_id] = tasks
 
 
-async def _passive_adjust(order_id: int, trace_id: str) -> None:
-    try:
-        await asyncio.sleep(15)
-    except asyncio.CancelledError:  # pragma: no cover - cooperative cancellation
-        return
-    async with orders_lock:
-        if trace_registry.get(trace_id) != order_id:
+async def _adaptive_adjust(order_id: int, trace_id: str) -> None:
+    last_offset = 0
+    for step_index in range(1, 4):
+        try:
+            async with orders_lock:
+                meta = trace_meta.get(trace_id)
+                if meta is None:
+                    return
+                path = _execution_path(meta)
+                if step_index >= len(path.steps):
+                    return
+                step = path.steps[step_index]
+            await asyncio.sleep(max(0, step.offset_sec - last_offset))
+            last_offset = step.offset_sec
+        except asyncio.CancelledError:  # pragma: no cover - cooperative cancellation
             return
-        state = orders_registry.get(order_id)
-        meta = trace_meta.get(trace_id)
-        if state is None or meta is None or state.status != "submitted":
+        except ValueError:
             return
-        new_price = _compute_passive_adjust(meta)
-        if new_price is None or new_price == meta.last_price:
-            return
-        meta.last_price = new_price
-        meta.payload.limit_price = new_price
-        order = _build_order(meta.payload, new_price, trace_id)
-    client = _require_ib_client()
-    client.placeOrder(order_id, meta.contract, order)
-    async with orders_lock:
-        updated = state.model_copy(update={"updated_at": utc_now()})
-        orders_registry[order_id] = updated
+
+        async with orders_lock:
+            if trace_registry.get(trace_id) != order_id:
+                return
+            state = orders_registry.get(order_id)
+            meta = trace_meta.get(trace_id)
+            if state is None or meta is None or state.status != "submitted":
+                return
+
+        _refresh_meta_quote(meta)
+
+        async with orders_lock:
+            if trace_registry.get(trace_id) != order_id:
+                return
+            state = orders_registry.get(order_id)
+            meta = trace_meta.get(trace_id)
+            if state is None or meta is None or state.status != "submitted":
+                return
+            try:
+                path = _execution_path(meta)
+            except ValueError:
+                return
+            if step_index >= len(path.steps):
+                return
+            new_price = path.steps[step_index].price
+            if new_price == meta.last_price:
+                continue
+            meta.last_price = new_price
+            meta.payload.limit_price = new_price
+            order = _build_order(meta.payload, new_price, trace_id)
+        client = _require_ib_client()
+        client.placeOrder(order_id, meta.contract, order)
+        async with orders_lock:
+            updated = state.model_copy(update={"updated_at": utc_now()})
+            orders_registry[order_id] = updated
 
 
 async def _force_adjust(order_id: int, trace_id: str) -> None:
@@ -1332,7 +1524,20 @@ async def _handle_signal_payload(payload: Dict[str, object]) -> None:
     if side == "SELL" or is_sell_signal(signal_code):
         strategy = str(payload.get("strategy_code") or "core-vol")
         trace_id = str(payload.get("trace_id") or f"exit-{symbol}")
-        await _force_close_symbol(strategy, str(symbol), trace_id)
+        cancel_pending = globals().get("_cancel_pending_buys")
+        close_positions = globals().get("_close_symbol_positions")
+        execution_mode = globals().get("ExecutionMode")
+        if cancel_pending is None or close_positions is None or execution_mode is None:
+            await _force_close_symbol(strategy, str(symbol), trace_id)
+        else:
+            await cancel_pending(str(symbol), "CANCEL_PENDING_ENTRY")
+            await close_positions(
+                strategy_code=strategy,
+                symbol=str(symbol),
+                trace_id=trace_id,
+                mode=execution_mode.ADAPTIVE,
+                signal_code=signal_code or "SIGNAL_EXIT",
+            )
         return
     if side == "BUY":
         trace_id = str(payload.get("trace_id") or f"entry-{symbol}")
@@ -1395,7 +1600,7 @@ async def _handle_buy_signal(payload: Dict[str, object], trace_id: str) -> None:
         return
 
     quantity = _extract_quantity(risk_hint)
-    limit_price = selection.quote.ask if selection.quote.ask > 0 else selection.quote.mid
+    limit_price = selection.quote.mid if selection.quote.mid > 0 else selection.quote.ask
     if limit_price is None or limit_price <= 0:
         LOGGER.warning(
             "signal.buy.invalid_quote",
@@ -1420,6 +1625,7 @@ async def _handle_buy_signal(payload: Dict[str, object], trace_id: str) -> None:
     request = ExecutionRequest(
         strategy_code=strategy,
         symbol=symbol,
+        asset_type=AssetType.OPTION,
         side=OrderSide.BUY,
         quantity=max(1, quantity),
         limit_price=limit_price,
@@ -1440,7 +1646,7 @@ async def _handle_buy_signal(payload: Dict[str, object], trace_id: str) -> None:
         a1_gate=True,
         is_exit=False,
         min_tick=selection.min_tick,
-        execution_mode=ExecutionMode.MARKETABLE,
+        execution_mode=ExecutionMode.ADAPTIVE,
         trace_id=trace_id,
     )
 

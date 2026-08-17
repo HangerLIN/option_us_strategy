@@ -15,6 +15,7 @@ from libs.db.dao import StrategyPositionDAO
 from libs.infra.db import get_session_factory
 from libs.infra.redis_bus import RedisBus
 from libs.schemas.common import ServiceHealth
+from libs.schemas.assets import AssetType
 
 from .consumer import ExecutionFillConsumer
 
@@ -38,6 +39,7 @@ class PnLSnapshot(BaseModel):
 class PositionRecord(BaseModel):
     strategy_code: str
     symbol: str
+    asset_type: str
     quantity: Decimal
     avg_price: Decimal
     unrealized_pnl: Decimal
@@ -47,6 +49,7 @@ class DailyPnLRecord(BaseModel):
     trade_date: str
     strategy_code: str
     symbol: str
+    asset_type: str
     realized: Decimal
     unrealized: Decimal
     fees: Decimal
@@ -92,7 +95,6 @@ async def pnl_snapshot(
     dao: StrategyPositionDAO = Depends(get_position_dao),
 ) -> list[PnLSnapshot]:
     positions = dao.list_positions(strategy_code=strategy_code)
-    option_multiplier = Decimal("100")
     report: dict[str, dict[str, Decimal]] = {}
 
     for position in positions:
@@ -100,12 +102,13 @@ async def pnl_snapshot(
             position.strategy_code,
             {"gross": Decimal("0"), "pnl": Decimal("0")},
         )
-        gross = Decimal(abs(position.open_quantity)) * position.mark_price * option_multiplier
+        multiplier = Decimal("100") if str(getattr(position, "asset_type", "OPTION")).upper() == AssetType.OPTION.value else Decimal("1")
+        gross = Decimal(abs(position.open_quantity)) * position.mark_price * multiplier
         group["gross"] += gross
         pnl = (
             (position.mark_price - position.avg_open_price)
             * Decimal(position.open_quantity)
-            * option_multiplier
+            * multiplier
         )
         group["pnl"] += pnl
 
@@ -130,6 +133,7 @@ async def list_positions(
         PositionRecord(
             strategy_code=position.strategy_code,
             symbol=position.symbol,
+            asset_type=position.asset_type,
             quantity=position.quantity,
             avg_price=position.avg_price,
             unrealized_pnl=position.unrealized_pnl,
@@ -154,6 +158,7 @@ async def list_daily_pnl(
             trade_date=record.trade_date.isoformat(),
             strategy_code=record.strategy_code,
             symbol=record.symbol,
+            asset_type=record.asset_type,
             realized=record.realized,
             unrealized=record.unrealized,
             fees=record.fees,

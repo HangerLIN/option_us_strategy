@@ -23,6 +23,7 @@ from libs.infra.metrics import (
     set_win_rate,
 )
 from libs.infra.redis_bus import RedisBus
+from libs.schemas.assets import AssetType
 from libs.schemas.events import ExecutionFill
 
 LOGGER = structlog.get_logger(__name__)
@@ -114,7 +115,8 @@ class ExecutionFillConsumer:
                 return 0.0
 
         market_value = abs(notional)
-        cost_basis = abs(Decimal(position.quantity)) * Decimal(position.avg_price) * Decimal("100")
+        multiplier = Decimal("100") if fill.asset_type == AssetType.OPTION else Decimal("1")
+        cost_basis = abs(Decimal(position.quantity)) * Decimal(position.avg_price) * multiplier
 
         self._emit_metric(set_realized_pnl_today, _to_float(self._today_realized))
         self._emit_metric(set_cumulative_pnl, _to_float(self._cumulative_realized))
@@ -164,6 +166,7 @@ class ExecutionFillConsumer:
             realized, position = dao.apply_fill(
                 strategy_code=fill.strategy_code,
                 symbol=fill.symbol,
+                asset_type=fill.asset_type.value,
                 side=fill.side,
                 quantity=Decimal(fill.fill_quantity),
                 price=Decimal(fill.fill_price),
@@ -171,28 +174,30 @@ class ExecutionFillConsumer:
                 filled_at=fill.filled_at,
             )
 
-            notional = abs(position.quantity) * position.avg_price * Decimal("100")
+            multiplier = Decimal("100") if fill.asset_type == AssetType.OPTION else Decimal("1")
+            notional = abs(position.quantity) * position.avg_price * multiplier
+            detail = {"strategy": fill.strategy_code, "asset_type": fill.asset_type.value}
             states = [
                 {
                     "ts": fill.filled_at,
                     "symbol": fill.symbol,
                     "metric_code": "NET_QTY",
                     "metric_value": Decimal(position.quantity),
-                    "detail": {"strategy": fill.strategy_code},
+                    "detail": detail,
                 },
                 {
                     "ts": fill.filled_at,
                     "symbol": fill.symbol,
                     "metric_code": "REALIZED_PNL",
                     "metric_value": realized,
-                    "detail": {"strategy": fill.strategy_code},
+                    "detail": detail,
                 },
                 {
                     "ts": fill.filled_at,
                     "symbol": fill.symbol,
                     "metric_code": "NOTIONAL",
                     "metric_value": notional,
-                    "detail": {"strategy": fill.strategy_code},
+                    "detail": detail,
                 },
             ]
             RiskStateDAO(session).insert_states(states)

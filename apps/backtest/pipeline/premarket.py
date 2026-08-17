@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Dict, Iterable, List, Mapping, Sequence
+from typing import Dict, Iterable, List, Mapping, Sequence, Set
 
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -314,10 +314,11 @@ class PremarketTop5Builder:
 
         ohlcv_stmt = text(
             """
-            SELECT symbol, prev_close_rth, close_rth
+            SELECT DISTINCT ON (symbol) symbol, close_rth
             FROM v_daily_ohlcv_enriched
-            WHERE trade_date_et::date = :trade_date
+            WHERE trade_date_et::date < :trade_date
               AND symbol = ANY(:symbols)
+            ORDER BY symbol, trade_date_et DESC
             """
         )
         ohlcv_rows = self._session.execute(
@@ -328,7 +329,7 @@ class PremarketTop5Builder:
             symbol = str(row[0]).upper()
             metrics[symbol] = {
                 "prev_close": _to_decimal(row[1], quant=PRICE_QUANT),
-                "close_rth": _to_decimal(row[2], quant=PRICE_QUANT),
+                "close_rth": _to_decimal(row[1], quant=PRICE_QUANT),
                 "sma60": None,
                 "sma60_slope": None,
             }
@@ -336,10 +337,11 @@ class PremarketTop5Builder:
         try:
             ma_stmt = text(
                 """
-                SELECT symbol, sma60, sma60_slope
+                SELECT DISTINCT ON (symbol) symbol, sma60, sma60_slope
                 FROM v_daily_ma60
-                WHERE trade_date_et::date = :trade_date
+                WHERE trade_date_et::date < :trade_date
                   AND symbol = ANY(:symbols)
+                ORDER BY symbol, trade_date_et DESC
                 """
             )
             ma_rows = self._session.execute(
@@ -358,7 +360,37 @@ class PremarketTop5Builder:
             metric["sma60"] = _to_decimal(row[1], quant=PRICE_QUANT)
             metric["sma60_slope"] = _to_decimal(row[2], quant=PRICE_QUANT)
 
+        for symbol in symbols:
+            metric = metrics.setdefault(
+                symbol.upper(),
+                {"prev_close": None, "close_rth": None, "sma60": None, "sma60_slope": None},
+            )
+            if metric["prev_close"] is None:
+                metric["prev_close"] = self._fallback_prev_close(symbol, trade_date)
+            if metric["close_rth"] is None:
+                metric["close_rth"] = metric["prev_close"]
+
         return metrics
+
+    def _fallback_prev_close(self, symbol: str, trade_date: date) -> Decimal | None:
+        stmt = text(
+            """
+            SELECT close
+            FROM bars1m_equity
+            WHERE symbol = :symbol
+              AND (ts_end AT TIME ZONE 'America/New_York')::date < :trade_date
+              AND (ts_end AT TIME ZONE 'America/New_York')::time <= TIME '16:00'
+            ORDER BY ts_end DESC
+            LIMIT 1
+            """
+        )
+        row = self._session.execute(
+            stmt,
+            {"symbol": symbol.upper(), "trade_date": trade_date},
+        ).fetchone()
+        if not row or row[0] is None:
+            return None
+        return _to_decimal(row[0], quant=PRICE_QUANT)
 
     def _load_market_caps(self, symbols: Sequence[str]) -> Dict[str, Decimal | None]:
         stmt = text(

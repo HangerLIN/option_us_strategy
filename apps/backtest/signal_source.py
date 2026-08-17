@@ -48,6 +48,7 @@ def load_signals(
     start: datetime,
     end: datetime,
     top5_source: Top5Source | None = None,
+    strategy_variant: str | None = None,
 ) -> List[SignalEvent]:
     mode = mode.lower()
     if mode not in {"recompute", "db"}:
@@ -56,7 +57,13 @@ def load_signals(
     if mode == "recompute":
         events = list(
             _generate_signals_recompute(
-                session_factory, dao, symbols, start, end, top5_source=top5_source
+                session_factory,
+                dao,
+                symbols,
+                start,
+                end,
+                top5_source=top5_source,
+                strategy_variant=strategy_variant,
             )
         )
     else:
@@ -74,67 +81,86 @@ def _generate_signals_recompute(
     end: datetime,
     *,
     top5_source: Top5Source | None,
+    strategy_variant: str | None,
 ) -> Iterator[SignalEvent]:
-    engine = SignalEngine(
-        session_factory=session_factory,
-        redis_bus=None,
-        top5_source=top5_source,
-        is_backtest=True,
-    )
     for symbol in symbols:
-        rows = dao.fetch_equity_bars(symbol=symbol, start_ts=start, end_ts=end)
-        cumulative_notional = Decimal("0")
-        cumulative_volume = Decimal("0")
-        vwap_session_date: date | None = None
-        for row in rows:
-            ts_end = row.ts_end
-            if isinstance(ts_end, datetime) and ts_end.tzinfo is None:
-                ts_end = ts_end.replace(tzinfo=start.tzinfo)
-            bar_end = ts_end
-            bar_start = bar_end - timedelta(minutes=1)
-            
-            # 过滤盘前时段（RTH = Regular Trading Hours: 9:30-16:00）
-            from libs.core import EASTERN
-            bar_et = bar_end.astimezone(EASTERN) if bar_end.tzinfo else bar_end.replace(tzinfo=EASTERN)
-            hour = bar_et.hour
-            minute = bar_et.minute
-            session_date = bar_et.date()
+        engine = SignalEngine(
+            session_factory=session_factory,
+            redis_bus=None,
+            top5_source=top5_source,
+            is_backtest=True,
+            allow_missing_option_liquidity_metrics=True,
+            strategy_variant=strategy_variant,
+        )
+        session = session_factory()
+        try:
+            rows = dao.fetch_equity_bars(symbol=symbol, start_ts=start, end_ts=end)
+            cumulative_notional = Decimal("0")
+            cumulative_volume = Decimal("0")
+            vwap_session_date: date | None = None
+            for row in rows:
+                ts_end = row.ts_end
+                if isinstance(ts_end, datetime) and ts_end.tzinfo is None:
+                    ts_end = ts_end.replace(tzinfo=start.tzinfo)
+                bar_end = ts_end
+                bar_start = bar_end - timedelta(minutes=1)
 
-            if vwap_session_date != session_date:
-                cumulative_notional = Decimal("0")
-                cumulative_volume = Decimal("0")
-                vwap_session_date = session_date
-            
-            # 只处理9:30-16:00的K线，排除盘前时段（8:00-9:30）
-            if hour < 9 or (hour == 9 and minute < 30) or hour >= 16:
-                continue
+                from libs.core import EASTERN
 
-            volume_dec = Decimal(row.volume or 0)
-            if volume_dec > 0:
-                cumulative_notional += row.close * volume_dec
-                cumulative_volume += volume_dec
-            vwap_value = row.close if cumulative_volume <= 0 else cumulative_notional / cumulative_volume
-            
-            event = BarsClosed(
-                trace_id=str(uuid4()),
-                symbol=symbol,
-                bar_start=bar_start,
-                bar_end=bar_end,
-                timeframe="1m",
-                open=row.open,
-                high=row.high,
-                low=row.low,
-                close=row.close,
-                volume=int(row.volume or 0),
-                vwap=vwap_value,
-                source="backtest",
-                received_at=bar_end,
-            )
-            envelopes = engine.process_bar(event)
-            for signal in envelopes:
-                if signal.generated_at < start or signal.generated_at >= end:
+                bar_et = (
+                    bar_end.astimezone(EASTERN)
+                    if bar_end.tzinfo
+                    else bar_end.replace(tzinfo=EASTERN)
+                )
+                hour = bar_et.hour
+                minute = bar_et.minute
+                session_date = bar_et.date()
+
+                if vwap_session_date != session_date:
+                    cumulative_notional = Decimal("0")
+                    cumulative_volume = Decimal("0")
+                    vwap_session_date = session_date
+
+                if hour < 9 or (hour == 9 and minute < 30) or hour >= 16:
                     continue
-                yield _envelope_to_event(signal, trace_id=str(uuid4()))
+
+                volume_dec = Decimal(row.volume or 0)
+                if volume_dec > 0:
+                    cumulative_notional += row.close * volume_dec
+                    cumulative_volume += volume_dec
+                vwap_value = row.close if cumulative_volume <= 0 else cumulative_notional / cumulative_volume
+
+                event = BarsClosed(
+                    trace_id=str(uuid4()),
+                    symbol=symbol,
+                    bar_start=bar_start,
+                    bar_end=bar_end,
+                    timeframe="1m",
+                    open=row.open,
+                    high=row.high,
+                    low=row.low,
+                    close=row.close,
+                    volume=int(row.volume or 0),
+                    vwap=vwap_value,
+                    source="backtest",
+                    received_at=bar_end,
+                )
+                detected = engine._evaluate_event(
+                    session,
+                    event,
+                    persist=False,
+                    publish=False,
+                    mutate_state=True,
+                    record_metric=False,
+                )
+                for entry in detected:
+                    signal = entry.signal
+                    if signal.generated_at < start or signal.generated_at >= end:
+                        continue
+                    yield _envelope_to_event(signal, trace_id=entry.trace_id)
+            session.rollback()
+        finally:
+            session.close()
 
 
 def _generate_signals_db(

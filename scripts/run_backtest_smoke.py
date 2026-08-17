@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Sequence, TYPE_CHECKING
+from typing import Dict, List, Mapping, Sequence, TYPE_CHECKING
 
 import structlog
 import subprocess
@@ -25,7 +25,6 @@ from libs.infra.db import get_session_factory
 if TYPE_CHECKING:  # pragma: no cover
     from apps.backtest.dao import BacktestDAO
     from apps.backtest.strategy.option_signal_strategy import ContractSelection, OptionSelector
-    from libs.schemas.signals import SignalSide
 
 LOGGER = structlog.get_logger(__name__)
 
@@ -77,6 +76,12 @@ class SmokeRunSummary:
     contract_file: Path
     symbols: List[SymbolRunSummary]
     run_ids: Dict[str, int]
+
+
+@dataclass(frozen=True)
+class TradeDatePlan:
+    trade_date: date
+    symbols: List[str]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -133,6 +138,18 @@ def _load_env_file(path: str | None) -> None:
         return
     load_dotenv(env_path, override=False)
     LOGGER.info("env.file_loaded", path=str(env_path))
+
+
+def _dedupe_symbols(symbols: Sequence[str]) -> List[str]:
+    ordered: List[str] = []
+    seen: set[str] = set()
+    for symbol in symbols:
+        normalized = str(symbol).strip().upper()
+        if not normalized or normalized in seen:
+            continue
+        ordered.append(normalized)
+        seen.add(normalized)
+    return ordered
 
 
 def _python_command(*args: str) -> List[str]:
@@ -219,7 +236,8 @@ def _ensure_equity_data(
         detail = ", ".join(f"{symbol} {counts[symbol]}/{required}" for symbol in missing)
         raise SmokeRetry(f"Equity data missing for {trade_date}: {detail}")
     cmd = _python_command(
-        "scripts/ingest_equity_1m_ibkr.py",
+        "-m",
+        "apps.backtest.data_prep.ingest_equity_1m_ibkr",
         "--date",
         trade_date.isoformat(),
         "--symbols",
@@ -287,8 +305,7 @@ def _ensure_option_l1(
     from apps.backtest.dao import BacktestDAO
 
     contracts_dir.mkdir(parents=True, exist_ok=True)
-    key = "_".join(sorted(symbols))
-    target_path = contracts_dir / f"contracts_{trade_date.isoformat()}_{key}.json"
+    target_path = _contracts_cache_path(contracts_dir, trade_date, symbols)
     if auto_ingest:
         cmd = _python_command(
             "scripts/ingest_option_l1_ibkr.py",
@@ -298,17 +315,27 @@ def _ensure_option_l1(
             *symbols,
             "--output-contracts",
             str(target_path),
+            "--dte-min",
+            "2",
+            "--dte-max",
+            "7",
+            "--otm-min",
+            "0",
+            "--otm-max",
+            "5",
             "--min-minutes",
             str(min_minutes),
             "--market-data-type",
             str(market_data_type),
         )
         _run_subprocess("ingest_option_l1", cmd)
-    if not target_path.exists():
+    source_path, descriptors = _resolve_cached_contracts(contracts_dir, trade_date, symbols)
+    if source_path is None:
         raise SmokeRetry(f"Contracts file not found at {target_path}")
-    descriptors = _load_contracts_from_file(target_path)
     if not descriptors:
         raise SmokeRetry("Contracts file empty; no viable options selected")
+    if source_path != target_path:
+        _write_contract_descriptors(target_path, descriptors)
     start_utc, end_utc = _session_bounds(trade_date)
     with session_factory() as session:
         dao = BacktestDAO(
@@ -353,6 +380,42 @@ def _session_bounds(trade_date: date) -> tuple[datetime, datetime]:
     return start_utc, end_utc
 
 
+def _candidate_symbols_for_trade_date(
+    dao: BacktestDAO,
+    trade_date: date,
+    *,
+    limit: int,
+    start_utc: datetime,
+    end_utc: datetime,
+) -> List[str]:
+    search_limit = max(limit * 5, 10)
+    candidates: List[str] = []
+    candidates.extend(str(sym).upper() for sym in dao.fetch_premarket_top(trade_date=trade_date))
+    volume_rank = dao.fetch_equity_volume_top(
+        start_ts=start_utc,
+        end_ts=end_utc,
+        limit=search_limit,
+    )
+    candidates.extend(
+        row[0].upper() if isinstance(row, tuple) else str(row).upper() for row in volume_rank
+    )
+    option_rank = dao.fetch_option_underlying_top(trade_date=trade_date, limit=search_limit)
+    candidates.extend(str(sym).upper() for sym in option_rank)
+    fallback = [
+        token.strip().upper()
+        for token in get_settings().top5_fixed_pool.split(",")
+        if token.strip()
+    ][:search_limit]
+    if fallback:
+        LOGGER.warning(
+            "smoke.symbols_fallback_fixed_pool",
+            trade_date=str(trade_date),
+            symbols=fallback,
+        )
+        candidates.extend(fallback)
+    return _dedupe_symbols(candidates)
+
+
 def _choose_symbols(
     dao: BacktestDAO,
     trade_date: date,
@@ -361,16 +424,196 @@ def _choose_symbols(
     start_utc: datetime,
     end_utc: datetime,
 ) -> List[str]:
-    symbols = dao.fetch_premarket_top(trade_date=trade_date)
-    if symbols:
-        return [sym.upper() for sym in symbols[:limit]]
-    volume_rank = dao.fetch_equity_volume_top(start_ts=start_utc, end_ts=end_utc, limit=limit)
-    if volume_rank:
-        return [row[0].upper() if isinstance(row, tuple) else row.upper() for row in volume_rank]
-    option_rank = dao.fetch_option_underlying_top(trade_date=trade_date, limit=limit)
-    if option_rank:
-        return [sym.upper() for sym in option_rank]
-    raise SmokeRetry(f"No candidate symbols found for {trade_date}")
+    candidates = _candidate_symbols_for_trade_date(
+        dao,
+        trade_date,
+        limit=limit,
+        start_utc=start_utc,
+        end_utc=end_utc,
+    )
+    if not candidates:
+        raise SmokeRetry(f"No candidate symbols found for {trade_date}")
+    return candidates[:limit]
+
+
+def _contracts_cache_path(contracts_dir: Path, trade_date: date, symbols: Sequence[str]) -> Path:
+    key = "_".join(sorted(_dedupe_symbols(symbols)))
+    return contracts_dir / f"contracts_{trade_date.isoformat()}_{key}.json"
+
+
+def _filter_contract_descriptors(
+    descriptors: Sequence[ContractDescriptor],
+    symbols: Sequence[str],
+) -> List[ContractDescriptor]:
+    target_symbols = set(_dedupe_symbols(symbols))
+    return [desc for desc in descriptors if desc.symbol.upper() in target_symbols]
+
+
+def _resolve_cached_contracts(
+    contracts_dir: Path,
+    trade_date: date,
+    symbols: Sequence[str],
+) -> tuple[Path | None, List[ContractDescriptor]]:
+    target_path = _contracts_cache_path(contracts_dir, trade_date, symbols)
+    if target_path.exists():
+        return target_path, _filter_contract_descriptors(_load_contracts_from_file(target_path), symbols)
+
+    pattern = f"contracts_{trade_date.isoformat()}_*.json"
+    expected_symbols = set(_dedupe_symbols(symbols))
+    for path in sorted(contracts_dir.glob(pattern)):
+        descriptors = _filter_contract_descriptors(_load_contracts_from_file(path), symbols)
+        if expected_symbols.issubset({desc.symbol.upper() for desc in descriptors}):
+            return path, descriptors
+    return None, []
+
+
+def _write_contract_descriptors(path: Path, descriptors: Sequence[ContractDescriptor]) -> None:
+    payload = [
+        {
+            "symbol": desc.symbol,
+            "option_right": desc.option_right,
+            "expiry": desc.expiry,
+            "strike": desc.strike,
+            "conid": desc.conid,
+            "min_tick": desc.min_tick,
+            "open_interest": desc.open_interest,
+            "volume": desc.volume,
+        }
+        for desc in descriptors
+    ]
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _symbol_has_complete_local_data(
+    settings,
+    session_factory: sessionmaker[Session],
+    trade_date: date,
+    symbol: str,
+    *,
+    contracts_dir: Path,
+    min_equity_coverage: float,
+    min_option_coverage: float,
+) -> tuple[bool, str]:
+    from apps.backtest.dao import BacktestDAO
+
+    start_utc, end_utc = _session_bounds(trade_date)
+    expected_equity = _expected_minutes(trade_date)
+    required_equity = max(1, math.ceil(expected_equity * min_equity_coverage))
+    required_option = max(1, math.ceil(expected_equity * min_option_coverage))
+
+    with session_factory() as session:
+        dao = BacktestDAO(
+            session,
+            option_bar_table=settings.option_bar_table,
+            option_chain_table=settings.option_chain_table,
+        )
+        equity_count = dao.count_equity_minutes(
+            symbol=symbol,
+            start_ts=start_utc,
+            end_ts=end_utc,
+        )
+        if equity_count < required_equity:
+            return False, f"{symbol}: equity {equity_count}/{required_equity}"
+
+        contracts_path, descriptors = _resolve_cached_contracts(
+            contracts_dir,
+            trade_date,
+            [symbol],
+        )
+        if contracts_path is None:
+            return False, f"{symbol}: missing cached contracts"
+        if not descriptors:
+            return False, f"{symbol}: empty cached contracts"
+
+        deficits: List[str] = []
+        for desc in descriptors:
+            candidate = dao.fetch_option_candidate_by_conid(desc.conid)
+            if candidate is None or None in (
+                candidate.bid,
+                candidate.ask,
+                candidate.mid,
+                candidate.min_tick,
+            ):
+                deficits.append(f"{desc.conid}: missing option chain quote")
+                continue
+            option_count = dao.count_option_minutes(
+                conid=desc.conid,
+                start_ts=start_utc,
+                end_ts=end_utc,
+            )
+            if option_count < required_option:
+                deficits.append(f"{desc.conid}: option {option_count}/{required_option}")
+        if deficits:
+            return False, f"{symbol}: " + ", ".join(deficits)
+
+    return True, symbol
+
+
+def _select_complete_symbols_for_trade_date(
+    args: argparse.Namespace,
+    settings,
+    session_factory: sessionmaker[Session],
+    trade_date: date,
+) -> tuple[List[str], List[str]]:
+    from apps.backtest.dao import BacktestDAO
+
+    start_utc, end_utc = _session_bounds(trade_date)
+    with session_factory() as session:
+        dao = BacktestDAO(
+            session,
+            option_bar_table=settings.option_bar_table,
+            option_chain_table=settings.option_chain_table,
+        )
+        candidates = _candidate_symbols_for_trade_date(
+            dao,
+            trade_date,
+            limit=args.symbols_limit,
+            start_utc=start_utc,
+            end_utc=end_utc,
+        )
+    selected: List[str] = []
+    reasons: List[str] = []
+    contracts_dir = Path(args.contracts_cache_dir)
+    for symbol in candidates:
+        complete, detail = _symbol_has_complete_local_data(
+            settings,
+            session_factory,
+            trade_date,
+            symbol,
+            contracts_dir=contracts_dir,
+            min_equity_coverage=args.min_equity_coverage,
+            min_option_coverage=args.min_option_coverage,
+        )
+        if complete:
+            selected.append(symbol)
+            if len(selected) >= args.symbols_limit:
+                break
+        else:
+            reasons.append(detail)
+    return selected, reasons
+
+
+def _find_latest_complete_trade_date(
+    args: argparse.Namespace,
+    settings,
+    session_factory: sessionmaker[Session],
+    trade_dates: Sequence[date],
+) -> TradeDatePlan | None:
+    for trade_date in trade_dates:
+        symbols, reasons = _select_complete_symbols_for_trade_date(
+            args,
+            settings,
+            session_factory,
+            trade_date,
+        )
+        if symbols:
+            return TradeDatePlan(trade_date=trade_date, symbols=symbols)
+        LOGGER.info(
+            "smoke.trade_date_incomplete",
+            trade_date=str(trade_date),
+            reasons=reasons[:10],
+        )
+    return None
 
 
 def _build_contract_selection(
@@ -457,6 +700,33 @@ def _option_selector_factory(mapping: Mapping[tuple[str, str], ContractSelection
     return selector
 
 
+def _build_smoke_top5_source(
+    settings,
+    session_factory: sessionmaker[Session],
+    trade_date: date,
+    symbols: Sequence[str],
+):
+    from apps.backtest.pipeline.premarket import PremarketTop5Builder
+    from apps.signal_svc.top5_source import BacktestTop5Source
+
+    batch_id = f"smoke-{trade_date.isoformat()}-{'-'.join(_dedupe_symbols(symbols))}"
+    with session_factory() as session:
+        builder = PremarketTop5Builder(
+            session,
+            preearn_days_min=settings.preearn_days_min,
+            preearn_days_max=settings.preearn_days_max,
+            preearn_atr_pct_max=settings.preearn_atr_pct_max,
+        )
+        builder.build_for_date(
+            batch_id=batch_id,
+            trade_date=trade_date,
+            symbols=_dedupe_symbols(symbols),
+            universe_code="smoke",
+        )
+        session.commit()
+    return BacktestTop5Source(batch_id=batch_id)
+
+
 def _execute_backtests(
     session_factory: sessionmaker[Session],
     settings,
@@ -466,6 +736,12 @@ def _execute_backtests(
     from apps.backtest.bt_runner import run_backtest
 
     start_utc, end_utc = _session_bounds(trade_date)
+    top5_source = _build_smoke_top5_source(
+        settings,
+        session_factory,
+        trade_date,
+        [selection.symbol for selection in selections],
+    )
     contract_map: Dict[tuple[str, str], ContractSelection] = {}
     for selection in selections:
         for right, contract in selection.contracts.items():
@@ -481,6 +757,7 @@ def _execute_backtests(
             risk_mode="inproc",
             option_selector=option_selector,
             option_contracts=selection.contracts,
+            top5_source=top5_source,
         )
         run_ids[selection.symbol.upper()] = run_id
         LOGGER.info("backtest.completed", symbol=selection.symbol, run_id=run_id)
@@ -601,6 +878,8 @@ def _process_trade_date(
     settings,
     session_factory: sessionmaker[Session],
     trade_date: date,
+    *,
+    symbols_override: Sequence[str] | None = None,
 ) -> SmokeRunSummary:
     from apps.backtest.dao import BacktestDAO
 
@@ -612,13 +891,16 @@ def _process_trade_date(
             option_bar_table=settings.option_bar_table,
             option_chain_table=settings.option_chain_table,
         )
-        symbols = _choose_symbols(
-            dao,
-            trade_date,
-            limit=args.symbols_limit,
-            start_utc=start_utc,
-            end_utc=end_utc,
-        )
+        if symbols_override is not None:
+            symbols = _dedupe_symbols(symbols_override)
+        else:
+            symbols = _choose_symbols(
+                dao,
+                trade_date,
+                limit=args.symbols_limit,
+                start_utc=start_utc,
+                end_utc=end_utc,
+            )
     LOGGER.info("smoke.symbols", trade_date=str(trade_date), symbols=symbols)
 
     _ensure_equity_data(
@@ -678,15 +960,42 @@ def main() -> int:
     session_factory = get_session_factory(settings)
 
     trade_dates = _candidate_trade_dates(session_factory, args.lookback_days)
+    attempt_plans: List[TradeDatePlan] = []
+    preferred = _find_latest_complete_trade_date(args, settings, session_factory, trade_dates)
+    if preferred is not None:
+        if preferred.trade_date != trade_dates[0]:
+            LOGGER.info(
+                "smoke.trade_date_fallback",
+                requested_trade_date=str(trade_dates[0]),
+                selected_trade_date=str(preferred.trade_date),
+                symbols=preferred.symbols,
+            )
+        attempt_plans.append(preferred)
     for trade_date in trade_dates:
+        if preferred is not None and trade_date == preferred.trade_date:
+            continue
+        attempt_plans.append(TradeDatePlan(trade_date=trade_date, symbols=[]))
+
+    for plan in attempt_plans:
         for attempt in range(max(1, args.max_retries)):
             try:
-                summary = _process_trade_date(args, settings, session_factory, trade_date)
+                summary = _process_trade_date(
+                    args,
+                    settings,
+                    session_factory,
+                    plan.trade_date,
+                    symbols_override=plan.symbols or None,
+                )
                 _print_summary(summary)
                 _exercise_api(summary)
                 return 0
             except SmokeRetry as exc:
-                LOGGER.warning("smoke.retry", trade_date=str(trade_date), attempt=attempt + 1, detail=str(exc))
+                LOGGER.warning(
+                    "smoke.retry",
+                    trade_date=str(plan.trade_date),
+                    attempt=attempt + 1,
+                    detail=str(exc),
+                )
     LOGGER.error("smoke.failed", reason="all candidate trade dates exhausted")
     return 1
 
@@ -694,22 +1003,33 @@ def main() -> int:
 def _exercise_api(summary: SmokeRunSummary) -> None:
     from apps.backtest.api import app as backtest_api_app
 
-    start = summary.start_utc.isoformat()
-    end = summary.end_utc.isoformat()
     client = TestClient(backtest_api_app)
-    runs_resp = client.get("/runs", params={"start": start, "end": end, "limit": 10})
+    expected_run_ids = set(summary.run_ids.values())
+    runs_resp = client.get("/runs", params={"limit": 100})
     if runs_resp.status_code != 200:
-        LOGGER.warning("api.runs_failed", status=runs_resp.status_code)
-        return
+        raise RuntimeError(f"/runs probe failed with HTTP {runs_resp.status_code}")
     runs_payload = runs_resp.json()
-    LOGGER.info("api.runs_probe", runs=runs_payload.get("data", {}))
+    runs_data = runs_payload.get("data", {})
+    returned_run_ids = {int(row["run_id"]) for row in runs_data.get("runs", []) if "run_id" in row}
+    missing_run_ids = sorted(expected_run_ids - returned_run_ids)
+    if missing_run_ids:
+        raise RuntimeError(f"/runs probe did not return completed run ids: {missing_run_ids}")
+    LOGGER.info("api.runs_probe", run_ids=sorted(expected_run_ids), count=runs_data.get("count"))
     for run_id in summary.run_ids.values():
-        metrics_resp = client.get(f"/metrics/{run_id}")
+        metrics_resp = client.get(f"/backtest-metrics/{run_id}")
+        if metrics_resp.status_code != 200:
+            raise RuntimeError(
+                f"/backtest-metrics/{run_id} probe failed with HTTP {metrics_resp.status_code}"
+            )
+        metrics_payload = metrics_resp.json()
+        total_metrics = (metrics_payload.get("data") or {}).get("total") or {}
+        if not total_metrics:
+            raise RuntimeError(f"/backtest-metrics/{run_id} returned no total metrics")
         LOGGER.info(
             "api.metrics_probe",
             run_id=run_id,
             status=metrics_resp.status_code,
-            payload=metrics_resp.json() if metrics_resp.status_code == 200 else None,
+            metric_count=len(total_metrics),
         )
 
 

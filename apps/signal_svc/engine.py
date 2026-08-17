@@ -39,6 +39,8 @@ from apps.risk_svc.limits import LimitsCache
 
 LOGGER = structlog.get_logger(__name__)
 
+OPTION_QUOTE_MAX_AGE_SECONDS = 60
+
 OPTION_HINT = {
     "dte": [2, 7],
     "otm_steps": [2, 5],
@@ -80,20 +82,239 @@ class SignalEngine:
         history_window: int = 180,
         top5_source: Top5Source | None = None,
         is_backtest: bool = False,
+        allow_missing_option_liquidity_metrics: bool = False,
+        strategy_variant: str | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._redis_bus = redis_bus
         self._strategy_code = strategy_code
         self._history_window = max(60, history_window)
         self._settings = get_settings()
+        self._strategy_variant = str(
+            strategy_variant or self._settings.backtest_strategy_variant or "v1"
+        ).lower()
+        self._orb_entry_enabled = self._strategy_variant in {
+            "v3",
+            "v6",
+            "v7",
+            "orb-entry",
+            "combined-v2",
+            "conservative-execution",
+        }
+        self._delayed_entry_enabled = self._strategy_variant in {
+            "v2",
+            "v3",
+            "v6",
+            "v7",
+            "delayed-entry",
+            "orb-entry",
+            "combined-v2",
+            "conservative-execution",
+        }
+        self._separated_exit_enabled = self._strategy_variant in {
+            "v5",
+            "v6",
+            "v7",
+            "separated-exit-policy",
+            "combined-v2",
+            "conservative-execution",
+        }
+        self._reversal_1030_enabled = self._strategy_variant in {
+            "v8",
+            "v8_1030_reversal",
+            "1030-reversal",
+            "reversal-1030",
+            "v8_guard_filter",
+            "v8-guard-filter",
+            "v8_guard_filter_followthrough",
+            "v8-guard-filter-followthrough",
+            "v8_guard_rsi_floor",
+            "v8-guard-rsi-floor",
+            "v8_guard_rsi_floor_core_room_025",
+            "v8-guard-rsi-floor-core-room-025",
+            "v8_guard_rsi_floor_core_room_035",
+            "v8-guard-rsi-floor-core-room-035",
+            "v8_guard_continuation",
+            "v8-guard-continuation",
+            "v8_guard_continuation_v2",
+            "v8-guard-continuation-v2",
+            "v8_guard_scalp_observe",
+            "v8-guard-scalp-observe",
+            "v8_guard_stop",
+            "v8-guard-stop",
+            "v8a",
+            "v8a_low_reversal",
+            "v8a-low-reversal",
+            "v8b",
+            "v8b_reclaim",
+            "v8b-reclaim",
+            "v8b2",
+            "v8b2_mid_reclaim_quality",
+            "v8b2-mid-reclaim-quality",
+            "v8b2_loose",
+            "v8b2-mid-reclaim-quality-loose",
+            "v8b2_mid_reclaim_quality_loose",
+            "v8b2_room040",
+            "v8b2-mid-reclaim-quality-room040",
+            "v8b2_mid_reclaim_quality_room040",
+            "v8b2_strict",
+            "v8b2-mid-reclaim-quality-strict",
+            "v8b2_mid_reclaim_quality_strict",
+            "v8b3",
+            "v8b3_mid_reclaim_followthrough",
+            "v8b3-mid-reclaim-followthrough",
+            "v8_ab",
+            "v8ab",
+            "v8-a-b",
+        }
+        self._reversal_1030_legacy_enabled = self._strategy_variant in {
+            "v8",
+            "v8_1030_reversal",
+            "1030-reversal",
+            "reversal-1030",
+            "v8_guard_filter",
+            "v8-guard-filter",
+            "v8_guard_filter_followthrough",
+            "v8-guard-filter-followthrough",
+            "v8_guard_rsi_floor",
+            "v8-guard-rsi-floor",
+            "v8_guard_rsi_floor_core_room_025",
+            "v8-guard-rsi-floor-core-room-025",
+            "v8_guard_rsi_floor_core_room_035",
+            "v8-guard-rsi-floor-core-room-035",
+            "v8_guard_continuation",
+            "v8-guard-continuation",
+            "v8_guard_continuation_v2",
+            "v8-guard-continuation-v2",
+            "v8_guard_scalp_observe",
+            "v8-guard-scalp-observe",
+            "v8_guard_stop",
+            "v8-guard-stop",
+        }
+        self._reversal_1030_v8_guard_filter_enabled = self._strategy_variant in {
+            "v8_guard_filter",
+            "v8-guard-filter",
+            "v8_guard_filter_followthrough",
+            "v8-guard-filter-followthrough",
+            "v8_guard_rsi_floor",
+            "v8-guard-rsi-floor",
+            "v8_guard_rsi_floor_core_room_025",
+            "v8-guard-rsi-floor-core-room-025",
+            "v8_guard_rsi_floor_core_room_035",
+            "v8-guard-rsi-floor-core-room-035",
+            "v8_guard_continuation",
+            "v8-guard-continuation",
+            "v8_guard_continuation_v2",
+            "v8-guard-continuation-v2",
+            "v8_guard_scalp_observe",
+            "v8-guard-scalp-observe",
+        }
+        self._reversal_1030_v8_guard_followthrough_enabled = self._strategy_variant in {
+            "v8_guard_filter_followthrough",
+            "v8-guard-filter-followthrough",
+        }
+        self._reversal_1030_v8_guard_rsi_floor_enabled = self._strategy_variant in {
+            "v8_guard_rsi_floor",
+            "v8-guard-rsi-floor",
+            "v8_guard_rsi_floor_core_room_025",
+            "v8-guard-rsi-floor-core-room-025",
+            "v8_guard_rsi_floor_core_room_035",
+            "v8-guard-rsi-floor-core-room-035",
+            "v8_guard_continuation",
+            "v8-guard-continuation",
+            "v8_guard_continuation_v2",
+            "v8-guard-continuation-v2",
+            "v8_guard_scalp_observe",
+            "v8-guard-scalp-observe",
+        }
+        self._reversal_1030_v8_guard_continuation_enabled = self._strategy_variant in {
+            "v8_guard_continuation",
+            "v8-guard-continuation",
+        }
+        self._reversal_1030_v8_guard_core_room_025_enabled = self._strategy_variant in {
+            "v8_guard_rsi_floor_core_room_025",
+            "v8-guard-rsi-floor-core-room-025",
+        }
+        self._reversal_1030_v8_guard_core_room_035_enabled = self._strategy_variant in {
+            "v8_guard_rsi_floor_core_room_035",
+            "v8-guard-rsi-floor-core-room-035",
+        }
+        self._reversal_1030_v8_guard_continuation_v2_enabled = self._strategy_variant in {
+            "v8_guard_continuation_v2",
+            "v8-guard-continuation-v2",
+        }
+        self._reversal_1030_v8_guard_scalp_observe_enabled = self._strategy_variant in {
+            "v8_guard_scalp_observe",
+            "v8-guard-scalp-observe",
+        }
+        self._reversal_1030_v8_guard_stop_enabled = self._strategy_variant in {
+            "v8_guard_stop",
+            "v8-guard-stop",
+        }
+        self._reversal_1030_v8a_enabled = self._strategy_variant in {
+            "v8a",
+            "v8a_low_reversal",
+            "v8a-low-reversal",
+            "v8_ab",
+            "v8ab",
+            "v8-a-b",
+        }
+        self._reversal_1030_v8b_enabled = self._strategy_variant in {
+            "v8b",
+            "v8b_reclaim",
+            "v8b-reclaim",
+            "v8_ab",
+            "v8ab",
+            "v8-a-b",
+        }
+        self._reversal_1030_v8b2_enabled = self._strategy_variant in {
+            "v8b2",
+            "v8b2_mid_reclaim_quality",
+            "v8b2-mid-reclaim-quality",
+            "v8b2_loose",
+            "v8b2-mid-reclaim-quality-loose",
+            "v8b2_mid_reclaim_quality_loose",
+            "v8b2_room040",
+            "v8b2-mid-reclaim-quality-room040",
+            "v8b2_mid_reclaim_quality_room040",
+            "v8b2_strict",
+            "v8b2-mid-reclaim-quality-strict",
+            "v8b2_mid_reclaim_quality_strict",
+            "v8b3",
+            "v8b3_mid_reclaim_followthrough",
+            "v8b3-mid-reclaim-followthrough",
+        }
+        self._reversal_1030_v8b3_enabled = self._strategy_variant in {
+            "v8b3",
+            "v8b3_mid_reclaim_followthrough",
+            "v8b3-mid-reclaim-followthrough",
+        }
+        self._reversal_1030_v8b2_loose_enabled = self._strategy_variant in {
+            "v8b2_loose",
+            "v8b2-mid-reclaim-quality-loose",
+            "v8b2_mid_reclaim_quality_loose",
+        }
+        self._reversal_1030_v8b2_room040_enabled = self._strategy_variant in {
+            "v8b2_room040",
+            "v8b2-mid-reclaim-quality-room040",
+            "v8b2_mid_reclaim_quality_room040",
+        }
+        self._reversal_1030_v8b2_strict_enabled = self._strategy_variant in {
+            "v8b2_strict",
+            "v8b2-mid-reclaim-quality-strict",
+            "v8b2_mid_reclaim_quality_strict",
+        }
         self._ttl = self._settings.ttl_buy_seconds
         self._cooldown = self._settings.cooldown_buy_seconds
         self._mfi_stoch_filter = self._settings.feature_mfi_stoch_filter
         self._preearn_days_min = int(self._settings.preearn_days_min)
         self._is_backtest = is_backtest
+        self._allow_missing_option_liquidity_metrics = allow_missing_option_liquidity_metrics
+        self._option_liquidity_required = bool(self._settings.option_liquidity_required)
         self._preearn_days_max = int(self._settings.preearn_days_max)
         self._preearn_atr_pct_max = Decimal(str(self._settings.preearn_atr_pct_max))
         self._positions: Dict[str, PositionState] = {}
+        self._reversal_1030_entries: Dict[str, Dict[str, Any]] = {}
         self._upper_break: Dict[str, datetime] = {}
         self._last_signal_ts: Dict[Tuple[str, str], datetime] = {}
         self._top5_recent_cache: Dict[date, set[str]] = {}
@@ -705,7 +926,27 @@ class SignalEngine:
         session: Session,
     ) -> Optional[SignalEnvelope]:
         et_time = _to_eastern(event.bar_end)
-        if (et_time.hour, et_time.minute) != (9, 31):
+        if getattr(self, "_orb_entry_enabled", False):
+            return None
+        if getattr(self, "_delayed_entry_enabled", False):
+            earliest = self._parse_hhmm(
+                str(getattr(self._settings, "open_chase_earliest_entry_time", "09:36"))
+            )
+            if et_time.time() < earliest or et_time.time() >= time(10, 30):
+                LOGGER.info(
+                    "signal.e1.delayed_entry_filtered",
+                    symbol=event.symbol,
+                    timestamp=et_time.isoformat(),
+                    earliest_entry_time=earliest.isoformat(timespec="minutes"),
+                    reason="open chase delayed-entry variant blocks 09:30-09:34 baseline entry",
+                )
+                try:
+                    if self._metrics_enabled:
+                        record_signal_filtered("OPEN_CHASE_DELAYED_ENTRY")
+                except Exception:
+                    pass
+                return None
+        elif (et_time.hour, et_time.minute) != (9, 31):
             return None
         
         # 入口日志：记录进入E1检测
@@ -773,16 +1014,12 @@ class SignalEngine:
         )
         try:
             # 昨日收盘价（RTH 收盘）
-            row_prev = session.execute(
-                text(
-                    """
-                    SELECT prev_close_rth
-                    FROM v_daily_ohlcv_enriched
-                    WHERE symbol = :symbol AND trade_date_et::date = :trade_date
-                    """
-                ),
-                {"symbol": event.symbol, "trade_date": trade_date},
-            ).fetchone()
+            prev_close_value = self._fallback_daily_field_value(
+                session,
+                event.symbol,
+                trade_date,
+                field_name="prev_close_rth",
+            )
             # 09:28 分钟的 ts_end（美东时区）
             ts_0928_et = datetime.combine(trade_date, time(9, 28), EASTERN)
             ts_0928_utc = ts_0928_et.astimezone(timezone.utc)
@@ -801,19 +1038,19 @@ class SignalEngine:
                 "signal.e1.gap_data_fetched",
                 symbol=event.symbol,
                 timestamp=et_time.isoformat(),
-                has_prev_close=bool(row_prev and row_prev[0]),
+                has_prev_close=prev_close_value is not None,
                 has_0928_price=bool(row_0928 and row_0928[0]),
-                prev_close_value=str(row_prev[0]) if row_prev and row_prev[0] else "None",
+                prev_close_value=str(prev_close_value) if prev_close_value is not None else "None",
                 price_0928_value=str(row_0928[0]) if row_0928 and row_0928[0] else "None"
             )
             
-            if row_prev is None or row_prev[0] is None or row_0928 is None or row_0928[0] is None:
+            if prev_close_value is None or row_0928 is None or row_0928[0] is None:
                 # 缺少关键数据则不通过过滤
                 LOGGER.info(
                     "signal.e1.gap_data_missing",
                     symbol=event.symbol,
                     timestamp=et_time.isoformat(),
-                    prev_close_available=bool(row_prev and row_prev[0]),
+                    prev_close_available=prev_close_value is not None,
                     price_0928_available=bool(row_0928 and row_0928[0]),
                     reason="盘前涨幅过滤：缺少昨收或09:28价格数据"
                 )
@@ -825,7 +1062,7 @@ class SignalEngine:
                 return None
 
             try:
-                prev_close = Decimal(str(row_prev[0]))
+                prev_close = Decimal(str(prev_close_value))
                 price_0928 = Decimal(str(row_0928[0]))
                 LOGGER.info(
                     "signal.e1.gap_data_parsed",
@@ -1321,6 +1558,919 @@ class SignalEngine:
             generated_at=event.bar_end,
         )
 
+    def _detect_open_chase_orb(
+        self,
+        event: BarsClosed,
+        df: pd.DataFrame,
+        trade_date: date,
+        vix_value: Optional[Decimal],
+        session: Session,
+    ) -> Optional[SignalEnvelope]:
+        if not getattr(self, "_orb_entry_enabled", False):
+            return None
+        et_time = _to_eastern(event.bar_end)
+        earliest = self._parse_hhmm(
+            str(getattr(self._settings, "open_chase_earliest_entry_time", "09:36"))
+        )
+        if et_time.time() < earliest or et_time.time() >= time(10, 30):
+            return None
+        if not self._top5_today(trade_date, session, event.symbol):
+            return None
+        todays = df[df["et"].dt.date == trade_date]
+        if len(todays) < max(6, int(getattr(self._settings, "open_chase_opening_range_minutes", 5))):
+            return None
+        current = todays.iloc[-1]
+        close = current["close"]
+        high = current["high"]
+        low = current["low"]
+        open_px = current["open"]
+        if None in (close, high, low, open_px):
+            return None
+
+        or_high, or_low = self._opening_range_from_df(todays)
+        vwap = self._vwap_from_df(todays)
+        if or_high is None or or_low is None or vwap is None:
+            return None
+        if close <= vwap:
+            return self._log_orb_reject(event, "reject_below_vwap")
+        if close <= or_high:
+            return self._log_orb_reject(event, "reject_not_breaking_orh")
+
+        total_range = high - low
+        if total_range <= 0:
+            return self._log_orb_reject(event, "reject_invalid_range")
+        close_position = (close - low) / total_range
+        if close_position < Decimal("0.50"):
+            return self._log_orb_reject(event, "reject_reclaim_failed")
+        upper_shadow = high - max(open_px, close)
+        upper_shadow_pct = upper_shadow / total_range if total_range > 0 else Decimal("1")
+        max_shadow = Decimal(
+            str(getattr(self._settings, "open_chase_max_upper_shadow_pct", Decimal("0.40")))
+        )
+        if upper_shadow_pct > max_shadow:
+            return self._log_orb_reject(event, "reject_large_upper_shadow")
+        if self._first_bar_blowoff(todays):
+            return self._log_orb_reject(event, "reject_first_bar_blowoff")
+        rvol = current.get("rvol6")
+        min_rvol = Decimal(str(getattr(self._settings, "open_chase_min_rvol", Decimal("1.0"))))
+        if rvol is not None and rvol < min_rvol:
+            return self._log_orb_reject(event, "reject_low_relative_volume")
+        if bool(getattr(self._settings, "open_chase_require_market_confirmed", False)):
+            return self._log_orb_reject(event, "reject_market_not_confirmed")
+
+        allowed, addition = self._can_open_position(event.symbol, df, session, event.bar_end)
+        if not allowed:
+            return None
+        reason = {
+            "entry_mode": "breakout",
+            "opening_range_high": str(or_high),
+            "opening_range_low": str(or_low),
+            "vwap": str(vwap),
+            "close": str(close),
+            "close_position": str(close_position),
+            "upper_shadow_pct": str(upper_shadow_pct),
+            "rvol6": str(rvol) if rvol is not None else None,
+            "add_position": addition,
+            "filters": {
+                "reject_below_vwap": False,
+                "reject_not_breaking_orh": False,
+                "reject_reclaim_failed": False,
+                "reject_large_upper_shadow": False,
+                "reject_first_bar_blowoff": False,
+                "reject_low_relative_volume": False,
+                "reject_market_not_confirmed": False,
+            },
+        }
+        return self._build_signal(
+            symbol=event.symbol,
+            signal_code="SIG_OPEN_CHASE_ORB_BUY",
+            side=SignalSide.BUY,
+            reason=reason,
+            generated_at=event.bar_end,
+        )
+
+    def _detect_1030_reversal_call(
+        self,
+        event: BarsClosed,
+        df: pd.DataFrame,
+        trade_date: date,
+        vix_value: Optional[Decimal],
+        session: Session,
+    ) -> Optional[SignalEnvelope]:
+        if not getattr(
+            self,
+            "_reversal_1030_legacy_enabled",
+            getattr(self, "_reversal_1030_enabled", False),
+        ):
+            return None
+        symbol = event.symbol.upper()
+        symbols = {
+            item.strip().upper()
+            for item in str(getattr(self._settings, "reversal_1030_symbols", "")).split(",")
+            if item.strip()
+        }
+        if symbols and symbol not in symbols:
+            return None
+
+        et_time = _to_eastern(event.bar_end)
+        start_time = self._parse_hhmm(
+            str(getattr(self._settings, "reversal_1030_start_time", "10:25"))
+        )
+        end_time = self._parse_hhmm(
+            str(getattr(self._settings, "reversal_1030_end_time", "10:40"))
+        )
+        if et_time.time() < start_time or et_time.time() > end_time:
+            return None
+        max_vix = Decimal(str(getattr(self._settings, "reversal_1030_max_vix", Decimal("20"))))
+        if vix_value is not None and vix_value > max_vix:
+            return self._log_1030_reject(event, "reject_vix_high", vix=str(vix_value))
+
+        todays = df[df["et"].dt.date == trade_date]
+        morning = todays[
+            (todays["et"].dt.time >= time(9, 30))
+            & (todays["et"].dt.time <= et_time.time())
+        ]
+        if len(morning) < 20:
+            return None
+        current = morning.iloc[-1]
+        prev = morning.iloc[-2]
+        session_open = _to_decimal(morning.iloc[0]["open"])
+        close = _to_decimal(current["close"])
+        open_px = _to_decimal(current["open"])
+        high = _to_decimal(current["high"])
+        low = _to_decimal(current["low"])
+        boll_dn = _to_decimal(current.get("boll_dn"))
+        boll_mid = _to_decimal(current.get("boll_mid"))
+        boll_up = _to_decimal(current.get("boll_up"))
+        rsi = _to_decimal(current.get("rsi6"))
+        prev_rsi = _to_decimal(prev.get("rsi6"))
+        if session_open <= 0 or close <= 0 or high <= 0 or low <= 0:
+            return None
+        if boll_dn <= 0 or boll_mid <= 0 or boll_up <= 0:
+            return None
+
+        abs_gap_limit = Decimal(
+            str(getattr(self._settings, "reversal_1030_max_abs_gap_pct", Decimal("0.06")))
+        )
+        intraday_move = (close - session_open) / session_open
+        if abs(intraday_move) > abs_gap_limit:
+            return self._log_1030_reject(
+                event,
+                "reject_abs_move_gt_limit",
+                intraday_move=str(intraday_move),
+                limit=str(abs_gap_limit),
+            )
+
+        min_drop = Decimal(
+            str(getattr(self._settings, "reversal_1030_min_morning_drop_pct", Decimal("0.003")))
+        )
+        morning_low = _to_decimal(morning["low"].min())
+        morning_drop = (session_open - morning_low) / session_open
+        if morning_drop < min_drop:
+            return self._log_1030_reject(
+                event,
+                "reject_no_morning_selloff",
+                morning_drop=str(morning_drop),
+                threshold=str(min_drop),
+            )
+
+        lower_buffer = Decimal(
+            str(getattr(self._settings, "reversal_1030_lower_band_buffer_pct", Decimal("0.0015")))
+        )
+        lower_touch_window = morning.tail(8)
+        lower_touch = False
+        doji_stability_count = 0
+        for _, row in lower_touch_window.iterrows():
+            row_low = _to_decimal(row.get("low"))
+            row_close = _to_decimal(row.get("close"))
+            row_open = _to_decimal(row.get("open"))
+            row_high = _to_decimal(row.get("high"))
+            row_dn = _to_decimal(row.get("boll_dn"))
+            if row_dn <= 0:
+                continue
+            if row_low <= row_dn * (Decimal("1") + lower_buffer):
+                lower_touch = True
+            bar_range = row_high - row_low
+            body = abs(row_close - row_open)
+            if (
+                row_low <= row_dn * (Decimal("1") + lower_buffer * Decimal("2"))
+                and bar_range > 0
+                and body / bar_range <= Decimal("0.35")
+            ):
+                doji_stability_count += 1
+        if not lower_touch and doji_stability_count < 3:
+            return self._log_1030_reject(event, "reject_no_lower_band_reversal")
+
+        green_bar = close > open_px
+        reclaim_lower = close > boll_dn and prev.get("close") is not None and _to_decimal(prev["close"]) <= boll_dn
+        recent_high_break = close > _to_decimal(morning.tail(4).iloc[:-1]["high"].max())
+        rsi_reclaim_level = Decimal(
+            str(getattr(self._settings, "reversal_1030_rsi_reclaim", Decimal("30")))
+        )
+        rsi_reclaim = rsi >= rsi_reclaim_level and (
+            prev_rsi < rsi_reclaim_level or rsi > prev_rsi
+        )
+        if not (green_bar and rsi_reclaim and (reclaim_lower or recent_high_break)):
+            return self._log_1030_reject(
+                event,
+                "reject_no_reversal_confirmation",
+                green_bar=str(green_bar),
+                rsi=str(rsi),
+                prev_rsi=str(prev_rsi),
+                reclaim_lower=str(reclaim_lower),
+                recent_high_break=str(recent_high_break),
+            )
+
+        vwap = self._vwap_from_df(morning)
+        boll_position = self._bollinger_position(close, boll_dn, boll_up)
+        vwap_distance = None
+        if vwap is not None and vwap > 0:
+            vwap_distance = (close - vwap) / vwap
+        guard_boll_pos_threshold = Decimal(
+            str(
+                getattr(
+                    self._settings,
+                    "reversal_1030_v8_guard_boll_pos_threshold",
+                    Decimal("0.30"),
+                )
+            )
+        )
+        v8_guard_triggered = bool(
+            vwap is not None
+            and close > vwap
+            and boll_position < guard_boll_pos_threshold
+        )
+        if (
+            getattr(self, "_reversal_1030_v8_guard_filter_enabled", False)
+            and v8_guard_triggered
+        ):
+            return self._log_1030_reject(
+                event,
+                "reject_v8_guard_above_vwap_low_boll_position",
+                close=str(close),
+                vwap=str(vwap),
+                boll_position=str(boll_position),
+                limit=str(guard_boll_pos_threshold),
+            )
+        if getattr(self, "_reversal_1030_v8_guard_rsi_floor_enabled", False):
+            rsi_floor_boll_pos_threshold = Decimal(
+                str(
+                    getattr(
+                        self._settings,
+                        "reversal_1030_v8_guard_rsi_floor_boll_pos_threshold",
+                        Decimal("0.20"),
+                    )
+                )
+            )
+            rsi_floor_min_rsi6 = Decimal(
+                str(
+                    getattr(
+                        self._settings,
+                        "reversal_1030_v8_guard_rsi_floor_min_rsi6",
+                        Decimal("35"),
+                    )
+                )
+            )
+            if (
+                vwap is not None
+                and close <= vwap
+                and boll_position < rsi_floor_boll_pos_threshold
+                and rsi < rsi_floor_min_rsi6
+            ):
+                return self._log_1030_reject(
+                    event,
+                    "reject_v8_guard_rsi_floor_below_vwap_deep_low",
+                    close=str(close),
+                    vwap=str(vwap),
+                    boll_position=str(boll_position),
+                    boll_pos_limit=str(rsi_floor_boll_pos_threshold),
+                    rsi=str(rsi),
+                    rsi_limit=str(rsi_floor_min_rsi6),
+                )
+        upper_room = (boll_up - close) / close
+        continuation_enabled = bool(
+            getattr(self, "_reversal_1030_v8_guard_continuation_enabled", False)
+        )
+        thin_room_filter = Decimal(
+            str(
+                getattr(
+                    self._settings,
+                    "reversal_1030_thin_room_filter_pct",
+                    Decimal("0.0010"),
+                )
+            )
+        )
+        thin_room_min_boll_pos = Decimal(
+            str(
+                getattr(
+                    self._settings,
+                    "reversal_1030_thin_room_filter_min_boll_pos",
+                    Decimal("0.80"),
+                )
+            )
+        )
+        if (
+            continuation_enabled
+            and upper_room < thin_room_filter
+            and boll_position > thin_room_min_boll_pos
+            and not (vwap is not None and close > vwap)
+        ):
+            return self._log_1030_reject(
+                event,
+                "reject_v8_guard_continuation_thin_room_near_upper",
+                close=str(close),
+                vwap=str(vwap) if vwap is not None else None,
+                boll_position=str(boll_position),
+                boll_pos_limit=str(thin_room_min_boll_pos),
+                upper_room_pct=str(upper_room),
+                upper_room_limit=str(thin_room_filter),
+            )
+        core_room_min_upper_room = None
+        if getattr(self, "_reversal_1030_v8_guard_core_room_025_enabled", False):
+            core_room_min_upper_room = Decimal(
+                str(
+                    getattr(
+                        self._settings,
+                        "reversal_1030_v8_guard_core_room_025_min_upper_room_pct",
+                        Decimal("0.0025"),
+                    )
+                )
+            )
+        elif getattr(self, "_reversal_1030_v8_guard_core_room_035_enabled", False):
+            core_room_min_upper_room = Decimal(
+                str(
+                    getattr(
+                        self._settings,
+                        "reversal_1030_v8_guard_core_room_035_min_upper_room_pct",
+                        Decimal("0.0035"),
+                    )
+                )
+            )
+        core_max_boll_pos = Decimal(
+            str(
+                getattr(
+                    self._settings,
+                    "reversal_1030_v8_guard_core_max_boll_pos",
+                    Decimal("0.80"),
+                )
+            )
+        )
+        core_room_enabled = core_room_min_upper_room is not None
+        if core_room_enabled:
+            if upper_room < core_room_min_upper_room:
+                return self._log_1030_reject(
+                    event,
+                    "reject_v8_guard_core_upper_room_small",
+                    upper_room_pct=str(upper_room),
+                    limit=str(core_room_min_upper_room),
+                )
+            if boll_position > core_max_boll_pos:
+                return self._log_1030_reject(
+                    event,
+                    "reject_v8_guard_core_boll_position_high",
+                    boll_position=str(boll_position),
+                    limit=str(core_max_boll_pos),
+                )
+
+        continuation_v2_enabled = bool(
+            getattr(self, "_reversal_1030_v8_guard_continuation_v2_enabled", False)
+        )
+        continuation_min_boll_pos = Decimal(
+            str(
+                getattr(
+                    self._settings,
+                    "reversal_1030_v8_guard_continuation_min_boll_pos",
+                    Decimal("0.60"),
+                )
+            )
+        )
+        is_continuation_candidate = bool(
+            vwap is not None
+            and close >= vwap
+            and close >= boll_mid
+            and boll_position >= continuation_min_boll_pos
+        )
+        if continuation_v2_enabled and not is_continuation_candidate:
+            return self._log_1030_reject(
+                event,
+                "reject_v8_guard_continuation_v2_not_quality_continuation",
+                close=str(close),
+                vwap=str(vwap) if vwap is not None else None,
+                boll_mid=str(boll_mid),
+                boll_position=str(boll_position),
+                boll_pos_min=str(continuation_min_boll_pos),
+            )
+
+        scalp_observe_enabled = bool(
+            getattr(self, "_reversal_1030_v8_guard_scalp_observe_enabled", False)
+        )
+        is_scalp_thin_room = bool(
+            vwap is not None
+            and close >= vwap
+            and boll_position > thin_room_min_boll_pos
+            and upper_room < thin_room_filter
+        )
+        if scalp_observe_enabled and not is_scalp_thin_room:
+            return self._log_1030_reject(
+                event,
+                "reject_v8_guard_scalp_observe_not_thin_room_scalp",
+                close=str(close),
+                vwap=str(vwap) if vwap is not None else None,
+                boll_position=str(boll_position),
+                boll_pos_min=str(thin_room_min_boll_pos),
+                upper_room_pct=str(upper_room),
+                upper_room_limit=str(thin_room_filter),
+            )
+        allowed, addition = self._can_open_position(event.symbol, df, session, event.bar_end)
+        if not allowed:
+            return None
+        entry_mode = (
+            "v8_guard_stop"
+            if getattr(self, "_reversal_1030_v8_guard_stop_enabled", False)
+            else "v8_guard_filter_followthrough"
+            if getattr(self, "_reversal_1030_v8_guard_followthrough_enabled", False)
+            else "v8_guard_continuation_v2"
+            if continuation_v2_enabled
+            else "v8_guard_scalp_observe"
+            if scalp_observe_enabled
+            else "v8_guard_rsi_floor_core_room_025"
+            if getattr(self, "_reversal_1030_v8_guard_core_room_025_enabled", False)
+            else "v8_guard_rsi_floor_core_room_035"
+            if getattr(self, "_reversal_1030_v8_guard_core_room_035_enabled", False)
+            else "v8_guard_continuation"
+            if continuation_enabled
+            else "v8_guard_rsi_floor"
+            if getattr(self, "_reversal_1030_v8_guard_rsi_floor_enabled", False)
+            else "1030_reversal_call"
+        )
+        if core_room_enabled:
+            trade_type = "option_core_reversal"
+            quality_profile = "core_room_025" if entry_mode.endswith("_025") else "core_room_035"
+        elif continuation_v2_enabled:
+            trade_type = "continuation_candidate"
+            quality_profile = "continuation_v2"
+        elif scalp_observe_enabled:
+            trade_type = "scalp_thin_room"
+            quality_profile = "scalp_observe"
+        else:
+            trade_type = None
+            quality_profile = None
+        reason = {
+            "entry_mode": entry_mode,
+            "watchlist": sorted(symbols),
+            "session_open": str(session_open),
+            "morning_low": str(morning_low),
+            "morning_drop_pct": str(morning_drop),
+            "intraday_move_pct": str(intraday_move),
+            "boll_dn": str(boll_dn),
+            "boll_mid": str(boll_mid),
+            "boll_up": str(boll_up),
+            "boll_position": str(boll_position),
+            "upper_room_pct": str(upper_room),
+            "vwap": str(vwap) if vwap is not None else None,
+            "vwap_distance_pct": str(vwap_distance) if vwap_distance is not None else None,
+            "rsi6": str(rsi),
+            "prev_rsi6": str(prev_rsi),
+            "lower_touch": lower_touch,
+            "doji_stability_count": doji_stability_count,
+            "green_bar": green_bar,
+            "reclaim_lower": reclaim_lower,
+            "recent_high_break": recent_high_break,
+            "entry_bar_low": str(low),
+            "entry_close": str(close),
+            "entry_vwap": str(vwap) if vwap is not None else None,
+            "entry_boll_mid": str(boll_mid),
+            "v8_guard_triggered": v8_guard_triggered,
+            "v8_guard_boll_pos_threshold": str(guard_boll_pos_threshold),
+            "is_option_core": bool(core_room_enabled),
+            "is_continuation_candidate": bool(is_continuation_candidate),
+            "is_scalp_thin_room": bool(is_scalp_thin_room),
+            "trade_type": trade_type,
+            "quality_profile": quality_profile,
+            "min_upper_room_pct": (
+                str(core_room_min_upper_room) if core_room_min_upper_room is not None else None
+            ),
+            "max_core_boll_pos": str(core_max_boll_pos),
+            "v8_guard_entry_low_stop_enabled": bool(
+                getattr(self, "_reversal_1030_v8_guard_stop_enabled", False)
+                and v8_guard_triggered
+            ),
+            "exit_plan": {
+                "primary": "sell_call_when_underlying_or_option_taps_1m_boll_upper",
+                "deadline": str(getattr(self._settings, "reversal_1030_exit_deadline", "12:00")),
+            },
+            "add_position": addition,
+            "option_liquidity": self._liquidity_snapshot.get(event.symbol, {"pass": True}),
+        }
+        return self._build_signal(
+            symbol=event.symbol,
+            signal_code="SIG_1030_REVERSAL_CALL_BUY",
+            side=SignalSide.BUY,
+            reason=reason,
+            generated_at=event.bar_end,
+            ttl_override=min(int(self._ttl), 90),
+        )
+
+    def _detect_1030_v8a_low_reversal_call(
+        self,
+        event: BarsClosed,
+        df: pd.DataFrame,
+        trade_date: date,
+        vix_value: Optional[Decimal],
+        session: Session,
+    ) -> Optional[SignalEnvelope]:
+        if not getattr(self, "_reversal_1030_v8a_enabled", False):
+            return None
+        ctx = self._reversal_1030_context(event, df, trade_date, vix_value)
+        if ctx is None:
+            return None
+
+        vwap = ctx["vwap"]
+        close = ctx["close"]
+        if vwap is None or close >= vwap:
+            return self._log_1030_reject(
+                event,
+                "reject_v8a_not_below_vwap",
+                close=str(close),
+                vwap=str(vwap) if vwap is not None else None,
+            )
+
+        max_boll_pos = Decimal(
+            str(getattr(self._settings, "reversal_1030_max_boll_pos_low", Decimal("0.55")))
+        )
+        if ctx["boll_position"] > max_boll_pos:
+            return self._log_1030_reject(
+                event,
+                "reject_v8a_boll_position_high",
+                boll_position=str(ctx["boll_position"]),
+                limit=str(max_boll_pos),
+            )
+
+        max_rsi = Decimal(str(getattr(self._settings, "reversal_1030_max_rsi6", Decimal("65"))))
+        if ctx["rsi"] > max_rsi:
+            return self._log_1030_reject(
+                event,
+                "reject_v8a_rsi_hot",
+                rsi=str(ctx["rsi"]),
+                limit=str(max_rsi),
+            )
+
+        if not (
+            ctx["green_bar"]
+            and ctx["rsi_reclaim"]
+            and (ctx["reclaim_lower"] or ctx["recent_high_break"])
+            and (ctx["lower_touch"] or ctx["doji_stability_count"] >= 3)
+        ):
+            return self._log_1030_reject(
+                event,
+                "reject_v8a_no_low_reversal_confirmation",
+                green_bar=str(ctx["green_bar"]),
+                rsi=str(ctx["rsi"]),
+                prev_rsi=str(ctx["prev_rsi"]),
+                reclaim_lower=str(ctx["reclaim_lower"]),
+                recent_high_break=str(ctx["recent_high_break"]),
+                lower_touch=str(ctx["lower_touch"]),
+            )
+
+        allowed, addition = self._can_open_position(event.symbol, df, session, event.bar_end)
+        if not allowed:
+            return None
+        reason = self._reversal_1030_reason(ctx, entry_mode="v8a_low_reversal", addition=addition)
+        return self._build_signal(
+            symbol=event.symbol,
+            signal_code="SIG_1030_V8A_LOW_REVERSAL_CALL_BUY",
+            side=SignalSide.BUY,
+            reason=reason,
+            generated_at=event.bar_end,
+            ttl_override=min(int(self._ttl), 90),
+        )
+
+    def _detect_1030_v8b_reclaim_call(
+        self,
+        event: BarsClosed,
+        df: pd.DataFrame,
+        trade_date: date,
+        vix_value: Optional[Decimal],
+        session: Session,
+    ) -> Optional[SignalEnvelope]:
+        if not getattr(self, "_reversal_1030_v8b_enabled", False):
+            return None
+        if self._positions.get(event.symbol) is not None:
+            return None
+        ctx = self._reversal_1030_context(event, df, trade_date, vix_value)
+        if ctx is None:
+            return None
+
+        max_boll_pos = Decimal(
+            str(getattr(self._settings, "reversal_1030_max_boll_pos_reclaim", Decimal("0.60")))
+        )
+        if ctx["boll_position"] > max_boll_pos:
+            return self._log_1030_reject(
+                event,
+                "reject_v8b_boll_position_high",
+                boll_position=str(ctx["boll_position"]),
+                limit=str(max_boll_pos),
+            )
+
+        max_rsi = Decimal(str(getattr(self._settings, "reversal_1030_max_rsi6", Decimal("65"))))
+        if ctx["rsi"] > max_rsi:
+            return self._log_1030_reject(
+                event,
+                "reject_v8b_rsi_hot",
+                rsi=str(ctx["rsi"]),
+                limit=str(max_rsi),
+            )
+
+        max_upper_shadow = Decimal(
+            str(getattr(self._settings, "reversal_1030_max_upper_shadow_pct", Decimal("0.40")))
+        )
+        if ctx["upper_shadow_pct"] > max_upper_shadow:
+            return self._log_1030_reject(
+                event,
+                "reject_v8b_large_upper_shadow",
+                upper_shadow_pct=str(ctx["upper_shadow_pct"]),
+                limit=str(max_upper_shadow),
+            )
+
+        reclaim_level = None
+        reclaim_type = None
+        if ctx["reclaim_vwap"]:
+            reclaim_level = ctx["vwap"]
+            reclaim_type = "vwap"
+        elif ctx["reclaim_mid"]:
+            reclaim_level = ctx["boll_mid"]
+            reclaim_type = "boll_mid"
+        if reclaim_level is None or reclaim_level <= 0:
+            return self._log_1030_reject(
+                event,
+                "reject_v8b_no_reclaim",
+                reclaim_vwap=str(ctx["reclaim_vwap"]),
+                reclaim_mid=str(ctx["reclaim_mid"]),
+            )
+
+        max_distance = Decimal(
+            str(
+                getattr(
+                    self._settings,
+                    "reversal_1030_reclaim_max_distance_vwap_pct",
+                    Decimal("0.0025"),
+                )
+            )
+        )
+        reclaim_distance = (ctx["close"] - reclaim_level) / reclaim_level
+        if reclaim_distance < 0 or reclaim_distance > max_distance:
+            return self._log_1030_reject(
+                event,
+                "reject_v8b_reclaim_extended",
+                reclaim_type=reclaim_type,
+                reclaim_distance=str(reclaim_distance),
+                limit=str(max_distance),
+            )
+
+        if not ctx["green_bar"]:
+            return self._log_1030_reject(event, "reject_v8b_not_green")
+
+        allowed, addition = self._can_open_position(event.symbol, df, session, event.bar_end)
+        if not allowed:
+            return None
+        reason = self._reversal_1030_reason(
+            ctx,
+            entry_mode="v8b_reclaim",
+            addition=addition,
+            extra={
+                "reclaim_type": reclaim_type,
+                "reclaim_level": str(reclaim_level),
+                "reclaim_distance_pct": str(reclaim_distance),
+            },
+        )
+        return self._build_signal(
+            symbol=event.symbol,
+            signal_code="SIG_1030_V8B_RECLAIM_CALL_BUY",
+            side=SignalSide.BUY,
+            reason=reason,
+            generated_at=event.bar_end,
+            ttl_override=min(int(self._ttl), 90),
+        )
+
+    def _detect_1030_v8b2_mid_reclaim_quality_call(
+        self,
+        event: BarsClosed,
+        df: pd.DataFrame,
+        trade_date: date,
+        vix_value: Optional[Decimal],
+        session: Session,
+    ) -> Optional[SignalEnvelope]:
+        if not getattr(self, "_reversal_1030_v8b2_enabled", False):
+            return None
+        if self._positions.get(event.symbol) is not None:
+            return None
+        ctx = self._reversal_1030_context(event, df, trade_date, vix_value)
+        if ctx is None:
+            return None
+
+        strict = bool(getattr(self, "_reversal_1030_v8b2_strict_enabled", False))
+        loose = bool(getattr(self, "_reversal_1030_v8b2_loose_enabled", False))
+        room040 = bool(getattr(self, "_reversal_1030_v8b2_room040_enabled", False))
+        followthrough = bool(getattr(self, "_reversal_1030_v8b3_enabled", False))
+        if followthrough:
+            max_boll_pos = Decimal(
+                str(
+                    getattr(
+                        self._settings,
+                        "reversal_1030_max_boll_pos_reclaim",
+                        Decimal("0.60"),
+                    )
+                )
+            )
+            min_upper_room = Decimal(
+                str(
+                    getattr(
+                        self._settings,
+                        "reversal_1030_mid_reclaim_min_upper_room_pct",
+                        Decimal("0.0035"),
+                    )
+                )
+            )
+            quality_profile = "followthrough"
+            entry_mode = "v8b3_mid_reclaim_followthrough"
+        elif strict:
+            max_boll_pos = Decimal(
+                str(
+                    getattr(
+                        self._settings,
+                        "reversal_1030_mid_reclaim_strict_max_boll_pos",
+                        Decimal("0.55"),
+                    )
+                )
+            )
+            min_upper_room = Decimal(
+                str(
+                    getattr(
+                        self._settings,
+                        "reversal_1030_mid_reclaim_strict_min_upper_room_pct",
+                        Decimal("0.0035"),
+                    )
+                )
+            )
+            quality_profile = "strict"
+            entry_mode = "v8b2_mid_reclaim_quality"
+        elif room040:
+            max_boll_pos = Decimal(
+                str(
+                    getattr(
+                        self._settings,
+                        "reversal_1030_max_boll_pos_reclaim",
+                        Decimal("0.60"),
+                    )
+                )
+            )
+            min_upper_room = Decimal(
+                str(
+                    getattr(
+                        self._settings,
+                        "reversal_1030_mid_reclaim_room040_min_upper_room_pct",
+                        Decimal("0.0040"),
+                    )
+                )
+            )
+            quality_profile = "room040"
+            entry_mode = "v8b2_mid_reclaim_quality"
+        elif loose:
+            max_boll_pos = Decimal(
+                str(
+                    getattr(
+                        self._settings,
+                        "reversal_1030_max_boll_pos_reclaim",
+                        Decimal("0.60"),
+                    )
+                )
+            )
+            min_upper_room = Decimal(
+                str(
+                    getattr(
+                        self._settings,
+                        "reversal_1030_mid_reclaim_loose_min_upper_room_pct",
+                        Decimal("0.0030"),
+                    )
+                )
+            )
+            quality_profile = "loose"
+            entry_mode = "v8b2_mid_reclaim_quality"
+        else:
+            max_boll_pos = Decimal(
+                str(
+                    getattr(
+                        self._settings,
+                        "reversal_1030_max_boll_pos_reclaim",
+                        Decimal("0.60"),
+                    )
+                )
+            )
+            min_upper_room = Decimal(
+                str(
+                    getattr(
+                        self._settings,
+                        "reversal_1030_mid_reclaim_min_upper_room_pct",
+                        Decimal("0.0030"),
+                    )
+                )
+            )
+            quality_profile = "base"
+            entry_mode = "v8b2_mid_reclaim_quality"
+
+        if ctx["boll_position"] > max_boll_pos:
+            return self._log_1030_reject(
+                event,
+                "reject_v8b2_boll_position_high",
+                boll_position=str(ctx["boll_position"]),
+                limit=str(max_boll_pos),
+            )
+
+        max_rsi = Decimal(str(getattr(self._settings, "reversal_1030_max_rsi6", Decimal("65"))))
+        if ctx["rsi"] > max_rsi:
+            return self._log_1030_reject(
+                event,
+                "reject_v8b2_rsi_hot",
+                rsi=str(ctx["rsi"]),
+                limit=str(max_rsi),
+            )
+
+        max_upper_shadow = Decimal(
+            str(getattr(self._settings, "reversal_1030_max_upper_shadow_pct", Decimal("0.40")))
+        )
+        if ctx["upper_shadow_pct"] > max_upper_shadow:
+            return self._log_1030_reject(
+                event,
+                "reject_v8b2_large_upper_shadow",
+                upper_shadow_pct=str(ctx["upper_shadow_pct"]),
+                limit=str(max_upper_shadow),
+            )
+
+        if not ctx["reclaim_mid"]:
+            return self._log_1030_reject(
+                event,
+                "reject_v8b2_no_mid_reclaim",
+                reclaim_vwap=str(ctx["reclaim_vwap"]),
+                reclaim_mid=str(ctx["reclaim_mid"]),
+            )
+
+        reclaim_level = ctx["boll_mid"]
+        max_distance = Decimal(
+            str(
+                getattr(
+                    self._settings,
+                    "reversal_1030_mid_reclaim_max_distance_pct",
+                    Decimal("0.0010"),
+                )
+            )
+        )
+        reclaim_distance = (ctx["close"] - reclaim_level) / reclaim_level
+        if reclaim_distance < 0 or reclaim_distance > max_distance:
+            return self._log_1030_reject(
+                event,
+                "reject_v8b2_mid_reclaim_extended",
+                reclaim_distance=str(reclaim_distance),
+                limit=str(max_distance),
+            )
+
+        upper_room = (ctx["boll_up"] - ctx["close"]) / ctx["close"]
+        if upper_room < min_upper_room:
+            return self._log_1030_reject(
+                event,
+                "reject_v8b2_upper_room_small",
+                upper_room_pct=str(upper_room),
+                limit=str(min_upper_room),
+            )
+
+        if not ctx["green_bar"]:
+            return self._log_1030_reject(event, "reject_v8b2_not_green")
+
+        allowed, addition = self._can_open_position(event.symbol, df, session, event.bar_end)
+        if not allowed:
+            return None
+        reason = self._reversal_1030_reason(
+            ctx,
+            entry_mode=entry_mode,
+            addition=addition,
+            extra={
+                "quality_profile": quality_profile,
+                "signal_type": "boll_mid_reclaim_only",
+                "reclaim_type": "boll_mid",
+                "reclaim_level": str(reclaim_level),
+                "reclaim_distance_pct": str(reclaim_distance),
+                "upper_room_pct": str(upper_room),
+                "min_upper_room_pct": str(min_upper_room),
+            },
+        )
+        return self._build_signal(
+            symbol=event.symbol,
+            signal_code="SIG_1030_BOLL_MID_RECLAIM_CALL_BUY",
+            side=SignalSide.BUY,
+            reason=reason,
+            generated_at=event.bar_end,
+            ttl_override=min(int(self._ttl), 90),
+        )
+
     def _detect_pm_a2(
         self,
         event: BarsClosed,
@@ -1501,8 +2651,16 @@ class SignalEngine:
         现在要求"从上轨上方回落"，才算真正的"回踩"。
         """
         state = self._positions.get(event.symbol)
-        if state is None or state.signal_code != "SIG_OPEN_CHASE_BUY":
+        if state is None or state.signal_code not in {"SIG_OPEN_CHASE_BUY", "SIG_OPEN_CHASE_ORB_BUY"}:
             return None
+        if getattr(self, "_separated_exit_enabled", False):
+            opened_at = _to_eastern(state.opened_at)
+            held_seconds = (_to_eastern(event.bar_end) - opened_at).total_seconds()
+            min_hold = int(
+                getattr(self._settings, "open_chase_min_hold_seconds_before_upper_tap_exit", 300)
+            )
+            if held_seconds < min_hold:
+                return None
         if len(df) < 3:
             return None
         
@@ -1524,6 +2682,19 @@ class SignalEngine:
         
         if not two_taps_after_above:
             return None
+        if getattr(self, "_separated_exit_enabled", False):
+            current = df.iloc[-1]
+            opened_at = _to_eastern(state.opened_at)
+            entry_rows = df[df["et"] <= opened_at]
+            if entry_rows.empty:
+                return None
+            entry_close = _to_decimal(entry_rows.iloc[-1]["close"])
+            current_close = _to_decimal(current["close"])
+            if (
+                bool(getattr(self._settings, "open_chase_require_profit_for_upper_tap_exit", True))
+                and current_close <= entry_close
+            ):
+                return None
         
         reason = {
             "two_upper_tap": True,
@@ -1537,11 +2708,365 @@ class SignalEngine:
         }
         return self._build_signal(
             symbol=event.symbol,
-            signal_code="SIG_EXIT_UPPER_TAP_X2",
+            signal_code=(
+                "OPEN_CHASE_UPPER_TAP_PROFIT_TAKE"
+                if getattr(self, "_separated_exit_enabled", False)
+                else "SIG_EXIT_UPPER_TAP_X2"
+            ),
             side=SignalSide.SELL,
             reason=reason,
             generated_at=event.bar_end,
         )
+
+    def _detect_1030_reversal_exit(
+        self,
+        event: BarsClosed,
+        df: pd.DataFrame,
+        trade_date: date,
+        vix_value: Optional[Decimal],
+        session: Session,
+    ) -> Optional[SignalEnvelope]:
+        state = self._positions.get(event.symbol)
+        reversal_buy_codes = {
+            "SIG_1030_REVERSAL_CALL_BUY",
+            "SIG_1030_V8A_LOW_REVERSAL_CALL_BUY",
+            "SIG_1030_V8B_RECLAIM_CALL_BUY",
+            "SIG_1030_BOLL_MID_RECLAIM_CALL_BUY",
+        }
+        if state is None or state.signal_code not in reversal_buy_codes:
+            return None
+        if len(df) < 2:
+            return None
+        current = df.iloc[-1]
+        close = _to_decimal(current.get("close"))
+        low = _to_decimal(current.get("low"))
+        high = _to_decimal(current.get("high"))
+        boll_up = _to_decimal(current.get("boll_up"))
+        boll_mid = _to_decimal(current.get("boll_mid"))
+        if close <= 0 or high <= 0:
+            return None
+        et_time = _to_eastern(event.bar_end)
+        entry = self._reversal_1030_entries.get(event.symbol)
+        entry_mode_for_exit = str(entry.get("entry_mode") or "") if entry else ""
+        v8_guard_entry_low_stop_enabled = bool(
+            entry
+            and state.signal_code == "SIG_1030_REVERSAL_CALL_BUY"
+            and entry.get("v8_guard_entry_low_stop_enabled")
+        )
+        v8_guard_followthrough_enabled = bool(
+            entry
+            and state.signal_code == "SIG_1030_REVERSAL_CALL_BUY"
+            and entry_mode_for_exit == "v8_guard_filter_followthrough"
+        )
+        v8_guard_continuation_enabled = bool(
+            entry
+            and state.signal_code == "SIG_1030_REVERSAL_CALL_BUY"
+            and entry_mode_for_exit in {"v8_guard_continuation", "v8_guard_continuation_v2"}
+        )
+        if entry and (
+            state.signal_code != "SIG_1030_REVERSAL_CALL_BUY"
+            or v8_guard_entry_low_stop_enabled
+            or v8_guard_followthrough_enabled
+            or v8_guard_continuation_enabled
+        ):
+            entry_close = _to_decimal(entry.get("entry_close"))
+            entry_mode = str(entry.get("entry_mode") or "")
+            if entry_close > 0 and close > entry_close:
+                entry["had_positive_unrealized"] = True
+            if entry_close > 0:
+                current_mfe = _to_decimal(entry.get("max_unrealized_pct"))
+                if current_mfe < 0:
+                    current_mfe = Decimal("0")
+                if high > 0:
+                    high_unrealized = (high - entry_close) / entry_close
+                    if high_unrealized > current_mfe:
+                        entry["max_unrealized_pct"] = str(high_unrealized)
+                        current_mfe = high_unrealized
+                if entry_mode in {"v8_guard_continuation", "v8_guard_continuation_v2"}:
+                    target_profit = Decimal(
+                        str(
+                            getattr(
+                                self._settings,
+                                "reversal_1030_continuation_min_exit_profit_pct",
+                                Decimal("0.0030"),
+                            )
+                        )
+                    )
+                    if high >= entry_close * (Decimal("1") + target_profit):
+                        return self._build_signal(
+                            symbol=event.symbol,
+                            signal_code="SIG_1030_REVERSAL_CONTINUATION_TARGET_EXIT",
+                            side=SignalSide.SELL,
+                            reason={
+                                "exit_reason": "reversal_1030_continuation_target",
+                                "entry_mode": entry_mode,
+                                "target_profit_pct": str(target_profit),
+                                "entry_close": str(entry_close),
+                                "close": str(close),
+                                "high": str(high),
+                            },
+                            generated_at=event.bar_end,
+                            ttl_override=min(int(self._ttl), 90),
+                        )
+
+            entry_low = _to_decimal(entry.get("entry_bar_low"))
+            stop_buffer = Decimal(
+                str(
+                    getattr(
+                        self._settings,
+                        "reversal_1030_failure_stop_entry_low_buffer_pct",
+                        Decimal("0.0005"),
+                    )
+                )
+            )
+            if (
+                (
+                    state.signal_code != "SIG_1030_REVERSAL_CALL_BUY"
+                    or v8_guard_entry_low_stop_enabled
+                )
+                and entry_low > 0
+                and low <= entry_low * (Decimal("1") - stop_buffer)
+            ):
+                return self._build_signal(
+                    symbol=event.symbol,
+                    signal_code="SIG_1030_REVERSAL_FAILURE_ENTRY_LOW_EXIT",
+                    side=SignalSide.SELL,
+                    reason={
+                        "exit_reason": "reversal_1030_entry_low_failure",
+                        "entry_mode": entry.get("entry_mode"),
+                            "entry_bar_low": str(entry_low),
+                            "stop_buffer_pct": str(stop_buffer),
+                            "close": str(close),
+                            "low": str(low),
+                            "v8_guard_entry_low_stop_enabled": v8_guard_entry_low_stop_enabled,
+                        },
+                    generated_at=event.bar_end,
+                    ttl_override=min(int(self._ttl), 90),
+                )
+
+            if entry_mode in {
+                "v8b3_mid_reclaim_followthrough",
+                "v8_guard_filter_followthrough",
+            } and entry_close > 0:
+                opened_at_raw = entry.get("opened_at")
+                opened_at = opened_at_raw if isinstance(opened_at_raw, datetime) else state.opened_at
+                held_seconds = max(0, int((event.bar_end - opened_at).total_seconds()))
+                check_minutes = int(
+                    getattr(
+                        self._settings,
+                        "reversal_1030_early_followthrough_check_minutes",
+                        3,
+                    )
+                )
+                min_mfe = Decimal(
+                    str(
+                        getattr(
+                            self._settings,
+                            "reversal_1030_early_followthrough_min_mfe_pct",
+                            Decimal("0.0010"),
+                        )
+                    )
+                )
+                if (
+                    held_seconds >= check_minutes * 60
+                    and current_mfe < min_mfe
+                    and close <= entry_close
+                    and boll_mid > 0
+                    and close < boll_mid
+                ):
+                    return self._build_signal(
+                        symbol=event.symbol,
+                        signal_code="SIG_1030_REVERSAL_EARLY_NO_FOLLOW_THROUGH_EXIT",
+                        side=SignalSide.SELL,
+                        reason={
+                            "exit_reason": "reversal_1030_early_no_follow_through",
+                            "entry_mode": entry_mode,
+                            "check_minutes": check_minutes,
+                            "held_seconds": held_seconds,
+                            "max_unrealized_pct": str(current_mfe),
+                            "min_mfe_pct": str(min_mfe),
+                            "entry_close": str(entry_close),
+                            "close": str(close),
+                            "boll_mid": str(boll_mid),
+                        },
+                        generated_at=event.bar_end,
+                        ttl_override=min(int(self._ttl), 90),
+                    )
+
+            reclaim_lost_modes = {
+                "v8b_reclaim",
+                "v8b2_mid_reclaim_quality",
+                "v8b3_mid_reclaim_followthrough",
+            }
+            if entry.get("had_positive_unrealized") and entry_mode in reclaim_lost_modes:
+                entry_vwap = _to_decimal(entry.get("entry_vwap"))
+                entry_boll_mid = _to_decimal(entry.get("entry_boll_mid"))
+                reclaim_level = None
+                reclaim_name = None
+                if entry_mode in reclaim_lost_modes and str(entry.get("reclaim_type")) == "boll_mid":
+                    reclaim_level = boll_mid if boll_mid > 0 else entry_boll_mid
+                    reclaim_name = "boll_mid"
+                elif entry_vwap > 0:
+                    reclaim_level = entry_vwap
+                    reclaim_name = "vwap"
+                elif entry_boll_mid > 0:
+                    reclaim_level = boll_mid if boll_mid > 0 else entry_boll_mid
+                    reclaim_name = "boll_mid"
+                lost_buffer = Decimal("0")
+                if entry_mode in {"v8b2_mid_reclaim_quality", "v8b3_mid_reclaim_followthrough"}:
+                    lost_buffer = Decimal(
+                        str(
+                            getattr(
+                                self._settings,
+                                "reversal_1030_reclaim_lost_buffer_pct",
+                                Decimal("0.0005"),
+                            )
+                        )
+                    )
+                if (
+                    reclaim_level is not None
+                    and reclaim_level > 0
+                    and close < reclaim_level * (Decimal("1") - lost_buffer)
+                ):
+                    return self._build_signal(
+                        symbol=event.symbol,
+                        signal_code="SIG_1030_REVERSAL_FAILURE_RECLAIM_LOST_EXIT",
+                        side=SignalSide.SELL,
+                        reason={
+                            "exit_reason": "reversal_1030_reclaim_lost_after_profit",
+                            "entry_mode": entry_mode,
+                            "reclaim_type": reclaim_name,
+                            "reclaim_level": str(reclaim_level),
+                            "lost_buffer_pct": str(lost_buffer),
+                            "close": str(close),
+                            "had_positive_unrealized": True,
+                        },
+                        generated_at=event.bar_end,
+                        ttl_override=min(int(self._ttl), 90),
+                    )
+        if boll_up > 0 and high >= boll_up:
+            if entry and entry_mode_for_exit in {"v8_guard_continuation", "v8_guard_continuation_v2"}:
+                entry_close = _to_decimal(entry.get("entry_close"))
+                entry_vwap = _to_decimal(entry.get("entry_vwap"))
+                fail_buffer = Decimal(
+                    str(
+                        getattr(
+                            self._settings,
+                            "reversal_1030_continuation_fail_buffer_pct",
+                            Decimal("0.0003"),
+                        )
+                    )
+                )
+                max_vwap_distance = Decimal(
+                    str(
+                        getattr(
+                            self._settings,
+                            "reversal_1030_continuation_max_vwap_distance_pct",
+                            Decimal("0.0075"),
+                        )
+                    )
+                )
+                vwap_distance = (
+                    (entry_close - entry_vwap) / entry_vwap
+                    if entry_vwap > 0 and entry_close > 0
+                    else None
+                )
+                continuation_active = bool(entry.get("continuation_active"))
+                qualifies = bool(
+                    entry_close > 0
+                    and close > entry_close
+                    and entry_vwap > 0
+                    and entry_close > entry_vwap
+                    and vwap_distance is not None
+                    and vwap_distance <= max_vwap_distance
+                    and (boll_mid <= 0 or close >= boll_mid * (Decimal("1") - fail_buffer))
+                    and close >= entry_vwap * (Decimal("1") - fail_buffer)
+                )
+                if qualifies and not continuation_active:
+                    entry["continuation_active"] = True
+                    entry["first_boll_up_tap_ts"] = event.bar_end.isoformat()
+                    entry["first_boll_up_tap_close"] = str(close)
+                    return None
+                if continuation_active:
+                    if (
+                        boll_mid > 0
+                        and close < boll_mid * (Decimal("1") - fail_buffer)
+                    ) or close < entry_vwap * (Decimal("1") - fail_buffer):
+                        return self._build_signal(
+                            symbol=event.symbol,
+                            signal_code="SIG_1030_REVERSAL_CONTINUATION_STRUCTURE_LOST_EXIT",
+                            side=SignalSide.SELL,
+                            reason={
+                                "exit_reason": "reversal_1030_continuation_structure_lost",
+                                "entry_mode": entry_mode_for_exit,
+                                "entry_close": str(entry_close),
+                                "entry_vwap": str(entry_vwap),
+                                "fail_buffer_pct": str(fail_buffer),
+                                "close": str(close),
+                                "boll_mid": str(boll_mid) if boll_mid > 0 else None,
+                            },
+                            generated_at=event.bar_end,
+                            ttl_override=min(int(self._ttl), 90),
+                        )
+                    return None
+            signal_code = "SIG_1030_REVERSAL_BOLL_UP_EXIT"
+            exit_reason = "underlying_tapped_1m_boll_upper"
+            if entry and str(entry.get("entry_mode") or "") == "v8b3_mid_reclaim_followthrough":
+                entry_close = _to_decimal(entry.get("entry_close"))
+                true_profit_min = Decimal(
+                    str(
+                        getattr(
+                            self._settings,
+                            "reversal_1030_boll_up_true_profit_min_pct",
+                            Decimal("0"),
+                        )
+                    )
+                )
+                true_exit_level = entry_close * (Decimal("1") + true_profit_min)
+                if entry_close > 0 and close > true_exit_level:
+                    signal_code = "SIG_1030_REVERSAL_BOLL_UP_TRUE_EXIT"
+                    exit_reason = "underlying_tapped_1m_boll_upper_true_profit"
+                elif entry_close > 0 and close <= entry_close:
+                    signal_code = "SIG_1030_REVERSAL_BOLL_UP_REBOUND_FAILURE_EXIT"
+                    exit_reason = "underlying_tapped_lowered_boll_upper_after_failure"
+                else:
+                    signal_code = "SIG_1030_REVERSAL_BOLL_UP_WEAK_EXIT"
+                    exit_reason = "underlying_tapped_1m_boll_upper_weak_profit"
+            return self._build_signal(
+                symbol=event.symbol,
+                signal_code=signal_code,
+                side=SignalSide.SELL,
+                reason={
+                    "exit_reason": exit_reason,
+                    "entry_mode": entry.get("entry_mode") if entry else None,
+                    "entry_close": str(_to_decimal(entry.get("entry_close"))) if entry else None,
+                    "close": str(close),
+                    "high": str(high),
+                    "boll_up": str(boll_up),
+                    "boll_mid": str(boll_mid) if boll_mid > 0 else None,
+                },
+                generated_at=event.bar_end,
+                ttl_override=min(int(self._ttl), 90),
+            )
+        deadline = self._parse_hhmm(
+            str(getattr(self._settings, "reversal_1030_exit_deadline", "12:00"))
+        )
+        if et_time.time() >= deadline:
+            return self._build_signal(
+                symbol=event.symbol,
+                signal_code="SIG_1030_REVERSAL_TIME_EXIT",
+                side=SignalSide.SELL,
+                reason={
+                    "exit_reason": "reversal_1030_deadline",
+                    "deadline": deadline.isoformat(timespec="minutes"),
+                    "close": str(close),
+                    "boll_mid": str(boll_mid) if boll_mid > 0 else None,
+                    "boll_up": str(boll_up) if boll_up > 0 else None,
+                },
+                generated_at=event.bar_end,
+                ttl_override=min(int(self._ttl), 90),
+            )
+        return None
 
     def _detect_s1(
         self,
@@ -1604,7 +3129,7 @@ class SignalEngine:
             return None
         et_time = _to_eastern(event.bar_end)
         if (
-            state.signal_code == "SIG_OPEN_CHASE_BUY"
+            state.signal_code in {"SIG_OPEN_CHASE_BUY", "SIG_OPEN_CHASE_ORB_BUY"}
             and et_time.time() >= time(14, 0)
         ):
             return self._build_signal(
@@ -1652,9 +3177,15 @@ class SignalEngine:
             self._detect_overnight_gap_exit,
             self._detect_am_sell_c1,
             self._detect_am_confluence_sell_s2,
+            self._detect_1030_reversal_exit,
             self._detect_s2,
             self._detect_s1,
             self._detect_time_clear,
+            self._detect_open_chase_orb,
+            self._detect_1030_reversal_call,
+            self._detect_1030_v8a_low_reversal_call,
+            self._detect_1030_v8b_reclaim_call,
+            self._detect_1030_v8b2_mid_reclaim_quality_call,
             self._detect_e1,
             self._detect_e2,
             self._detect_pm_a2,
@@ -1663,6 +3194,21 @@ class SignalEngine:
             self._detect_am_bottom_a1,
             self._detect_am_confluence_buy_a2,
         ]
+        if getattr(self, "_reversal_1030_v8a_enabled", False) or getattr(
+            self, "_reversal_1030_v8b_enabled", False
+        ) or getattr(
+            self, "_reversal_1030_v8b2_enabled", False
+        ):
+            detectors = [
+                self._detect_1030_reversal_exit,
+                self._detect_time_clear,
+            ]
+            if getattr(self, "_reversal_1030_v8a_enabled", False):
+                detectors.append(self._detect_1030_v8a_low_reversal_call)
+            if getattr(self, "_reversal_1030_v8b_enabled", False):
+                detectors.append(self._detect_1030_v8b_reclaim_call)
+            if getattr(self, "_reversal_1030_v8b2_enabled", False):
+                detectors.append(self._detect_1030_v8b2_mid_reclaim_quality_call)
 
         detected: List[DetectedSignal] = []
         for detector in detectors:
@@ -1670,7 +3216,7 @@ class SignalEngine:
             if signal is None:
                 continue
             if signal.side == SignalSide.BUY:
-                if not self._passes_buy_priority(trade_date, signal):
+                if not self._is_1030_reversal_buy(signal.signal_code) and not self._passes_buy_priority(trade_date, signal):
                     if self._metrics_enabled:
                         try:
                             record_signal_filtered("PRIORITY_FILTER")
@@ -1742,12 +3288,16 @@ class SignalEngine:
             "positions": copy.deepcopy(self._positions),
             "upper_break": copy.deepcopy(self._upper_break),
             "last_signal_ts": copy.deepcopy(self._last_signal_ts),
+            "reversal_1030_entries": copy.deepcopy(
+                getattr(self, "_reversal_1030_entries", {})
+            ),
         }
 
     def _restore_state(self, snapshot: Dict[str, Any]) -> None:
         self._positions = snapshot["positions"]
         self._upper_break = snapshot["upper_break"]
         self._last_signal_ts = snapshot["last_signal_ts"]
+        self._reversal_1030_entries = snapshot.get("reversal_1030_entries", {})
 
     def _daily_open_price(
         self,
@@ -1755,29 +3305,56 @@ class SignalEngine:
         symbol: str,
         trade_date: date,
     ) -> Optional[Decimal]:
+        return self._fallback_daily_field_value(
+            session,
+            symbol,
+            trade_date,
+            field_name="open_rth",
+        )
+
+    def _fallback_daily_field_value(
+        self,
+        session: Optional[Session],
+        symbol: str,
+        trade_date: date,
+        *,
+        field_name: str,
+    ) -> Optional[Decimal]:
         if session is None:
             return None
-        row = session.execute(
-            text(
-                """
-                SELECT open_rth
-                FROM v_daily_ohlcv_enriched
-                WHERE symbol = :symbol AND trade_date_et::date = :trade_date
-                """
-            ),
-            {"symbol": symbol, "trade_date": trade_date},
-        ).fetchone()
-        if not row:
-            return None
-        open_rth = row[0]
-        if open_rth is None:
-            return None
         try:
-            return Decimal(str(open_rth))
-        except (InvalidOperation, TypeError):
-            return None
+            row = session.execute(
+                text(
+                    f"""
+                    SELECT {field_name}
+                    FROM v_daily_ohlcv_enriched
+                    WHERE symbol = :symbol AND trade_date_et::date = :trade_date
+                    """
+                ),
+                {"symbol": symbol, "trade_date": trade_date},
+            ).fetchone()
+        except Exception:
+            LOGGER.exception(
+                "signal_engine.daily_field_query_failed",
+                symbol=symbol,
+                trade_date=str(trade_date),
+                field_name=field_name,
+            )
+            row = None
+        if row and row[0] is not None:
+            try:
+                return Decimal(str(row[0]))
+            except (InvalidOperation, TypeError):
+                return None
+        if field_name == "prev_close_rth":
+            return self._previous_rth_close_from_bars(session, symbol, trade_date)
+        if field_name == "close_rth":
+            return self._rth_close_from_bars(session, symbol, trade_date)
+        if field_name == "open_rth":
+            return self._rth_open_from_bars(session, symbol, trade_date)
+        return None
 
-    def _daily_close_price(
+    def _previous_rth_close_from_bars(
         self,
         session: Optional[Session],
         symbol: str,
@@ -1789,29 +3366,117 @@ class SignalEngine:
             row = session.execute(
                 text(
                     """
-                    SELECT close_rth
-                    FROM v_daily_ohlcv_enriched
-                    WHERE symbol = :symbol AND trade_date_et::date = :trade_date
+                    SELECT close
+                    FROM bars1m_equity
+                    WHERE symbol = :symbol
+                      AND (ts_end AT TIME ZONE 'America/New_York')::date < :trade_date
+                      AND (ts_end AT TIME ZONE 'America/New_York')::time <= TIME '16:00'
+                    ORDER BY ts_end DESC
+                    LIMIT 1
                     """
                 ),
                 {"symbol": symbol, "trade_date": trade_date},
             ).fetchone()
         except Exception:
             LOGGER.exception(
-                "signal_engine.daily_close_query_failed",
+                "signal_engine.prev_close_bars_query_failed",
                 symbol=symbol,
                 trade_date=str(trade_date),
             )
             return None
-        if not row:
-            return None
-        close_rth = row[0]
-        if close_rth is None:
+        if not row or row[0] is None:
             return None
         try:
-            return Decimal(str(close_rth))
+            return Decimal(str(row[0]))
         except (InvalidOperation, TypeError):
             return None
+
+    def _rth_close_from_bars(
+        self,
+        session: Optional[Session],
+        symbol: str,
+        trade_date: date,
+    ) -> Optional[Decimal]:
+        if session is None:
+            return None
+        try:
+            row = session.execute(
+                text(
+                    """
+                    SELECT close
+                    FROM bars1m_equity
+                    WHERE symbol = :symbol
+                      AND (ts_end AT TIME ZONE 'America/New_York')::date = :trade_date
+                      AND (ts_end AT TIME ZONE 'America/New_York')::time <= TIME '16:00'
+                    ORDER BY ts_end DESC
+                    LIMIT 1
+                    """
+                ),
+                {"symbol": symbol, "trade_date": trade_date},
+            ).fetchone()
+        except Exception:
+            LOGGER.exception(
+                "signal_engine.close_bars_query_failed",
+                symbol=symbol,
+                trade_date=str(trade_date),
+            )
+            return None
+        if not row or row[0] is None:
+            return None
+        try:
+            return Decimal(str(row[0]))
+        except (InvalidOperation, TypeError):
+            return None
+
+    def _rth_open_from_bars(
+        self,
+        session: Optional[Session],
+        symbol: str,
+        trade_date: date,
+    ) -> Optional[Decimal]:
+        if session is None:
+            return None
+        try:
+            row = session.execute(
+                text(
+                    """
+                    SELECT open
+                    FROM bars1m_equity
+                    WHERE symbol = :symbol
+                      AND (ts_end AT TIME ZONE 'America/New_York')::date = :trade_date
+                      AND (ts_end AT TIME ZONE 'America/New_York')::time >= TIME '09:30'
+                    ORDER BY ts_end ASC
+                    LIMIT 1
+                    """
+                ),
+                {"symbol": symbol, "trade_date": trade_date},
+            ).fetchone()
+        except Exception:
+            LOGGER.exception(
+                "signal_engine.open_bars_query_failed",
+                symbol=symbol,
+                trade_date=str(trade_date),
+            )
+            return None
+        if not row or row[0] is None:
+            return None
+        try:
+            return Decimal(str(row[0]))
+        except (InvalidOperation, TypeError):
+            return None
+
+    def _daily_close_price(
+        self,
+        session: Optional[Session],
+        symbol: str,
+        trade_date: date,
+    ) -> Optional[Decimal]:
+        return self._fallback_daily_field_value(
+            session,
+            symbol,
+            trade_date,
+            field_name="close_rth",
+        )
 
     def _day_open_price(self, df: pd.DataFrame, trade_date: date) -> Optional[Decimal]:
         if df is None or df.empty:
@@ -1883,7 +3548,11 @@ class SignalEngine:
                     """
                     SELECT sma60
                     FROM v_daily_ma60
-                    WHERE symbol = :symbol AND trade_date_et::date = :trade_date
+                    WHERE symbol = :symbol
+                      AND trade_date_et::date <= :trade_date
+                      AND sma60 IS NOT NULL
+                    ORDER BY trade_date_et DESC
+                    LIMIT 1
                     """
                 ),
                 {"symbol": symbol, "trade_date": trade_date},
@@ -2054,22 +3723,6 @@ class SignalEngine:
                     reason="已达到最大持仓数量限制"
                 )
                 return False, False
-            if session is not None and ts_end is not None:
-                passed, snapshot = self._option_liquidity_pass(session, symbol, ts_end)
-                self._liquidity_snapshot[symbol] = snapshot
-                LOGGER.info(
-                    "position_check.option_liquidity",
-                    symbol=symbol,
-                    passed=passed,
-                    snapshot=snapshot
-                )
-                if not passed:
-                    LOGGER.info(
-                        "position_check.liquidity_blocked",
-                        symbol=symbol,
-                        reason="期权流动性不足"
-                    )
-                    return False, False
             LOGGER.info(
                 "position_check.allowed",
                 symbol=symbol,
@@ -2097,44 +3750,19 @@ class SignalEngine:
 
         if not (ao_up and obv_rising and rvol_high):
             return False, False
-        passed, snapshot = self._option_liquidity_pass(session, symbol, ts_end)
-        self._liquidity_snapshot[symbol] = snapshot
-        if not passed:
-            return False, False
         return True, True
 
     def _option_liquidity_pass(
         self, session: Session, symbol: str, ts_end: datetime
     ) -> Tuple[bool, Dict[str, Any]]:
         """
-        读取 bars1m_option 数据判定期权流动性，返回 (是否通过, 详情字典)。
+        读取截至 signal 时刻的最新 option quote 判定期权流动性，返回 (是否通过, 详情字典)。
         """
+        if not getattr(self, "_option_liquidity_required", True):
+            return True, {"pass": True, "reason": "disabled_by_config"}
         window_start = ts_end - timedelta(minutes=15)
-        symbol_column = self._option_symbol_column(session)
-        stmt = text(
-            f"""
-            SELECT
-                bid,
-                ask,
-                volume,
-                open_interest,
-                expiry,
-                strike,
-                ts_end,
-                underlying_price
-            FROM bars1m_option
-            WHERE {symbol_column} = :symbol
-              AND "right" = 'CALL'
-              AND ts_end BETWEEN :start_ts AND :end_ts
-            ORDER BY ts_end DESC, volume DESC NULLS LAST
-            LIMIT 200
-            """
-        )
         try:
-            rows = session.execute(
-                stmt,
-                {"symbol": symbol, "start_ts": window_start, "end_ts": ts_end},
-            ).mappings().all()
+            rows = self._option_quote_candidates(session, symbol, ts_end, window_start=window_start)
         except Exception:
             LOGGER.exception("signal_engine.option_liquidity_query_failed", symbol=symbol)
             return False, {
@@ -2159,6 +3787,7 @@ class SignalEngine:
 
         trade_date = ts_end.astimezone(EASTERN).date()
         selected: Optional[Dict[str, Any]] = None
+        fallback_selected: Optional[Dict[str, Any]] = None
         for row in rows:
             bid = row.get("bid")
             ask = row.get("ask")
@@ -2175,8 +3804,6 @@ class SignalEngine:
             except (InvalidOperation, TypeError, ValueError):
                 continue
             if bid_dec <= 0 or ask_dec <= 0 or ask_dec <= bid_dec:
-                continue
-            if int(volume) < 100 or int(oi) < 500:
                 continue
             if isinstance(expiry, datetime):
                 expiry_date = expiry.date()
@@ -2212,8 +3839,38 @@ class SignalEngine:
                 "dte": int(dte),
                 "ts_sample": ts_sample.isoformat() if isinstance(ts_sample, datetime) else str(ts_sample),
             }
+            quote_age_seconds = None
+            if isinstance(ts_sample, datetime):
+                quote_age_seconds = max(0.0, (ts_end - ts_sample).total_seconds())
+                candidate["quote_age_seconds"] = quote_age_seconds
+            if quote_age_seconds is not None and quote_age_seconds > OPTION_QUOTE_MAX_AGE_SECONDS:
+                continue
+            allow_missing_metrics = getattr(
+                self, "_allow_missing_option_liquidity_metrics", False
+            )
+            if allow_missing_metrics and int(volume) == 0 and int(oi) == 0:
+                fallback_candidate = dict(candidate)
+                fallback_candidate["reason"] = "quote_only_missing_oi_volume"
+                fallback_candidate["missing_metrics_fallback"] = True
+                if (
+                    fallback_selected is None
+                    or fallback_candidate["spread"] < fallback_selected.get("spread", float("inf"))
+                ):
+                    fallback_selected = fallback_candidate
+            if int(volume) < 100 or int(oi) < 500:
+                continue
             if selected is None or candidate["volume"] > selected.get("volume", 0):
                 selected = candidate
+
+        if selected is None and fallback_selected is not None:
+            LOGGER.info(
+                "signal_engine.option_liquidity_fallback",
+                symbol=symbol,
+                window_start=window_start.isoformat(),
+                window_end=ts_end.isoformat(),
+                snapshot=fallback_selected,
+            )
+            return True, fallback_selected
 
         if selected is None:
             LOGGER.info(
@@ -2236,6 +3893,61 @@ class SignalEngine:
         )
         return True, selected
 
+    def _option_quote_candidates(
+        self,
+        session: Session,
+        symbol: str,
+        ts_end: datetime,
+        *,
+        window_start: datetime | None = None,
+    ) -> List[Dict[str, Any]]:
+        symbol_column = self._option_symbol_column(session)
+        lower_bound = window_start or (ts_end - timedelta(minutes=15))
+        stmt = text(
+            f"""
+            WITH ranked AS (
+                SELECT
+                    conid,
+                    bid,
+                    ask,
+                    volume,
+                    open_interest,
+                    expiry,
+                    strike,
+                    ts_end,
+                    underlying_price,
+                    delta,
+                    COALESCE(mid, (bid + ask) / 2, last) AS current_price,
+                    ROW_NUMBER() OVER (PARTITION BY conid ORDER BY ts_end DESC) AS rn
+                FROM bars1m_option
+                WHERE {symbol_column} = :symbol
+                  AND "right" = 'CALL'
+                  AND ts_end BETWEEN :start_ts AND :end_ts
+                  AND COALESCE(mid, (bid + ask) / 2, last) IS NOT NULL
+            )
+            SELECT
+                conid,
+                bid,
+                ask,
+                volume,
+                open_interest,
+                expiry,
+                strike,
+                ts_end,
+                underlying_price,
+                delta,
+                current_price
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY ts_end DESC, (volume IS NULL) ASC, volume DESC, conid ASC
+            LIMIT 200
+            """
+        )
+        return session.execute(
+            stmt,
+            {"symbol": symbol, "start_ts": lower_bound, "end_ts": ts_end},
+        ).mappings().all()
+
     def _risk_hint_for_signal(
         self,
         symbol: str,
@@ -2248,6 +3960,11 @@ class SignalEngine:
         if side == SignalSide.BUY:
             size_map = {
                 "SIG_OPEN_CHASE_BUY": "2R",
+                "SIG_OPEN_CHASE_ORB_BUY": "2R",
+                "SIG_1030_REVERSAL_CALL_BUY": "1R",
+                "SIG_1030_V8A_LOW_REVERSAL_CALL_BUY": "1R",
+                "SIG_1030_V8B_RECLAIM_CALL_BUY": "1R",
+                "SIG_1030_BOLL_MID_RECLAIM_CALL_BUY": "1R",
                 "SIG_PM_BOTTOM_A4": "2R",
             }
             hint["size"] = size_map.get(signal_code, "1R")
@@ -2284,7 +4001,21 @@ class SignalEngine:
         if liquidity:
             hint["liquidity"] = liquidity
         hint["signal_code"] = signal_code
+        if self._is_1030_reversal_buy(signal_code):
+            hint["strategy_family"] = "1030_reversal"
+            hint["dte"] = [0, 7]
+            hint["delta"] = [0.35, 0.55]
+            hint["exit_plan"] = reason.get("exit_plan")
         return hint
+
+    @staticmethod
+    def _is_1030_reversal_buy(signal_code: str | None) -> bool:
+        return signal_code in {
+            "SIG_1030_REVERSAL_CALL_BUY",
+            "SIG_1030_V8A_LOW_REVERSAL_CALL_BUY",
+            "SIG_1030_V8B_RECLAIM_CALL_BUY",
+            "SIG_1030_BOLL_MID_RECLAIM_CALL_BUY",
+        }
 
     def _register_state(self, signal: SignalEnvelope, ts_end: datetime) -> None:
         key = (signal.symbol, signal.signal_code)
@@ -2301,15 +4032,35 @@ class SignalEngine:
                 state.signal_code = signal.signal_code
                 state.opened_at = ts_end
                 state.additions = min(state.additions + 1, 1)
+            if self._is_1030_reversal_buy(signal.signal_code):
+                self._reversal_1030_entries[signal.symbol] = {
+                    "entry_mode": signal.reason.get("entry_mode"),
+                    "entry_bar_low": signal.reason.get("entry_bar_low"),
+                    "entry_close": signal.reason.get("entry_close"),
+                    "entry_vwap": signal.reason.get("entry_vwap"),
+                    "entry_boll_mid": signal.reason.get("entry_boll_mid"),
+                    "reclaim_type": signal.reason.get("reclaim_type"),
+                    "quality_profile": signal.reason.get("quality_profile"),
+                    "trade_type": signal.reason.get("trade_type"),
+                    "v8_guard_triggered": signal.reason.get("v8_guard_triggered"),
+                    "v8_guard_entry_low_stop_enabled": signal.reason.get(
+                        "v8_guard_entry_low_stop_enabled"
+                    ),
+                    "opened_at": ts_end,
+                    "had_positive_unrealized": False,
+                    "max_unrealized_pct": "0",
+                }
         elif signal.signal_code in SELL_SIGNALS:
             self._positions.pop(signal.symbol, None)
             self._upper_break.pop(signal.symbol, None)
+            self._reversal_1030_entries.pop(signal.symbol, None)
 
     def _persist_signal(self, session: Session, signal: SignalEnvelope, ts_end: datetime) -> None:
         log_dao = SignalLogDAO(session)
         log_dao.record_signal(
             run_id=self._run_id,
             symbol=signal.symbol,
+            asset_type=signal.asset_type.value,
             signal_code=signal.signal_code,
             ts_end=ts_end,
             accepted=True,
@@ -2567,6 +4318,309 @@ class SignalEngine:
             return False, Decimal("0")
         return True, bounce
 
+    def _opening_range_from_df(self, todays: pd.DataFrame) -> tuple[Decimal | None, Decimal | None]:
+        minutes = int(getattr(self._settings, "open_chase_opening_range_minutes", 5))
+        if todays.empty:
+            return None, None
+        start_time = time(9, 30)
+        end_dt = datetime.combine(date.today(), start_time) + timedelta(minutes=max(1, minutes) - 1)
+        end_time = end_dt.time()
+        window = todays[(todays["et"].dt.time >= start_time) & (todays["et"].dt.time <= end_time)]
+        if window.empty:
+            return None, None
+        return _to_decimal(window["high"].max()), _to_decimal(window["low"].min())
+
+    @staticmethod
+    def _vwap_from_df(todays: pd.DataFrame) -> Decimal | None:
+        if todays.empty:
+            return None
+        frame = todays.dropna(subset=["close", "volume"])
+        if frame.empty:
+            return None
+        total_volume = sum(_to_decimal(value) for value in frame["volume"])
+        if total_volume <= 0:
+            return None
+        total = sum(
+            _to_decimal(row["close"]) * _to_decimal(row["volume"])
+            for _, row in frame.iterrows()
+        )
+        return total / total_volume
+
+    def _reversal_1030_context(
+        self,
+        event: BarsClosed,
+        df: pd.DataFrame,
+        trade_date: date,
+        vix_value: Optional[Decimal],
+    ) -> Dict[str, Any] | None:
+        symbol = event.symbol.upper()
+        symbols = {
+            item.strip().upper()
+            for item in str(getattr(self._settings, "reversal_1030_symbols", "")).split(",")
+            if item.strip()
+        }
+        if symbols and symbol not in symbols:
+            return None
+
+        et_time = _to_eastern(event.bar_end)
+        start_time = self._parse_hhmm(
+            str(getattr(self._settings, "reversal_1030_start_time", "10:25"))
+        )
+        end_time = self._parse_hhmm(
+            str(getattr(self._settings, "reversal_1030_end_time", "10:40"))
+        )
+        if et_time.time() < start_time or et_time.time() > end_time:
+            return None
+
+        max_vix = Decimal(str(getattr(self._settings, "reversal_1030_max_vix", Decimal("20"))))
+        if vix_value is not None and vix_value > max_vix:
+            self._log_1030_reject(event, "reject_vix_high", vix=str(vix_value))
+            return None
+
+        todays = df[df["et"].dt.date == trade_date]
+        morning = todays[
+            (todays["et"].dt.time >= time(9, 30))
+            & (todays["et"].dt.time <= et_time.time())
+        ]
+        if len(morning) < 20:
+            return None
+
+        current = morning.iloc[-1]
+        prev = morning.iloc[-2]
+        session_open = _to_decimal(morning.iloc[0]["open"])
+        close = _to_decimal(current.get("close"))
+        open_px = _to_decimal(current.get("open"))
+        high = _to_decimal(current.get("high"))
+        low = _to_decimal(current.get("low"))
+        prev_close = _to_decimal(prev.get("close"))
+        boll_dn = _to_decimal(current.get("boll_dn"))
+        boll_mid = _to_decimal(current.get("boll_mid"))
+        boll_up = _to_decimal(current.get("boll_up"))
+        rsi = _to_decimal(current.get("rsi6"))
+        prev_rsi = _to_decimal(prev.get("rsi6"))
+        if session_open <= 0 or close <= 0 or high <= 0 or low <= 0:
+            return None
+        if boll_dn <= 0 or boll_mid <= 0 or boll_up <= 0 or boll_up <= boll_dn:
+            self._log_1030_reject(event, "reject_invalid_bollinger_band")
+            return None
+
+        abs_gap_limit = Decimal(
+            str(getattr(self._settings, "reversal_1030_max_abs_gap_pct", Decimal("0.06")))
+        )
+        intraday_move = (close - session_open) / session_open
+        if abs(intraday_move) > abs_gap_limit:
+            self._log_1030_reject(
+                event,
+                "reject_abs_move_gt_limit",
+                intraday_move=str(intraday_move),
+                limit=str(abs_gap_limit),
+            )
+            return None
+
+        min_drop = Decimal(
+            str(getattr(self._settings, "reversal_1030_min_morning_drop_pct", Decimal("0.003")))
+        )
+        morning_low = _to_decimal(morning["low"].min())
+        morning_drop = (session_open - morning_low) / session_open
+        if morning_drop < min_drop:
+            self._log_1030_reject(
+                event,
+                "reject_no_morning_selloff",
+                morning_drop=str(morning_drop),
+                threshold=str(min_drop),
+            )
+            return None
+
+        lower_buffer = Decimal(
+            str(getattr(self._settings, "reversal_1030_lower_band_buffer_pct", Decimal("0.0015")))
+        )
+        lower_touch = False
+        doji_stability_count = 0
+        for _, row in morning.tail(8).iterrows():
+            row_low = _to_decimal(row.get("low"))
+            row_close = _to_decimal(row.get("close"))
+            row_open = _to_decimal(row.get("open"))
+            row_high = _to_decimal(row.get("high"))
+            row_dn = _to_decimal(row.get("boll_dn"))
+            if row_dn <= 0:
+                continue
+            if row_low <= row_dn * (Decimal("1") + lower_buffer):
+                lower_touch = True
+            bar_range = row_high - row_low
+            body = abs(row_close - row_open)
+            if (
+                row_low <= row_dn * (Decimal("1") + lower_buffer * Decimal("2"))
+                and bar_range > 0
+                and body / bar_range <= Decimal("0.35")
+            ):
+                doji_stability_count += 1
+
+        vwap = self._vwap_from_df(morning)
+        rsi_reclaim_level = Decimal(
+            str(getattr(self._settings, "reversal_1030_rsi_reclaim", Decimal("30")))
+        )
+        rsi_reclaim = rsi >= rsi_reclaim_level and (
+            prev_rsi < rsi_reclaim_level or rsi > prev_rsi
+        )
+        reclaim_lower = close > boll_dn and prev_close <= boll_dn
+        recent_high_break = close > _to_decimal(morning.tail(4).iloc[:-1]["high"].max())
+        reclaim_vwap = bool(vwap is not None and close >= vwap and prev_close < vwap)
+        reclaim_mid = close >= boll_mid and prev_close < boll_mid
+
+        return {
+            "symbol": event.symbol,
+            "symbols": symbols,
+            "session_open": session_open,
+            "morning_low": morning_low,
+            "morning_drop": morning_drop,
+            "intraday_move": intraday_move,
+            "current": current,
+            "prev": prev,
+            "close": close,
+            "open": open_px,
+            "high": high,
+            "low": low,
+            "prev_close": prev_close,
+            "boll_dn": boll_dn,
+            "boll_mid": boll_mid,
+            "boll_up": boll_up,
+            "boll_position": self._bollinger_position(close, boll_dn, boll_up),
+            "vwap": vwap,
+            "rsi": rsi,
+            "prev_rsi": prev_rsi,
+            "rsi_reclaim": rsi_reclaim,
+            "lower_touch": lower_touch,
+            "doji_stability_count": doji_stability_count,
+            "green_bar": close > open_px,
+            "reclaim_lower": reclaim_lower,
+            "recent_high_break": recent_high_break,
+            "reclaim_vwap": reclaim_vwap,
+            "reclaim_mid": reclaim_mid,
+            "upper_shadow_pct": self._upper_shadow_pct(open_px, high, low, close),
+        }
+
+    def _reversal_1030_reason(
+        self,
+        ctx: Dict[str, Any],
+        *,
+        entry_mode: str,
+        addition: bool,
+        extra: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        reason = {
+            "entry_mode": entry_mode,
+            "watchlist": sorted(ctx["symbols"]),
+            "session_open": str(ctx["session_open"]),
+            "morning_low": str(ctx["morning_low"]),
+            "morning_drop_pct": str(ctx["morning_drop"]),
+            "intraday_move_pct": str(ctx["intraday_move"]),
+            "boll_dn": str(ctx["boll_dn"]),
+            "boll_mid": str(ctx["boll_mid"]),
+            "boll_up": str(ctx["boll_up"]),
+            "boll_position": str(ctx["boll_position"]),
+            "vwap": str(ctx["vwap"]) if ctx["vwap"] is not None else None,
+            "rsi6": str(ctx["rsi"]),
+            "prev_rsi6": str(ctx["prev_rsi"]),
+            "lower_touch": ctx["lower_touch"],
+            "doji_stability_count": ctx["doji_stability_count"],
+            "green_bar": ctx["green_bar"],
+            "reclaim_lower": ctx["reclaim_lower"],
+            "recent_high_break": ctx["recent_high_break"],
+            "reclaim_vwap": ctx["reclaim_vwap"],
+            "reclaim_mid": ctx["reclaim_mid"],
+            "upper_shadow_pct": str(ctx["upper_shadow_pct"]),
+            "entry_bar_low": str(ctx["low"]),
+            "entry_close": str(ctx["close"]),
+            "entry_vwap": str(ctx["vwap"]) if ctx["vwap"] is not None else None,
+            "entry_boll_mid": str(ctx["boll_mid"]),
+            "exit_plan": {
+                "primary": "sell_call_when_underlying_taps_1m_boll_upper",
+                "failure_entry_low": "sell_call_when_underlying_breaks_entry_bar_low",
+                "failure_reclaim_lost": "sell_call_when_underlying_loses_vwap_or_mid_after_profit",
+                "deadline": str(getattr(self._settings, "reversal_1030_exit_deadline", "12:00")),
+            },
+            "add_position": addition,
+            "option_liquidity": self._liquidity_snapshot.get(ctx["symbol"], {"pass": True}),
+        }
+        if extra:
+            reason.update(extra)
+        return reason
+
+    @staticmethod
+    def _bollinger_position(close: Decimal, boll_dn: Decimal, boll_up: Decimal) -> Decimal:
+        width = boll_up - boll_dn
+        if width <= 0:
+            return Decimal("999")
+        return (close - boll_dn) / width
+
+    @staticmethod
+    def _upper_shadow_pct(open_px: Decimal, high: Decimal, low: Decimal, close: Decimal) -> Decimal:
+        total_range = high - low
+        if total_range <= 0:
+            return Decimal("0")
+        return (high - max(open_px, close)) / total_range
+
+    def _first_bar_blowoff(self, todays: pd.DataFrame) -> bool:
+        rows = todays[todays["et"].dt.time == time(9, 31)]
+        if rows.empty:
+            rows = todays.head(1)
+        if rows.empty:
+            return False
+        first = rows.iloc[0]
+        high = _to_decimal(first["high"])
+        low = _to_decimal(first["low"])
+        close = _to_decimal(first["close"])
+        open_px = _to_decimal(first["open"])
+        total_range = high - low
+        if total_range <= 0:
+            return False
+        range_pct = total_range / open_px if open_px > 0 else Decimal("0")
+        threshold = Decimal(
+            str(
+                getattr(
+                    self._settings,
+                    "open_chase_first_bar_blowoff_range_pct",
+                    Decimal("0.012"),
+                )
+            )
+        )
+        close_position = (close - low) / total_range
+        return range_pct > threshold and close_position < Decimal("0.50")
+
+    def _log_orb_reject(self, event: BarsClosed, reason: str) -> None:
+        LOGGER.info(
+            "signal.open_chase_orb.filtered",
+            symbol=event.symbol,
+            timestamp=_to_eastern(event.bar_end).isoformat(),
+            reason=reason,
+        )
+        try:
+            if self._metrics_enabled:
+                record_signal_filtered(reason.upper())
+        except Exception:
+            pass
+        return None
+
+    def _log_1030_reject(self, event: BarsClosed, reason: str, **fields: Any) -> None:
+        LOGGER.info(
+            "signal.reversal_1030.filtered",
+            symbol=event.symbol,
+            timestamp=_to_eastern(event.bar_end).isoformat(),
+            reason=reason,
+            **fields,
+        )
+        try:
+            if self._metrics_enabled:
+                record_signal_filtered(reason.upper())
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _parse_hhmm(value: str) -> time:
+        hour, minute = value.split(":", 1)
+        return time(hour=int(hour), minute=int(minute))
+
     def _load_history(
         self, session: Session, symbol: str, ts_end: datetime, *, limit: int
     ) -> Optional[pd.DataFrame]:
@@ -2668,14 +4722,6 @@ class SignalEngine:
             return False
         if not self._top5_recent(trade_date, session, symbol):
             return False
-        if self._is_high_open(session, symbol, trade_date):
-            ts_end = (
-                current["ts_end"].to_pydatetime()
-                if hasattr(current["ts_end"], "to_pydatetime")
-                else current["ts_end"]
-            )
-            if self._option_price_exceeds_open(session, symbol, trade_date, ts_end):
-                return False
         return True
 
     def _top5_recent(
@@ -2711,25 +4757,13 @@ class SignalEngine:
         return result
 
     def _is_high_open(self, session: Session, symbol: str, trade_date: date) -> bool:
-        row = session.execute(
-            text(
-                """
-                SELECT open_rth, prev_close_rth
-                FROM v_daily_ohlcv_enriched
-                WHERE symbol = :symbol AND trade_date_et::date = :trade_date
-                """
-            ),
-            {"symbol": symbol, "trade_date": trade_date},
-        ).fetchone()
-        if not row:
-            return False
-        open_rth, prev_close_rth = row
-        if open_rth is None or prev_close_rth is None:
-            return False
-        try:
-            open_rth_dec = Decimal(str(open_rth))
-            prev_close_dec = Decimal(str(prev_close_rth))
-        except Exception:
+        open_rth_dec = self._fallback_daily_field_value(
+            session, symbol, trade_date, field_name="open_rth"
+        )
+        prev_close_dec = self._fallback_daily_field_value(
+            session, symbol, trade_date, field_name="prev_close_rth"
+        )
+        if open_rth_dec is None or prev_close_dec is None:
             return False
         return open_rth_dec > prev_close_dec
 
@@ -2745,34 +4779,13 @@ class SignalEngine:
             ts_query = ts_query.replace(tzinfo=timezone.utc)
         window_start = ts_query - timedelta(minutes=15)
         trade_date_et = ts_query.astimezone(EASTERN).date()
-        symbol_column = self._option_symbol_column(session)
         try:
-            current_row = session.execute(
-                text(
-                    f"""
-                    SELECT
-                        conid,
-                        expiry,
-                        strike,
-                        COALESCE(mid, (bid + ask) / 2, last) AS current_price,
-                        bid,
-                        ask,
-                        volume,
-                        open_interest,
-                        delta,
-                        underlying_price,
-                        ts_end
-                    FROM bars1m_option
-                    WHERE {symbol_column} = :symbol
-                      AND "right" = 'CALL'
-                      AND ts_end BETWEEN :window_start AND :ts_end
-                      AND COALESCE(mid, (bid + ask) / 2, last) IS NOT NULL
-                    ORDER BY ts_end DESC, volume DESC NULLS LAST
-                    LIMIT 200
-                    """
-                ),
-                {"symbol": symbol, "window_start": window_start, "ts_end": ts_query},
-            ).mappings().all()
+            current_row = self._option_quote_candidates(
+                session,
+                symbol,
+                ts_query,
+                window_start=window_start,
+            )
         except Exception:
             LOGGER.exception(
                 "signal_engine.option_price_open_current_query_failed",
@@ -2805,21 +4818,31 @@ class SignalEngine:
                 ask_dec = Decimal(str(ask)) if ask is not None else None
             except (InvalidOperation, TypeError, ValueError):
                 continue
+            ts_sample = _coerce_utc_datetime(row.get("ts_end"))
             spread = Decimal("Infinity")
             if bid_dec is not None and ask_dec is not None:
                 if bid_dec <= 0 or ask_dec <= 0 or ask_dec <= bid_dec:
                     continue
                 spread = ask_dec - bid_dec
                 threshold = max(Decimal("0.10"), current_price_dec * Decimal("0.05"))
-                if spread > threshold:
+                if getattr(self, "_option_liquidity_required", True) and spread > threshold:
+                    continue
+            if ts_sample is not None:
+                if max(0.0, (ts_query - ts_sample).total_seconds()) > OPTION_QUOTE_MAX_AGE_SECONDS:
                     continue
             try:
                 volume_int = int(volume or 0)
                 oi_int = int(oi or 0)
-                if volume_int < 100:
-                    continue
-                if oi_int < 500:
-                    continue
+                allow_missing_metrics = getattr(
+                    self, "_allow_missing_option_liquidity_metrics", False
+                )
+                if getattr(self, "_option_liquidity_required", True) and not (
+                    allow_missing_metrics and volume_int == 0 and oi_int == 0
+                ):
+                    if volume_int < 100:
+                        continue
+                    if oi_int < 500:
+                        continue
             except (TypeError, ValueError):
                 continue
             if isinstance(expiry, datetime):
@@ -2855,13 +4878,16 @@ class SignalEngine:
                 if underlying_dec is not None
                 else Decimal("Infinity")
             )
+            quote_age = max(0.0, (ts_query - ts_sample).total_seconds()) if ts_sample else 0.0
             candidates.append(
                 {
                     "conid": conid,
                     "current_price": current_price_dec,
                     "expiry": expiry_date,
                     "strike": strike,
+                    "quote_ts": ts_sample,
                     "selection_key": (
+                        quote_age,
                         -volume_int,
                         self._option_delta_penalty(delta_dec),
                         spread,
@@ -2953,6 +4979,21 @@ def _to_eastern(ts: datetime) -> datetime:
     if ts.tzinfo is None:
         return ts.replace(tzinfo=EASTERN)
     return ts.astimezone(EASTERN)
+
+
+def _coerce_utc_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        ts = value
+    else:
+        try:
+            ts = pd.Timestamp(value).to_pydatetime()
+        except (TypeError, ValueError):
+            return None
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
 
 
 def _to_decimal(value: Any) -> Decimal:

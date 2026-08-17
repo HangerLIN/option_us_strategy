@@ -36,6 +36,7 @@ from libs.schemas.risk import (
     RiskLimits,
     RiskState,
 )
+from libs.schemas.assets import AssetType
 from .service import RiskService
 from .state import RiskStateAggregator
 from .subscribers import RiskStreamConsumers
@@ -244,22 +245,24 @@ async def list_risk_events(
 
 
 def _compute_notional(positions: list) -> Decimal:
-    option_multiplier = Decimal("100")
     return sum(
-        Decimal(abs(position.open_quantity)) * position.mark_price * option_multiplier
+        Decimal(abs(position.open_quantity))
+        * position.mark_price
+        * _position_multiplier(position)
         for position in positions
     )
 
 
 def _build_exposure_snapshots(positions: list) -> list[ExposureSnapshot]:
-    option_multiplier = Decimal("100")
     snapshots: list[ExposureSnapshot] = []
     for position in positions:
-        notional = Decimal(abs(position.open_quantity)) * position.mark_price * option_multiplier
+        asset_type = _position_asset_type(position)
+        notional = Decimal(abs(position.open_quantity)) * position.mark_price * _position_multiplier(position)
         snapshots.append(
             ExposureSnapshot(
                 strategy_code=position.strategy_code,
                 symbol=position.symbol,
+                asset_type=asset_type,
                 option_right=position.option_right,
                 open_quantity=position.open_quantity,
                 mark_price=position.mark_price,
@@ -273,6 +276,18 @@ def _build_exposure_snapshots(positions: list) -> list[ExposureSnapshot]:
             )
         )
     return snapshots
+
+
+def _position_asset_type(position: object) -> AssetType:
+    raw = str(getattr(position, "asset_type", "OPTION") or "OPTION").upper()
+    try:
+        return AssetType(raw)
+    except ValueError:
+        return AssetType.OPTION
+
+
+def _position_multiplier(position: object) -> Decimal:
+    return Decimal("100") if _position_asset_type(position) == AssetType.OPTION else Decimal("1")
 
 
 def _fetch_latest_metrics() -> tuple[Optional[datetime], Dict[str, Any]]:
@@ -389,7 +404,14 @@ async def force_close(
     dao: StrategyPositionDAO = Depends(get_position_dao),
 ) -> ApiResult:
     update_trace_context(symbol=payload.symbol, signal_code=payload.strategy_code)
-    position = dao.get_position(payload.strategy_code, payload.symbol, payload.option_right)
+    if payload.asset_type == AssetType.OPTION and payload.option_right is None:
+        return ApiResult(ok=False, code="REJECT:OPTION_RIGHT_REQUIRED", message="期权强平需要 option_right")
+    position = dao.get_position(
+        payload.strategy_code,
+        payload.symbol,
+        payload.option_right,
+        asset_type=payload.asset_type.value,
+    )
     if position is None:
         return ApiResult(ok=False, code="REJECT:POSITION_NOT_FOUND", message="未找到持仓")
 
@@ -412,6 +434,7 @@ async def force_close(
             symbol=payload.symbol,
             payload={
                 "strategy_code": payload.strategy_code,
+                "asset_type": payload.asset_type.value,
                 "option_right": payload.option_right,
             },
         )
@@ -421,6 +444,7 @@ async def force_close(
         {
             "strategy_code": payload.strategy_code,
             "symbol": payload.symbol,
+            "asset_type": payload.asset_type.value,
             "option_right": payload.option_right,
             "reason": "MANUAL",
             "triggered_at": event_ts,
@@ -436,6 +460,7 @@ async def force_close(
     result = ForceCloseResult(
         strategy_code=payload.strategy_code,
         symbol=payload.symbol,
+        asset_type=payload.asset_type,
         option_right=payload.option_right,
         was_open=was_open,
         closed_quantity=closed_quantity,

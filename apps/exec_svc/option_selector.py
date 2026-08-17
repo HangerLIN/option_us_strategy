@@ -8,7 +8,7 @@ from typing import Iterable, Optional, Sequence
 import structlog
 from ibapi.contract import Contract, ContractDetails
 
-from libs.core import EASTERN
+from libs.core import EASTERN, get_settings
 from libs.infra import IBClient
 
 
@@ -50,6 +50,7 @@ class OptionSelector:
     def __init__(self, ib_client: IBClient, *, snapshot_timeout: float = 5.0) -> None:
         self._ib_client = ib_client
         self._snapshot_timeout = snapshot_timeout
+        self._liquidity_required = bool(get_settings().option_liquidity_required)
         self._logger = structlog.get_logger(__name__)
 
     # ------------------------------------------------------------------ Public API
@@ -146,7 +147,7 @@ class OptionSelector:
                     if quote is None:
                         continue
 
-                    if not _passes_liquidity(quote):
+                    if self._liquidity_required and not _passes_liquidity(quote):
                         self._logger.info(
                             "option_selector.liquidity_reject",
                             symbol=symbol,

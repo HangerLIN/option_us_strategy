@@ -55,17 +55,25 @@ class MetricsWriter(bt.Analyzer):
             self._pnl_series.append(pnl)
 
     def stop(self) -> None:
-        total_pnl = sum(self._pnl_series)
-        gross_wins = sum(p for p in self._pnl_series if p > 0)
-        gross_losses = sum(abs(p) for p in self._pnl_series if p < 0)
-        num_trades = len(self._pnl_series)
-        win_trades = len([p for p in self._pnl_series if p > 0])
-        win_rate = win_trades / num_trades if num_trades else 0
-        total_fees = sum(self._fees)
-        total_slippage = sum(self._slippage)
+        pnl_series = list(self._pnl_series)
+        fees_series = list(self._fees)
+        reconstructed_pnl, reconstructed_fees = self._reconstruct_realized_totals()
+        if reconstructed_pnl:
+            pnl_series, fees_series = reconstructed_pnl, reconstructed_fees
 
-        sharpe = self._compute_sharpe()
-        max_drawdown = self._compute_max_drawdown()
+        total_pnl = sum(pnl_series)
+        gross_wins = sum(p for p in pnl_series if p > 0)
+        gross_losses = sum(abs(p) for p in pnl_series if p < 0)
+        num_trades = len(pnl_series)
+        win_trades = len([p for p in pnl_series if p > 0])
+        win_rate = win_trades / num_trades if num_trades else 0
+        total_fees = sum(fees_series)
+        trade_rows = self._fetch_bt_trades()
+        recorded_slippage = [float(row.get("slippage") or 0) for row in trade_rows]
+        total_slippage = sum(recorded_slippage) if trade_rows else sum(self._slippage)
+
+        sharpe = self._compute_sharpe(pnl_series)
+        max_drawdown = self._compute_max_drawdown(pnl_series)
 
         total_metrics = [
             {"run_id": self.run_id, "metric_code": "total_pnl", "metric_value": total_pnl},
@@ -104,6 +112,54 @@ class MetricsWriter(bt.Analyzer):
             )
         self.dao.record_metrics_daily(rows)
 
+    def _reconstruct_realized_totals(self) -> tuple[list[float], list[float]]:
+        rows = self._fetch_bt_trades()
+        realized: list[float] = []
+        fees_paid: list[float] = []
+        open_legs: dict[tuple[object, ...], Deque[_OpenLeg]] = defaultdict(deque)
+
+        for row in rows:
+            side = str(row.get("side") or "").upper()
+            signal_code = str(row.get("reason_code") or "")
+            quantity = abs(float(row.get("quantity") or 0))
+            price = float(row.get("price") or 0)
+            fees = float(row.get("fees") or 0)
+            if quantity <= 0 or price <= 0:
+                continue
+            key = (
+                str(row.get("symbol") or "").upper(),
+                str(row.get("option_right") or "").upper(),
+                str(row.get("strike") or ""),
+                str(row.get("expiry") or ""),
+            )
+            if side == "BUY" and signal_code in BUY_SIGNAL_CODES:
+                open_legs[key].append(
+                    _OpenLeg(
+                        quantity=quantity,
+                        price=price,
+                        signal_code=signal_code,
+                        fees=fees,
+                    )
+                )
+                continue
+            if side != "SELL":
+                continue
+
+            remaining = quantity
+            while remaining > 0 and open_legs[key]:
+                leg = open_legs[key][0]
+                closed_qty = min(remaining, leg.quantity)
+                entry_fee = leg.fees * (closed_qty / leg.quantity) if leg.quantity else 0.0
+                exit_fee = fees * (closed_qty / quantity) if quantity else 0.0
+                realized.append((price - leg.price) * closed_qty * 100.0 - entry_fee - exit_fee)
+                fees_paid.extend([entry_fee, exit_fee])
+                leg.quantity -= closed_qty
+                remaining -= closed_qty
+                if leg.quantity <= 1e-9:
+                    open_legs[key].popleft()
+
+        return realized, fees_paid
+
     def _build_signal_metrics(self) -> list[dict[str, float | int]]:
         """Attribute closed option PnL back to the entry signal that opened the leg.
 
@@ -115,6 +171,7 @@ class MetricsWriter(bt.Analyzer):
         rows = self._fetch_bt_trades()
         opportunities = self._fetch_signal_opportunities()
         realized: dict[str, list[float]] = defaultdict(list)
+        realized_returns: dict[str, list[float]] = defaultdict(list)
         forward_5m: dict[str, list[float]] = defaultdict(list)
         open_legs: dict[tuple[object, ...], Deque[_OpenLeg]] = defaultdict(deque)
 
@@ -156,6 +213,9 @@ class MetricsWriter(bt.Analyzer):
                 exit_fee = fees * (closed_qty / quantity) if quantity else 0.0
                 pnl = (price - leg.price) * closed_qty * 100.0 - entry_fee - exit_fee
                 realized[leg.signal_code].append(pnl)
+                entry_notional = leg.price * closed_qty * 100.0 + entry_fee
+                if entry_notional > 0:
+                    realized_returns[leg.signal_code].append(pnl / entry_notional)
                 leg.quantity -= closed_qty
                 remaining -= closed_qty
                 if leg.quantity <= 1e-9:
@@ -167,6 +227,7 @@ class MetricsWriter(bt.Analyzer):
         )
         for code in all_codes:
             values = realized.get(code, [])
+            return_values = realized_returns.get(code, [])
             returns_5m = forward_5m.get(code, [])
             count = len(values)
             pnl_total = sum(values)
@@ -179,24 +240,123 @@ class MetricsWriter(bt.Analyzer):
             suffix = code.removeprefix("SIG_")
             metrics.extend(
                 [
-                    {"run_id": self.run_id, "metric_code": f"PNL_SIG_{suffix}", "metric_value": pnl_total},
-                    {"run_id": self.run_id, "metric_code": f"AVG_PNL_SIG_{suffix}", "metric_value": avg_pnl},
-                    {"run_id": self.run_id, "metric_code": f"WIN_RATE_SIG_{suffix}", "metric_value": win_rate},
-                    {"run_id": self.run_id, "metric_code": f"LOSS_RATE_SIG_{suffix}", "metric_value": loss_rate},
-                    {"run_id": self.run_id, "metric_code": f"COUNT_EXEC_SIG_{suffix}", "metric_value": count},
-                    {"run_id": self.run_id, "metric_code": f"COUNT_OPP_SIG_{suffix}", "metric_value": opp_count},
-                    {"run_id": self.run_id, "metric_code": f"GROSS_WIN_SIG_{suffix}", "metric_value": sum(wins)},
-                    {"run_id": self.run_id, "metric_code": f"GROSS_LOSS_SIG_{suffix}", "metric_value": abs(sum(losses))},
-                    # Backward-compatible names used by the earlier completion report.
-                    {"run_id": self.run_id, "metric_code": f"RET_SIG_{suffix}_TFE_MEAN", "metric_value": avg_pnl},
-                    {"run_id": self.run_id, "metric_code": f"RET_SIG_{suffix}_TFE_P50", "metric_value": median(values) if values else 0.0},
-                    {"run_id": self.run_id, "metric_code": f"RET_SIG_{suffix}_TFE_P90", "metric_value": self._percentile(values, 0.90)},
-                    {"run_id": self.run_id, "metric_code": f"COUNT_EXEC_SIG_{suffix}_FIXED", "metric_value": count},
-                    {"run_id": self.run_id, "metric_code": f"COUNT_OPP_SIG_{suffix}_TFE", "metric_value": opp_count},
-                    {"run_id": self.run_id, "metric_code": f"RET_SIG_{suffix}_5M", "metric_value": mean(returns_5m) if returns_5m else 0.0},
-                    {"run_id": self.run_id, "metric_code": f"RET_SIG_{suffix}_5M_P50", "metric_value": median(returns_5m) if returns_5m else 0.0},
-                    {"run_id": self.run_id, "metric_code": f"RET_SIG_{suffix}_5M_P90", "metric_value": self._percentile(returns_5m, 0.90)},
-                    {"run_id": self.run_id, "metric_code": f"COUNT_EXEC_SIG_{suffix}_5M", "metric_value": len(returns_5m)},
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"PNL_SIG_{suffix}",
+                        "metric_value": pnl_total,
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"AVG_PNL_SIG_{suffix}",
+                        "metric_value": avg_pnl,
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"WIN_RATE_SIG_{suffix}",
+                        "metric_value": win_rate,
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"LOSS_RATE_SIG_{suffix}",
+                        "metric_value": loss_rate,
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"COUNT_EXEC_SIG_{suffix}",
+                        "metric_value": count,
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"COUNT_OPP_SIG_{suffix}",
+                        "metric_value": opp_count,
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"GROSS_WIN_SIG_{suffix}",
+                        "metric_value": sum(wins),
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"GROSS_LOSS_SIG_{suffix}",
+                        "metric_value": abs(sum(losses)),
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"PNL_USD_SIG_{suffix}_MEAN",
+                        "metric_value": avg_pnl,
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"PNL_USD_SIG_{suffix}_P50",
+                        "metric_value": median(values) if values else 0.0,
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"PNL_USD_SIG_{suffix}_P90",
+                        "metric_value": self._percentile(values, 0.90),
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"RETURN_DECIMAL_SIG_{suffix}_REALIZED_MEAN",
+                        "metric_value": mean(return_values) if return_values else 0.0,
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"RETURN_DECIMAL_SIG_{suffix}_REALIZED_P50",
+                        "metric_value": median(return_values) if return_values else 0.0,
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"RETURN_DECIMAL_SIG_{suffix}_REALIZED_P90",
+                        "metric_value": self._percentile(return_values, 0.90),
+                    },
+                    # Deprecated compatibility aliases. These contain USD PnL
+                    # despite the historical RET prefix.
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"RET_SIG_{suffix}_TFE_MEAN",
+                        "metric_value": avg_pnl,
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"RET_SIG_{suffix}_TFE_P50",
+                        "metric_value": median(values) if values else 0.0,
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"RET_SIG_{suffix}_TFE_P90",
+                        "metric_value": self._percentile(values, 0.90),
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"COUNT_EXEC_SIG_{suffix}_FIXED",
+                        "metric_value": count,
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"COUNT_OPP_SIG_{suffix}_TFE",
+                        "metric_value": opp_count,
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"RET_SIG_{suffix}_5M",
+                        "metric_value": mean(returns_5m) if returns_5m else 0.0,
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"RET_SIG_{suffix}_5M_P50",
+                        "metric_value": median(returns_5m) if returns_5m else 0.0,
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"RET_SIG_{suffix}_5M_P90",
+                        "metric_value": self._percentile(returns_5m, 0.90),
+                    },
+                    {
+                        "run_id": self.run_id,
+                        "metric_code": f"COUNT_EXEC_SIG_{suffix}_5M",
+                        "metric_value": len(returns_5m),
+                    },
                 ]
             )
         return metrics
@@ -311,18 +471,22 @@ class MetricsWriter(bt.Analyzer):
 
     def _fetch_bt_trades(self) -> list[Mapping[str, object]]:
         session = self.dao._session  # BacktestDAO owns the run transaction.
-        rows = session.execute(
-            text(
-                """
+        rows = (
+            session.execute(
+                text(
+                    """
                 SELECT symbol, side, quantity, price, trade_ts, option_right,
-                       strike, expiry, fees, reason_code
+                       strike, expiry, fees, slippage, reason_code
                 FROM bt_trades
                 WHERE run_id = :run_id
                 ORDER BY trade_ts ASC, side ASC
                 """
-            ),
-            {"run_id": self.run_id},
-        ).mappings().all()
+                ),
+                {"run_id": self.run_id},
+            )
+            .mappings()
+            .all()
+        )
         return list(rows)
 
     def _fetch_signal_opportunities(self) -> dict[str, int]:
@@ -351,8 +515,8 @@ class MetricsWriter(bt.Analyzer):
         idx = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * q))))
         return ordered[idx]
 
-    def _compute_sharpe(self) -> float | None:
-        pnl_series = self._pnl_series
+    def _compute_sharpe(self, pnl_series: list[float] | None = None) -> float | None:
+        pnl_series = pnl_series if pnl_series is not None else self._pnl_series
         if len(pnl_series) < 2:
             return None
         avg = mean(pnl_series)
@@ -361,11 +525,12 @@ class MetricsWriter(bt.Analyzer):
             return None
         return avg / variance**0.5
 
-    def _compute_max_drawdown(self) -> float | None:
+    def _compute_max_drawdown(self, pnl_series: list[float] | None = None) -> float | None:
+        pnl_series = pnl_series if pnl_series is not None else self._pnl_series
         cumulative = 0.0
         peak = 0.0
         max_dd = 0.0
-        for pnl in self._pnl_series:
+        for pnl in pnl_series:
             cumulative += pnl
             peak = max(peak, cumulative)
             drawdown = peak - cumulative

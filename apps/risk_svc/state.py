@@ -13,6 +13,7 @@ from libs.db.dao import RiskStateDAO
 from libs.db.models import StrategyPosition
 from libs.infra.metrics import set_risk_drawdown, set_risk_used_r
 from libs.infra.redis_bus import RedisBus
+from libs.schemas.assets import AssetType
 from libs.schemas.events import BarsClosed
 
 from .publisher import publish_risk_alert, publish_risk_block, publish_risk_unblock
@@ -132,10 +133,16 @@ class RiskStateAggregator:
                 continue
             mark = Decimal(str(pos.mark_price))
             avg = Decimal(str(pos.avg_open_price))
-            total_notional += abs(qty) * mark * _OPTION_MULTIPLIER
-            unrealized += (mark - avg) * qty * _OPTION_MULTIPLIER
+            multiplier = self._position_multiplier(pos)
+            total_notional += abs(qty) * mark * multiplier
+            unrealized += (mark - avg) * qty * multiplier
             num_positions += 1
         return num_positions, unrealized, total_notional
+
+    @staticmethod
+    def _position_multiplier(position: StrategyPosition) -> Decimal:
+        raw = str(getattr(position, "asset_type", "OPTION") or "OPTION").upper()
+        return _OPTION_MULTIPLIER if raw == AssetType.OPTION.value else Decimal("1")
 
     def _fetch_realized_pnl(self, session: Session, ts_end: datetime) -> Decimal:
         et_date = ts_end.astimezone(EASTERN).date()

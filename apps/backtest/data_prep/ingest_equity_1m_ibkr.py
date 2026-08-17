@@ -21,7 +21,7 @@ import logging
 import time
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Dict, Iterable, List, Mapping, Sequence, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
 from sqlalchemy import text
@@ -59,13 +59,20 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--start",
-        required=True,
         help="起始日期 (包含, YYYY-MM-DD, 东部时间)",
     )
     parser.add_argument(
         "--end",
-        required=True,
         help="结束日期 (包含, YYYY-MM-DD, 东部时间)",
+    )
+    parser.add_argument(
+        "--date",
+        help="单日拉取日期 (YYYY-MM-DD)，等价于 --start/--end 同一天",
+    )
+    parser.add_argument(
+        "--symbols",
+        nargs="+",
+        help="显式指定股票列表；用于 smoke/minimal ingest",
     )
     parser.add_argument(
         "--universe",
@@ -98,7 +105,18 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="严格模式：单日存在失败则中止，不推进检查点",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--skip-vix",
+        action="store_true",
+        help="跳过 VIX 日线回填；用于只补齐正股分钟数据的研究任务",
+    )
+    args = parser.parse_args()
+    if args.date:
+        args.start = args.start or args.date
+        args.end = args.end or args.date
+    if not args.start or not args.end:
+        parser.error("must provide --start/--end or --date")
+    return args
 
 
 def _to_trade_date(value: str) -> date:
@@ -191,6 +209,24 @@ def _count_symbol_bars_between(
             text(
                 """
                 SELECT COUNT(*) FROM bars1m_equity
+                WHERE symbol = :symbol
+                  AND ts_end >= :start_ts
+                  AND ts_end <= :end_ts
+                """
+            ),
+            {"symbol": symbol, "start_ts": start_ts, "end_ts": end_ts},
+        ).scalar()
+        return int(count or 0)
+
+
+def _count_symbol_indicators_between(
+    session_factory: sessionmaker[Session], symbol: str, start_ts: datetime, end_ts: datetime
+) -> int:
+    with session_factory() as session:
+        count = session.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM indicators_eq_1m
                 WHERE symbol = :symbol
                   AND ts_end >= :start_ts
                   AND ts_end <= :end_ts
@@ -860,10 +896,13 @@ def main() -> int:
         if not trade_dates:
             raise SystemExit("No trading dates available in the requested window")
 
-        # 从数据库表解析股票池
-        resolver = UniverseResolver(session)
-        universe = resolver.resolve(args.universe)
-        symbols = universe.symbols
+        # 从显式参数或数据库表解析股票池
+        if args.symbols:
+            symbols = [symbol.strip().upper() for symbol in args.symbols if symbol.strip()]
+        else:
+            resolver = UniverseResolver(session)
+            universe = resolver.resolve(args.universe)
+            symbols = universe.symbols
         if not symbols:
             raise SystemExit("Symbol universe resolved to zero entries")
         
@@ -947,19 +986,20 @@ def main() -> int:
                     _, _, expected_bars = _get_rth_window_utc(session_factory, trade_date)
                     monitor.set_day_expected_bars(trade_date, expected_bars)
                 # 首先拉取VIX数据（每个交易日一次）
-                try:
-                    ingest_vix(
-                        client=client,
-                        session_factory=session_factory,
-                        trade_date=trade_date,
-                    )
-                except Exception as exc:
-                    LOGGER.error(
-                        "ingest_vix.failed trade_date=%s error=%s",
-                        trade_date.isoformat(),
-                        str(exc),
-                    )
-                    # VIX拉取失败不影响equity数据拉取，继续执行
+                if not args.skip_vix:
+                    try:
+                        ingest_vix(
+                            client=client,
+                            session_factory=session_factory,
+                            trade_date=trade_date,
+                        )
+                    except Exception as exc:
+                        LOGGER.error(
+                            "ingest_vix.failed trade_date=%s error=%s",
+                            trade_date.isoformat(),
+                            str(exc),
+                        )
+                        # VIX拉取失败不影响equity数据拉取，继续执行
                 
                 # 拉取股票数据（先检查是否已完整，已完整则跳过并标记完成）
                 for symbol in batch_symbols:
@@ -968,8 +1008,30 @@ def main() -> int:
                         start_utc, end_utc, expected = _get_rth_window_utc(session_factory, trade_date)
                         existing = _count_symbol_bars_between(session_factory, symbol, start_utc, end_utc)
                         if existing >= max(1, expected):
+                            existing_indicators = _count_symbol_indicators_between(
+                                session_factory, symbol, start_utc, end_utc
+                            )
+                            if existing_indicators < max(1, expected):
+                                LOGGER.info(
+                                    "recompute.indicators symbol=%s trade_date=%s indicators=%d expected=%d",
+                                    symbol,
+                                    trade_date.isoformat(),
+                                    existing_indicators,
+                                    expected,
+                                )
+                                _recompute_indicators(session_factory, symbol, trade_date)
+                                existing_indicators = _count_symbol_indicators_between(
+                                    session_factory, symbol, start_utc, end_utc
+                                )
                             with session_factory() as session:
-                                _mark_symbol_completed(session, ingestion_id, trade_date, symbol, existing, existing)
+                                _mark_symbol_completed(
+                                    session,
+                                    ingestion_id,
+                                    trade_date,
+                                    symbol,
+                                    existing,
+                                    existing_indicators,
+                                )
                                 session.commit()
                             if monitor:
                                 monitor.record_symbol_date_completed(symbol, trade_date)
@@ -1071,7 +1133,7 @@ def main() -> int:
                 final_stats["rate_bars_per_sec"],
             )
         
-    except Exception as exc:
+    except Exception:
         # 标记失败
         if monitor:
             monitor.mark_failed()

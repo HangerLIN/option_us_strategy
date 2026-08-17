@@ -31,9 +31,9 @@ class OptionQuote:
     expiry: datetime
     strike: Decimal
     dte: int
-    bid: Decimal
-    ask: Decimal
-    mid: Decimal
+    bid: Decimal | None
+    ask: Decimal | None
+    mid: Decimal | None
     open_interest: int
     volume: int
     min_tick: Decimal
@@ -69,6 +69,25 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dte-min", type=int, default=2, help="Minimum days to expiry (inclusive)")
     parser.add_argument("--dte-max", type=int, default=7, help="Maximum days to expiry (inclusive)")
+    parser.add_argument(
+        "--rights",
+        nargs="+",
+        choices=["CALL", "PUT"],
+        default=["CALL", "PUT"],
+        help="Option rights to store (default CALL PUT)",
+    )
+    parser.add_argument(
+        "--delta-min",
+        type=float,
+        default=None,
+        help="Minimum absolute delta when delta is available",
+    )
+    parser.add_argument(
+        "--delta-max",
+        type=float,
+        default=None,
+        help="Maximum absolute delta when delta is available",
+    )
     parser.add_argument(
         "--otm-min",
         type=float,
@@ -120,6 +139,30 @@ def _market_snapshot(client: IBClient, contract, *, generic_ticks: str = "100,10
     return client.market_data_snapshot(contract, generic_ticks=generic_ticks, timeout=10.0)
 
 
+def _safe_int(value: object | None) -> int:
+    if value is None:
+        return 0
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if math.isnan(numeric):
+        return 0
+    return int(numeric)
+
+
+def _safe_float(value: object | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(numeric):
+        return None
+    return numeric
+
+
 def _resolve_spot(
     session_factory: sessionmaker[Session],
     client: IBClient,
@@ -169,6 +212,13 @@ def _session_bounds(trade_date: date) -> Tuple[datetime, datetime]:
     start_utc = start_et.astimezone(timezone.utc)
     end_utc = (end_et + timedelta(minutes=1)).astimezone(timezone.utc)
     return start_utc, end_utc
+
+
+def _quote_probe_window(trade_date: date) -> Tuple[datetime, datetime]:
+    _, end_et = trading_session_window(trade_date, tz=EASTERN)
+    end_et = end_et + timedelta(minutes=1)
+    start_et = end_et - timedelta(minutes=30)
+    return start_et.astimezone(timezone.utc), end_et.astimezone(timezone.utc)
 
 
 def _stream_bid_ask(
@@ -223,6 +273,85 @@ def _stream_bid_ask(
     return bid, ask
 
 
+def _decimal_or_none(value: object | None) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        numeric = Decimal(str(value))
+    except Exception:
+        return None
+    if not numeric.is_finite():
+        return None
+    return numeric
+
+
+def _quote_from_values(
+    bid_raw: object | None,
+    ask_raw: object | None,
+) -> Tuple[Decimal | None, Decimal | None, Decimal | None]:
+    bid = _decimal_or_none(bid_raw)
+    ask = _decimal_or_none(ask_raw)
+    if bid is None or ask is None or ask <= 0 or ask < bid:
+        return None, None, None
+    return bid, ask, (bid + ask) / Decimal("2")
+
+
+def _resolve_option_quote(
+    client: IBClient,
+    contract,
+    trade_date: date,
+    symbol: str,
+    option_right: str,
+    strike: float,
+) -> tuple[Decimal | None, Decimal | None, Decimal | None, int, int, float | None]:
+    start_utc, end_utc = _quote_probe_window(trade_date)
+    try:
+        bars = client.req_option_bid_ask_1m(
+            contract,
+            start=start_utc,
+            end=end_utc,
+            use_rth=True,
+        )
+        for bar in reversed(bars):
+            bid, ask, mid = _quote_from_values(bar.get("bid"), bar.get("ask"))
+            if mid is not None:
+                volume = _safe_int(bar.get("bid_size")) + _safe_int(bar.get("ask_size"))
+                return bid, ask, mid, 0, volume, None
+    except Exception as exc:
+        LOGGER.warning(
+            "option_quote.history_failed",
+            symbol=symbol,
+            right=option_right,
+            strike=strike,
+            error=str(exc),
+        )
+
+    try:
+        snapshot = _market_snapshot(client, contract)
+        bid, ask, mid = _quote_from_values(snapshot.get("bid"), snapshot.get("ask"))
+        if mid is not None:
+            return (
+                bid,
+                ask,
+                mid,
+                _safe_int(snapshot.get("open_interest")),
+                _safe_int(snapshot.get("option_volume") or snapshot.get("volume")),
+                _safe_float(snapshot.get("delta")),
+            )
+    except Exception as exc:
+        LOGGER.warning(
+            "option_quote.snapshot_failed",
+            symbol=symbol,
+            right=option_right,
+            strike=strike,
+            error=str(exc),
+        )
+
+    bid_float, ask_float = _stream_bid_ask(client, contract, symbol, option_right, strike)
+    bid, ask, mid = _quote_from_values(bid_float, ask_float)
+    return bid, ask, mid, 0, 0, None
+
+
 def _choose_strikes(strikes: Iterable[float], spot: float, *, right: str, otm_min: float, otm_max: float) -> List[float]:
     strikes_sorted = sorted(set(strikes))
     if not strikes_sorted:
@@ -246,6 +375,24 @@ def _choose_strikes(strikes: Iterable[float], spot: float, *, right: str, otm_mi
     return chosen
 
 
+def _select_option_entry(params: Sequence[Mapping], symbol: str) -> Mapping:
+    symbol_up = symbol.upper()
+
+    def score(entry: Mapping) -> tuple[int, int, int, int]:
+        trading_class = str(entry.get("trading_class") or entry.get("tradingClass") or "").upper()
+        exchange = str(entry.get("exchange") or "").upper()
+        expirations = entry.get("expirations") or []
+        strikes = entry.get("strikes") or []
+        return (
+            1 if trading_class == symbol_up else 0,
+            1 if exchange == "SMART" else 0,
+            len(expirations),
+            len(strikes),
+        )
+
+    return max(params, key=score)
+
+
 def _build_option_quotes(
     client: IBClient,
     *,
@@ -261,6 +408,9 @@ def _build_option_quotes(
     dte_max: int,
     otm_min: float,
     otm_max: float,
+    rights: Sequence[str] = ("CALL", "PUT"),
+    delta_min: float | None = None,
+    delta_max: float | None = None,
     max_per_side: int,
 ) -> List[OptionQuote]:
     quotes: List[OptionQuote] = []
@@ -269,7 +419,7 @@ def _build_option_quotes(
         dte = (expiry_dt.date() - trade_date).days
         if dte < dte_min or dte > dte_max:
             continue
-        for right in ("CALL", "PUT"):
+        for right in rights:
             selected_strikes = _choose_strikes(strikes, spot_price, right=right, otm_min=otm_min, otm_max=otm_max)
             if not selected_strikes:
                 continue
@@ -277,8 +427,10 @@ def _build_option_quotes(
                 selected_strikes = sorted(selected_strikes)
             else:
                 selected_strikes = sorted(selected_strikes, reverse=True)
-            selected_strikes = selected_strikes[:max_per_side]
+            saved_for_side = 0
             for strike in selected_strikes:
+                if saved_for_side >= max_per_side:
+                    break
                 contract = client.option_contract(
                     symbol=symbol,
                     expiry=expiry_dt.strftime("%Y%m%d"),
@@ -286,63 +438,42 @@ def _build_option_quotes(
                     right=right,
                     exchange=exchange or "SMART",
                     multiplier=multiplier or "100",
+                    include_expired=True,
                 )
                 if trading_class:
                     contract.tradingClass = trading_class
-                detail = client.req_contract_details(contract, timeout=15.0)
+                try:
+                    detail = client.req_contract_details(contract, timeout=15.0)
+                except Exception as exc:
+                    LOGGER.warning(
+                        "contract_details.failed",
+                        symbol=symbol,
+                        expiry=expiry_dt.isoformat(),
+                        strike=strike,
+                        right=right,
+                        reason=str(exc),
+                    )
+                    continue
                 if not detail:
                     LOGGER.warning("contract_details.empty symbol=%s expiry=%s strike=%s right=%s", symbol, expiry_dt.isoformat(), strike, right)
                     continue
                 resolved = detail.contract
                 conid = int(resolved.conId)
                 min_tick = Decimal(str(detail.minTick or 0.01))
-            snapshot = _market_snapshot(client, resolved, generic_ticks="")
-            bid = snapshot.get("bid")
-            ask = snapshot.get("ask")
-            open_interest = snapshot.get("open_interest")
-            volume = snapshot.get("option_volume")
-            delta = snapshot.get("delta")
-            if bid is None or ask is None:
-                start_utc, end_utc = _session_bounds(trade_date)
-                try:
-                    l1_records = client.req_option_bid_ask_1m(
-                        resolved,
-                        start=start_utc,
-                        end=end_utc,
-                        use_rth=True,
-                    )
-                except Exception as exc:
-                    LOGGER.warning(
-                        "option_snapshot.no_liquidity",
-                        symbol=symbol,
-                        conid=conid,
-                        right=right,
-                        strike=strike,
-                        reason=str(exc),
-                    )
-                    continue
-                if not l1_records:
-                    LOGGER.warning(
-                        "option_snapshot.no_liquidity",
-                        symbol=symbol,
-                        conid=conid,
-                        right=right,
-                        strike=strike,
-                        reason="empty_bid_ask_history",
-                    )
-                    continue
-                bid = l1_records[0]["bid"]
-                ask = l1_records[0]["ask"]
-            bid_dec = Decimal(str(bid))
-            ask_dec = Decimal(str(ask))
-            if ask_dec <= 0 or bid_dec <= 0 or ask_dec <= bid_dec:
-                continue
-                mid_dec = (bid_dec + ask_dec) / Decimal("2")
-                oi_val = int(open_interest) if open_interest is not None and not math.isnan(open_interest) else 0
-                vol_val = int(volume) if volume is not None and not math.isnan(volume) else 0
-                if oi_val <= 0 and vol_val <= 0:
-                    LOGGER.warning("option_snapshot.no_liquidity symbol=%s conid=%s", symbol, conid)
-                    continue
+                bid, ask, mid, open_interest, volume, delta = _resolve_option_quote(
+                    client,
+                    resolved,
+                    trade_date,
+                    symbol,
+                    right,
+                    strike,
+                )
+                if delta is not None:
+                    abs_delta = abs(float(delta))
+                    if delta_min is not None and abs_delta < delta_min:
+                        continue
+                    if delta_max is not None and abs_delta > delta_max:
+                        continue
                 quotes.append(
                     OptionQuote(
                         conid=conid,
@@ -351,15 +482,16 @@ def _build_option_quotes(
                         expiry=expiry_dt,
                         strike=Decimal(str(strike)),
                         dte=dte,
-                        bid=bid_dec,
-                        ask=ask_dec,
-                        mid=mid_dec,
-                        open_interest=oi_val,
-                        volume=vol_val,
+                        bid=bid,
+                        ask=ask,
+                        mid=mid,
+                        open_interest=open_interest,
+                        volume=volume,
                         min_tick=min_tick,
-                        delta=float(delta) if delta is not None and not math.isnan(delta) else None,
+                        delta=delta,
                     )
                 )
+                saved_for_side += 1
     return quotes
 
 
@@ -374,7 +506,7 @@ def _insert_quotes(session_factory: sessionmaker[Session], trade_date: date, quo
             underlying_symbol,
             expiry,
             strike,
-            right,
+            "right",
             dte,
             delta,
             bid,
@@ -399,12 +531,11 @@ def _insert_quotes(session_factory: sessionmaker[Session], trade_date: date, quo
             :volume,
             :min_tick
         )
-        ON CONFLICT (conid) DO UPDATE SET
-            trade_date = EXCLUDED.trade_date,
+        ON CONFLICT (trade_date, conid) DO UPDATE SET
             underlying_symbol = EXCLUDED.underlying_symbol,
             expiry = EXCLUDED.expiry,
             strike = EXCLUDED.strike,
-            right = EXCLUDED.right,
+            "right" = EXCLUDED."right",
             dte = EXCLUDED.dte,
             delta = EXCLUDED.delta,
             bid = EXCLUDED.bid,
@@ -449,6 +580,9 @@ def ingest_option_chain_meta(
     dte_max: int,
     otm_min: float,
     otm_max: float,
+    rights: Sequence[str],
+    delta_min: float | None,
+    delta_max: float | None,
     max_per_side: int,
 ) -> List[OptionQuote]:
     LOGGER.info("option_chain.start symbol=%s trade_date=%s", symbol, str(trade_date))
@@ -463,7 +597,7 @@ def ingest_option_chain_meta(
     option_entries = [entry for entry in params if isinstance(entry, Mapping) and entry.get("expirations")]
     if not option_entries:
         raise RuntimeError(f"No option parameters returned for {symbol}")
-    base_entry = option_entries[0]
+    base_entry = _select_option_entry(option_entries, symbol)
     expirations = sorted(set(base_entry.get("expirations", [])))
     strikes = sorted(set(float(x) for x in base_entry.get("strikes", [])))
     exchange = base_entry.get("exchange") or "SMART"
@@ -483,6 +617,9 @@ def ingest_option_chain_meta(
         dte_max=dte_max,
         otm_min=otm_min,
         otm_max=otm_max,
+        rights=rights,
+        delta_min=delta_min,
+        delta_max=delta_max,
         max_per_side=max_per_side,
     )
     if not quotes:
@@ -573,6 +710,9 @@ def main() -> int:
                             dte_max=args.dte_max,
                             otm_min=args.otm_min,
                             otm_max=args.otm_max,
+                            rights=[right.upper() for right in args.rights],
+                            delta_min=args.delta_min,
+                            delta_max=args.delta_max,
                             max_per_side=args.max_per_side,
                         )
                         total_quotes += len(quotes)

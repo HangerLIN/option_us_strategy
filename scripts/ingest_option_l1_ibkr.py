@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Sequence
+from typing import Dict, List, Mapping, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
@@ -67,6 +67,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dte-min", type=int, default=2, help="Minimum DTE inclusive (default 2)")
     parser.add_argument("--dte-max", type=int, default=7, help="Maximum DTE inclusive (default 7)")
     parser.add_argument(
+        "--rights",
+        nargs="+",
+        choices=["CALL", "PUT"],
+        default=["CALL", "PUT"],
+        help="Option rights to auto-select when using --underlyings (default CALL PUT)",
+    )
+    parser.add_argument(
+        "--delta-min",
+        type=float,
+        default=None,
+        help="Minimum absolute delta when candidate delta is available",
+    )
+    parser.add_argument(
+        "--delta-max",
+        type=float,
+        default=None,
+        help="Maximum absolute delta when candidate delta is available",
+    )
+    parser.add_argument(
         "--otm-min",
         type=float,
         default=2.0,
@@ -95,6 +114,14 @@ def _parse_args() -> argparse.Namespace:
         default=300,
         help="Minimum number of 1m L1 candles required per option (default 300)",
     )
+    parser.add_argument(
+        "--window-start-et",
+        help="Optional explicit start time in HH:MM Eastern for the L1 request window.",
+    )
+    parser.add_argument(
+        "--window-end-et",
+        help="Optional explicit end time in HH:MM Eastern for the L1 request window.",
+    )
     return parser.parse_args()
 
 
@@ -103,6 +130,14 @@ def _parse_trade_date(value: str) -> date:
         return datetime.strptime(value, "%Y-%m-%d").date()
     except ValueError as exc:
         raise SystemExit(f"Invalid --date {value!r}, expected YYYY-MM-DD") from exc
+
+
+def _parse_hhmm(value: str) -> tuple[int, int]:
+    try:
+        parsed = datetime.strptime(value, "%H:%M").time()
+    except ValueError as exc:
+        raise SystemExit(f"Invalid time {value!r}, expected HH:MM") from exc
+    return parsed.hour, parsed.minute
 
 
 def _load_contracts_from_file(path: Path) -> List[ContractDescriptor]:
@@ -179,6 +214,9 @@ def _filter_candidates(
     spot_price: float,
     otm_min: float,
     otm_max: float,
+    delta_min: Decimal | None = None,
+    delta_max: Decimal | None = None,
+    require_activity: bool = True,
 ) -> List[ContractDescriptor]:
     filtered: List[ContractDescriptor] = []
     spot_dec = Decimal(str(spot_price))
@@ -190,20 +228,32 @@ def _filter_candidates(
         strike = cand.strike
         oi = cand.open_interest
         vol = cand.volume
-        if None in (bid, ask, mid, min_tick, strike, oi, vol):
+        if None in (min_tick, strike):
             continue
-        bid_d = Decimal(str(bid))
-        ask_d = Decimal(str(ask))
-        mid_d = Decimal(str(mid))
+        has_quote = None not in (bid, ask, mid)
+        if has_quote:
+            bid_d = Decimal(str(bid))
+            ask_d = Decimal(str(ask))
+            mid_d = Decimal(str(mid))
+        else:
+            bid_d = ask_d = mid_d = Decimal("0")
         min_tick_d = Decimal(str(min_tick))
         strike_d = Decimal(str(strike))
-        if Decimal(str(oi)) < Decimal("500") or Decimal(str(vol)) < Decimal("100"):
+        oi_d = Decimal(str(oi or 0))
+        vol_d = Decimal(str(vol or 0))
+        if require_activity and (oi_d < Decimal("500") or vol_d < Decimal("100")):
             continue
-        if not _spread_ok(bid_d, ask_d, mid_d, min_tick_d):
+        if has_quote and not _spread_ok(bid_d, ask_d, mid_d, min_tick_d):
             continue
         otm_pct = _otm_percentage(option_right, strike_d, spot_dec)
         if otm_pct < otm_min or otm_pct > otm_max:
             continue
+        if cand.delta is not None:
+            delta_abs = abs(Decimal(str(cand.delta)))
+            if delta_min is not None and delta_abs < delta_min:
+                continue
+            if delta_max is not None and delta_abs > delta_max:
+                continue
         desc = ContractDescriptor.from_candidate(cand)
         filtered.append(desc)
     return filtered
@@ -219,6 +269,9 @@ def _select_contracts_for_symbol(
     dte_max: int,
     otm_min: float,
     otm_max: float,
+    rights: Sequence[str],
+    delta_min: Decimal | None,
+    delta_max: Decimal | None,
 ) -> List[ContractDescriptor]:
     start_et, end_et = trading_session_window(trade_date, tz=EASTERN)
     start_utc = start_et.astimezone(timezone.utc)
@@ -226,7 +279,7 @@ def _select_contracts_for_symbol(
     spot = _spot_close_price(session, symbol, start_utc, end_utc)
 
     selections: List[ContractDescriptor] = []
-    for option_right in ("CALL", "PUT"):
+    for option_right in rights:
         candidates = dao.fetch_option_candidates(
             trade_date=trade_date,
             underlying_symbol=symbol,
@@ -240,14 +293,40 @@ def _select_contracts_for_symbol(
             spot_price=spot,
             otm_min=otm_min,
             otm_max=otm_max,
+            delta_min=delta_min,
+            delta_max=delta_max,
         )
+        if not filtered:
+            filtered = _filter_candidates(
+                candidates,
+                option_right=option_right,
+                spot_price=spot,
+                otm_min=otm_min,
+                otm_max=otm_max,
+                delta_min=delta_min,
+                delta_max=delta_max,
+                require_activity=False,
+            )
+            if filtered:
+                LOGGER.warning(
+                    "Using relaxed option activity filter",
+                    extra={"symbol": symbol, "right": option_right},
+                )
         if not filtered:
             LOGGER.warning(
                 "No contracts passed filters",
                 extra={"symbol": symbol, "right": option_right},
             )
             continue
-        filtered.sort(key=lambda item: item.min_tick)
+        spot_dec = Decimal(str(spot))
+        filtered.sort(
+            key=lambda item: (
+                -(item.open_interest or 0),
+                -(item.volume or 0),
+                item.min_tick,
+                abs(Decimal(str(item.strike)) - spot_dec),
+            ),
+        )
         selections.append(filtered[0])
     if not selections:
         raise RuntimeError(f"{symbol} no option contracts meet the criteria")
@@ -264,6 +343,9 @@ def _aggregate_contracts(
         return _load_contracts_from_file(Path(args.contracts_file))
 
     targets: List[ContractDescriptor] = []
+    delta_min = Decimal(str(args.delta_min)) if args.delta_min is not None else None
+    delta_max = Decimal(str(args.delta_max)) if args.delta_max is not None else None
+    rights = [right.upper() for right in (args.rights or ["CALL", "PUT"])]
     with session_factory() as session:
         dao = BacktestDAO(
             session,
@@ -282,6 +364,9 @@ def _aggregate_contracts(
                     dte_max=args.dte_max,
                     otm_min=args.otm_min,
                     otm_max=args.otm_max,
+                    rights=rights,
+                    delta_min=delta_min,
+                    delta_max=delta_max,
                 )
             )
     seen: Dict[tuple, ContractDescriptor] = {}
@@ -306,7 +391,7 @@ def _store_option_minutes(
             conid,
             underlying_symbol,
             expiry,
-            right,
+            "right",
             strike,
             ts_end,
             bid,
@@ -381,6 +466,43 @@ def _store_option_minutes(
         session.commit()
 
 
+def _backfill_chain_quote(
+    session_factory: sessionmaker[Session],
+    trade_date: date,
+    descriptor: ContractDescriptor,
+    records: Sequence[Mapping[str, float]],
+) -> None:
+    if not records or descriptor.conid is None:
+        return
+    first = records[0]
+    update_sql = text(
+        """
+        UPDATE option_chain_meta
+        SET
+            bid = :bid,
+            ask = :ask,
+            mid = :mid,
+            volume = COALESCE(volume, 0),
+            open_interest = COALESCE(open_interest, 0),
+            updated_at = now()
+        WHERE trade_date = :trade_date
+          AND conid = :conid
+        """
+    )
+    with session_factory() as session:
+        session.execute(
+            update_sql,
+            {
+                "trade_date": trade_date,
+                "conid": descriptor.conid,
+                "bid": first["bid"],
+                "ask": first["ask"],
+                "mid": first["mid"],
+            },
+        )
+        session.commit()
+
+
 def _merge_minute_records(
     primary: Sequence[Mapping[str, float]],
     secondary: Sequence[Mapping[str, float]],
@@ -402,6 +524,8 @@ def _ingest_contract(
     trade_date: date,
     *,
     min_minutes: int,
+    window_start_et: str | None,
+    window_end_et: str | None,
 ) -> None:
     if descriptor.conid is None:
         LOGGER.info("Resolving contract detail for %s", descriptor)
@@ -411,20 +535,50 @@ def _ingest_contract(
         strike=descriptor.strike,
         right=descriptor.option_right,
         conid=descriptor.conid,
+        include_expired=True,
     )
     start_et, end_et = trading_session_window(trade_date, tz=EASTERN)
-    start_utc = start_et.astimezone(timezone.utc)
-    end_utc = (end_et + timedelta(minutes=1)).astimezone(timezone.utc)
+    request_start_et = start_et
+    request_end_et = end_et + timedelta(minutes=1)
+    if window_start_et or window_end_et:
+        if not (window_start_et and window_end_et):
+            raise RuntimeError("--window-start-et and --window-end-et must be provided together")
+        start_hour, start_minute = _parse_hhmm(window_start_et)
+        end_hour, end_minute = _parse_hhmm(window_end_et)
+        request_start_et = datetime(
+            trade_date.year,
+            trade_date.month,
+            trade_date.day,
+            start_hour,
+            start_minute,
+            tzinfo=EASTERN,
+        )
+        request_end_et = datetime(
+            trade_date.year,
+            trade_date.month,
+            trade_date.day,
+            end_hour,
+            end_minute,
+            tzinfo=EASTERN,
+        )
+        if request_end_et <= request_start_et:
+            raise RuntimeError("--window-end-et must be later than --window-start-et")
+    elif min_minutes > 0:
+        request_start_et = max(start_et, end_et - timedelta(minutes=min_minutes))
+    start_utc = request_start_et.astimezone(timezone.utc)
+    end_utc = request_end_et.astimezone(timezone.utc)
     records = client.req_option_bid_ask_1m(contract, start=start_utc, end=end_utc, use_rth=True)
     required = max(0, min_minutes)
     if required and len(records) < required:
         LOGGER.warning(
             "option_l1.rth_insufficient",
-            symbol=descriptor.symbol,
-            right=descriptor.option_right,
-            conid=descriptor.conid,
-            count=len(records),
-            required=required,
+            extra={
+                "symbol": descriptor.symbol,
+                "right": descriptor.option_right,
+                "conid": descriptor.conid,
+                "count": len(records),
+                "required": required,
+            },
         )
         try:
             extended_records = client.req_option_bid_ask_1m(
@@ -436,10 +590,12 @@ def _ingest_contract(
         except Exception as exc:
             LOGGER.warning(
                 "option_l1.extended_failed",
-                symbol=descriptor.symbol,
-                right=descriptor.option_right,
-                conid=descriptor.conid,
-                error=str(exc),
+                extra={
+                    "symbol": descriptor.symbol,
+                    "right": descriptor.option_right,
+                    "conid": descriptor.conid,
+                    "error": str(exc),
+                },
             )
             extended_records = []
         if extended_records:
@@ -450,6 +606,7 @@ def _ingest_contract(
             f"({len(records)}/{required})"
         )
     _store_option_minutes(session_factory, descriptor, records)
+    _backfill_chain_quote(session_factory, trade_date, descriptor, records)
     LOGGER.info(
         "Stored option L1 minutes symbol=%s right=%s strike=%s expiry=%s count=%s",
         descriptor.symbol,
@@ -492,6 +649,8 @@ def main() -> int:
                 contract,
                 trade_date,
                 min_minutes=args.min_minutes,
+                window_start_et=args.window_start_et,
+                window_end_et=args.window_end_et,
             )
     finally:
         client.disconnect_and_stop()
