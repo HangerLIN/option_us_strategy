@@ -15,6 +15,7 @@ from apps.backtest.dao import BacktestDAO
 from apps.backtest.lifecycle_log import BacktestLifecycleLogger
 from apps.backtest.risk_adapter import ExposureLike, OrderIntent, RiskCtx
 from libs.core import EASTERN, get_settings
+from libs.execution.pricing import PriceStep, round_to_tick
 from apps.backtest.signal_source import SignalEvent
 from libs.schemas.exec import ExecutionMode, OrderSide
 from libs.schemas.signals import SignalEnvelope, SignalSide
@@ -114,6 +115,10 @@ class OptionSignalStrategy(bt.Strategy):
         self._profit_taken: Dict[str, set[str]] = defaultdict(set)
         self._risk_limit: Decimal = Decimal(str(get_settings().risk_notional_cap))
         self._settings = get_settings()
+        self._cached_bar_interval_seconds: Optional[float] = None
+        self._fill_time_anchor = str(
+            getattr(self._settings, "backtest_option_fill_time_anchor", "next_bar_close")
+        ).lower()
         self._strategy_variant = str(
             self.p.strategy_variant
             or getattr(self._settings, "backtest_strategy_variant", "v1")
@@ -232,6 +237,65 @@ class OptionSignalStrategy(bt.Strategy):
         )
 
     # ------------------------------------------------------------------
+    def _entry_execution_mode(self) -> ExecutionMode:
+        """Choose an entry execution mode that respects the data feed granularity.
+
+        The adaptive path schedules limit-price steps at 5/15/25s and a 30s TTL.
+        On a minute feed those offsets are never observed, which adds a whole extra
+        bar of latency before the order becomes marketable. When the caller opts
+        into feed-aware fill timing, submit entries marketable from the start so
+        they fill on the next bar instead of two bars later.
+        """
+        if self._fill_time_anchor in {"next_bar_close", "next_bar_open"}:
+            return ExecutionMode.MARKETABLE
+        return ExecutionMode.ADAPTIVE
+
+    def _feed_aware_entry_path(self, contract: ContractSelection) -> ExecutionPath:
+        """Build a marketable ceiling so a feed-aware entry fills on the next bar.
+
+        A signal-time ask becomes stale by the next bar when the quote moves against
+        us. Posting a limit at ``2 * ask`` behaves like a market order under the
+        quote-aware broker while still filling at the then-current ask, so the entry
+        fills one bar after the signal instead of rolling through a TTL fallback.
+        """
+        ceiling = round_to_tick(
+            contract.ask * Decimal("2"),
+            contract.min_tick,
+            OrderSide.BUY,
+        )
+        return ExecutionPath(
+            [PriceStep(offset_sec=0, price=ceiling, stage="feed-aware-market")],
+            ttl_seconds=120,
+        )
+
+    def _bar_interval_seconds(self) -> float:
+        if self._cached_bar_interval_seconds is not None:
+            return self._cached_bar_interval_seconds
+        try:
+            current_dt = _as_utc_naive(self.data.datetime.datetime(0))
+            previous_dt = _as_utc_naive(self.data.datetime.datetime(-1))
+            delta = (current_dt - previous_dt).total_seconds()
+            if delta > 0:
+                self._cached_bar_interval_seconds = delta
+        except Exception:
+            self._cached_bar_interval_seconds = None
+        if self._cached_bar_interval_seconds is None:
+            self._cached_bar_interval_seconds = 60.0
+        return self._cached_bar_interval_seconds
+
+    def _anchored_fill_time(self, managed: ManagedOrder, current_dt: datetime) -> datetime:
+        """Return the timestamp recorded for a fill under the chosen anchor.
+
+        ``next_bar_close`` keeps the natural bar-close timestamp; ``next_bar_open``
+        shifts it back one bar interval so the recorded fill time reflects the next
+        bar's open rather than its close. Only entry fills are anchored; exits keep
+        their own execution timing.
+        """
+        if self._fill_time_anchor != "next_bar_open" or managed.side != OrderSide.BUY:
+            return current_dt
+        return current_dt - timedelta(seconds=self._bar_interval_seconds())
+
+    # ------------------------------------------------------------------
     def _handle_entry_signal(self, signal: SignalEnvelope, trace_id: str, now: datetime) -> None:
         trace_value = trace_id or str(uuid.uuid4())
         contract = self.option_selector(signal, now)
@@ -244,7 +308,12 @@ class OptionSignalStrategy(bt.Strategy):
             )
             return
 
-        path = self._build_path(signal, contract, ExecutionMode.ADAPTIVE)
+        entry_mode = self._entry_execution_mode()
+        path = (
+            self._feed_aware_entry_path(contract)
+            if self._fill_time_anchor in {"next_bar_close", "next_bar_open"}
+            else self._build_path(signal, contract, entry_mode)
+        )
         first_step = path.steps[0]
 
         size = self._parse_size(signal)
@@ -289,10 +358,14 @@ class OptionSignalStrategy(bt.Strategy):
             return
 
         execution_contract = self._refresh_contract_from_feed(contract, now) or contract
-        execution_path = self._build_path(signal, execution_contract, ExecutionMode.ADAPTIVE)
+        execution_path = (
+            self._feed_aware_entry_path(execution_contract)
+            if self._fill_time_anchor in {"next_bar_close", "next_bar_open"}
+            else self._build_path(signal, execution_contract, entry_mode)
+        )
         self._record_signal(signal, accepted=True, reason="PASS", trace_id=trace_value)
         self._submit_order(
-            signal, execution_contract, ExecutionMode.ADAPTIVE, execution_path, trace_value
+            signal, execution_contract, entry_mode, execution_path, trace_value
         )
 
     # ------------------------------------------------------------------
@@ -885,6 +958,7 @@ class OptionSignalStrategy(bt.Strategy):
             position_before = self._positions_qty.get(symbol, Decimal("0"))
             entry_snapshot = dict(self._open_entry.get(symbol.upper(), {}))
             current_dt = _as_utc_naive(self.data.datetime.datetime(0))
+            fill_ts = self._anchored_fill_time(managed, current_dt)
             fill_context = self._build_context(managed.contract, current_dt)
             stale_reason = self._stale_reject_reason(
                 managed, current_dt, context=fill_context, fill_price=executed_price
@@ -910,7 +984,7 @@ class OptionSignalStrategy(bt.Strategy):
                 entry_bar = self._current_equity_row()
                 self._open_entry[symbol.upper()] = {
                     "signal_code": managed.signal.signal_code,
-                    "opened_at": current_dt,
+                    "opened_at": fill_ts,
                     "entry_price": executed_price,
                     "entry_underlying": fill_context.get("underlying_price"),
                     "entry_vwap": fill_context.get("vwap"),
@@ -945,7 +1019,7 @@ class OptionSignalStrategy(bt.Strategy):
                     "side": "BUY" if managed.side == OrderSide.BUY else "SELL",
                     "quantity": Decimal(str(order.executed.size)),
                     "price": Decimal(str(order.executed.price)),
-                    "trade_ts": _as_utc_naive(self.data.datetime.datetime(0)),
+                    "trade_ts": fill_ts,
                     "trace_id": managed.trace_id,
                     "option_right": managed.contract.option_right,
                     "strike": managed.contract.strike,
@@ -959,7 +1033,7 @@ class OptionSignalStrategy(bt.Strategy):
                 managed,
                 event_type="ORDER_FILLED",
                 reason_code=managed.signal.signal_code,
-                event_dt=current_dt,
+                event_dt=fill_ts,
                 fill_price=executed_price,
                 context=fill_context,
                 stale_reject_reason=managed.invalid_fill_reason,
@@ -984,7 +1058,7 @@ class OptionSignalStrategy(bt.Strategy):
                 position_event,
                 trace_id=managed.trace_id,
                 order_ref=order.ref,
-                event_time=current_dt,
+                event_time=fill_ts,
                 signal_code=managed.signal.signal_code,
                 side=managed.side,
                 fill_status=order.getstatusname(),

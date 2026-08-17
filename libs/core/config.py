@@ -78,6 +78,9 @@ class Settings(BaseSettings):
     backtest_orphan_timeout_hours: int = Field(
         24, validation_alias="BACKTEST_ORPHAN_TIMEOUT_HOURS"
     )
+    backtest_option_fill_time_anchor: str = Field(
+        "next_bar_close", validation_alias="BACKTEST_OPTION_FILL_TIME_ANCHOR"
+    )
     calibration_version: str | None = Field(None, validation_alias="CALIBRATION_VERSION")
     open_chase_earliest_entry_time: str = Field(
         "09:36", validation_alias="OPEN_CHASE_EARLIEST_ENTRY_TIME"
