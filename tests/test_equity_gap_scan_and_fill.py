@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, time
+from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any, Dict, List
 from unittest.mock import Mock, patch
@@ -11,6 +11,7 @@ import pytest
 from apps.backtest.dao import EquityBarRow
 from apps.backtest.datafeed.timescale_equity import (
     _INDICATOR_COLS,
+    _equity_context_window,
     _fill_equity_gaps_via_ibkr,
     _scan_equity_gaps,
 )
@@ -210,8 +211,8 @@ def test_price_gap_scan_and_fill() -> None:
 def test_indicator_gap_only_triggers_indicator_recompute() -> None:
     df = _build_base_dataframe()
     problematic_minutes = [
-        pd.Timestamp(f"{TEST_TRADE_DATE} 09:35", tz="US/Eastern"),
-        pd.Timestamp(f"{TEST_TRADE_DATE} 09:36", tz="US/Eastern"),
+        pd.Timestamp(f"{TEST_TRADE_DATE} 10:35", tz="US/Eastern"),
+        pd.Timestamp(f"{TEST_TRADE_DATE} 10:36", tz="US/Eastern"),
     ]
     for ts in problematic_minutes:
         for col in _INDICATOR_COLS:
@@ -244,3 +245,13 @@ def test_indicator_gap_only_triggers_indicator_recompute() -> None:
     filled = _update_dataframe_with_calls(df, fake_dao.bars_calls, fake_dao.indicator_calls)
     post_report = _scan_equity_gaps(df=filled, symbol=symbol)
     assert not post_report.indicator_gaps
+
+
+def test_equity_context_window_includes_1600_bar() -> None:
+    start = datetime.fromisoformat("2025-10-02T09:30:00-04:00")
+    end = datetime.fromisoformat("2025-10-02T16:00:00-04:00")
+
+    context_start, context_end = _equity_context_window(start=start, end=end)
+
+    assert context_start == datetime.fromisoformat("2025-10-01T20:00:00+00:00")
+    assert context_end == datetime.fromisoformat("2025-10-02T20:01:00+00:00")

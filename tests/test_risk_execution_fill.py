@@ -15,7 +15,9 @@ from risk_svc.service import RiskService  # type: ignore[import-not-found]
 from libs.core.config import get_settings
 from libs.db import Base
 from libs.db.models import PnLIntraday, RiskEvent, RiskState, StrategyPosition
+from libs.schemas.assets import AssetType
 from libs.schemas.events import ExecutionFill
+from libs.schemas.risk import RiskCheckRequest
 
 
 class FakeRedis:
@@ -133,6 +135,7 @@ def _settings_env(monkeypatch):
     monkeypatch.setenv("IB_PORT", "4002")
     monkeypatch.setenv("IB_CLIENT_ID", "1")
     monkeypatch.setenv("IB_ACCOUNT", "DU123456")
+    monkeypatch.setenv("OPTION_LIQUIDITY_REQUIRED", "true")
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
@@ -358,3 +361,168 @@ def test_list_blocks_snapshot() -> None:
     assert blocks
     assert blocks[0]["symbol"] == "AAPL"
     assert blocks[0]["reason"] == "TEST"
+
+
+@pytest.mark.asyncio
+async def test_handle_equity_execution_fill_does_not_require_option_right() -> None:
+    engine = _sqlite_engine()
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, future=True)
+
+    risk_service = RiskService(session_factory, redis_url="redis://localhost:6379/0")
+    risk_service._redis = FakeRedis()  # type: ignore[attr-defined]
+    risk_service._blocks = StubBlockStore({})  # type: ignore[attr-defined]
+    consumers = RiskStreamConsumers(
+        StubRedisBus(),
+        risk_service,
+        session_factory=session_factory,
+    )
+
+    filled_at = datetime(2024, 7, 1, 14, 30, tzinfo=timezone.utc)
+    payload = ExecutionFill(
+        trace_id="trace-eq-1",
+        order_id=2,
+        client_order_id="cl-eq-1",
+        symbol="SPY",
+        asset_type=AssetType.ETF,
+        side="BUY",
+        fill_quantity=Decimal("10"),
+        fill_price=Decimal("500"),
+        strategy_code="starter-equity",
+        signal_code="SIG_EQUITY_MOMENTUM_BUY",
+        fees=Decimal("1"),
+        execution_id="exec-eq-1",
+        filled_at=filled_at,
+    ).model_dump()
+
+    await consumers._handle_execution_fill({"payload": payload, "trace_id": "trace-eq-1"})
+
+    with session_factory() as session:
+        position = session.execute(select(StrategyPosition)).scalar_one()
+        assert position.asset_type == "ETF"
+        assert position.option_right is None
+        assert position.open_quantity == 10
+        notional_state = session.execute(
+            select(RiskState).where(
+                RiskState.symbol == "SPY",
+                RiskState.metric_code == "NOTIONAL",
+            )
+        ).scalar_one()
+        assert notional_state.metric_value == Decimal("5000.000000")
+
+
+def test_option_liquidity_allows_quote_only_fallback_when_enabled() -> None:
+    engine = _sqlite_engine()
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, future=True)
+
+    risk_service = RiskService(session_factory, redis_url="redis://localhost:6379/0")
+    request = RiskCheckRequest(
+        strategy_code="core-vol",
+        symbol="AMD",
+        notional=Decimal("1835"),
+        implied_vol=0.0,
+        timestamp=datetime(2026, 5, 22, 13, 31, tzinfo=timezone.utc),
+        signal_code="SIG_OPEN_CHASE_BUY",
+        option_right="CALL",
+        option_strike=Decimal("470"),
+        option_expiry="20260529",
+        option_open_interest=0,
+        option_volume=0,
+        option_bid=Decimal("18.05"),
+        option_ask=Decimal("18.65"),
+        option_mid=Decimal("18.35"),
+        option_spread=Decimal("0.60"),
+        option_dte=7,
+        allow_missing_option_liquidity_metrics=True,
+    )
+
+    passed, snapshot = risk_service._check_option_liquidity(request)
+    assert passed is True
+    assert snapshot["missing_metrics_fallback"] is True
+    assert snapshot["reason"] == "quote_only_missing_oi_volume"
+
+
+def test_option_liquidity_skips_non_option_assets_even_when_enabled() -> None:
+    engine = _sqlite_engine()
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, future=True)
+
+    risk_service = RiskService(session_factory, redis_url="redis://localhost:6379/0")
+    request = RiskCheckRequest(
+        strategy_code="starter-equity",
+        symbol="SPY",
+        asset_type=AssetType.ETF,
+        notional=Decimal("5000"),
+        implied_vol=0.0,
+        timestamp=datetime(2026, 5, 22, 13, 31, tzinfo=timezone.utc),
+        signal_code="SIG_EQUITY_MOMENTUM_BUY",
+    )
+
+    passed, snapshot = risk_service._check_option_liquidity(request)
+    assert passed is True
+    assert snapshot["reason"] == "non_option_asset"
+
+
+def test_option_liquidity_rejects_stale_quote() -> None:
+    engine = _sqlite_engine()
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, future=True)
+
+    risk_service = RiskService(session_factory, redis_url="redis://localhost:6379/0")
+    request = RiskCheckRequest(
+        strategy_code="core-vol",
+        symbol="AMD",
+        notional=Decimal("1835"),
+        implied_vol=0.0,
+        timestamp=datetime(2026, 5, 22, 13, 31, tzinfo=timezone.utc),
+        signal_code="SIG_OPEN_CHASE_BUY",
+        option_right="CALL",
+        option_strike=Decimal("470"),
+        option_expiry="20260529",
+        option_open_interest=600,
+        option_volume=200,
+        option_bid=Decimal("18.05"),
+        option_ask=Decimal("18.35"),
+        option_mid=Decimal("18.20"),
+        option_spread=Decimal("0.30"),
+        option_dte=7,
+        option_quote_ts=datetime(2026, 5, 22, 13, 29, 30, tzinfo=timezone.utc),
+    )
+
+    passed, snapshot = risk_service._check_option_liquidity(request)
+    assert passed is False
+    assert snapshot["reason"] == "stale_quote"
+
+
+def test_option_liquidity_disabled_by_config(monkeypatch) -> None:
+    monkeypatch.setenv("OPTION_LIQUIDITY_REQUIRED", "false")
+    get_settings.cache_clear()
+    engine = _sqlite_engine()
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, future=True)
+
+    risk_service = RiskService(session_factory, redis_url="redis://localhost:6379/0")
+    request = RiskCheckRequest(
+        strategy_code="core-vol",
+        symbol="AMD",
+        notional=Decimal("860"),
+        implied_vol=0.0,
+        timestamp=datetime(2026, 5, 26, 13, 31, tzinfo=timezone.utc),
+        signal_code="SIG_OPEN_CHASE_BUY",
+        option_right="CALL",
+        option_strike=Decimal("505"),
+        option_expiry="20260529",
+        option_open_interest=0,
+        option_volume=2,
+        option_bid=Decimal("8.05"),
+        option_ask=Decimal("9.15"),
+        option_mid=Decimal("8.60"),
+        option_spread=Decimal("1.10"),
+        option_dte=3,
+    )
+
+    passed, snapshot = risk_service._check_option_liquidity(request)
+
+    assert passed is True
+    assert snapshot["reason"] == "disabled_by_config"

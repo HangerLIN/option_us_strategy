@@ -1,7 +1,16 @@
 import os
+import tempfile
+from pathlib import Path
+
+
+_health_db_fd, _health_db_path = tempfile.mkstemp(
+    prefix="backtest-health-",
+    suffix=".db",
+)
+os.close(_health_db_fd)
 
 os.environ.setdefault("APP_ENV", "test")
-os.environ.setdefault("DATABASE_URL", "sqlite:///./test.db")
+os.environ["DATABASE_URL"] = f"sqlite:///{_health_db_path}"
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 os.environ.setdefault("IB_HOST", "127.0.0.1")
 os.environ.setdefault("IB_PORT", "4002")
@@ -45,3 +54,5 @@ def test_health_endpoints() -> None:
         assert payload["ok"] is True
         assert payload["code"] == "OK"
         assert payload["data"]["service"] == service_name
+
+    Path(_health_db_path).unlink(missing_ok=True)

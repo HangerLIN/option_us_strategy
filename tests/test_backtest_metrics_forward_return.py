@@ -34,6 +34,7 @@ def test_signal_metrics_include_option_forward_return_5m() -> None:
                     strike NUMERIC,
                     expiry DATE,
                     fees NUMERIC,
+                    slippage NUMERIC,
                     reason_code TEXT
                 )
                 """
@@ -132,6 +133,7 @@ def test_signal_metrics_skip_5m_return_when_option_bar_missing() -> None:
                     strike NUMERIC,
                     expiry DATE,
                     fees NUMERIC,
+                    slippage NUMERIC,
                     reason_code TEXT
                 )
                 """
@@ -208,6 +210,7 @@ def test_signal_metrics_5m_return_uses_underlying_symbol_column() -> None:
                     strike NUMERIC,
                     expiry DATE,
                     fees NUMERIC,
+                    slippage NUMERIC,
                     reason_code TEXT
                 )
                 """
@@ -277,3 +280,76 @@ def test_signal_metrics_5m_return_uses_underlying_symbol_column() -> None:
     by_code = {row["metric_code"]: row["metric_value"] for row in metrics}
     assert by_code["RET_SIG_AM_BOTTOM_A1_5M"] == pytest.approx(0.3)
     assert by_code["COUNT_EXEC_SIG_AM_BOTTOM_A1_5M"] == 1
+
+
+def test_realized_option_metrics_expose_explicit_usd_and_return_units() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    with Session(engine, future=True) as session:
+        session.execute(
+            text(
+                """
+                CREATE TABLE bt_trades (
+                    run_id INTEGER, symbol TEXT, side TEXT, quantity NUMERIC,
+                    price NUMERIC, trade_ts TIMESTAMP, option_right TEXT,
+                    strike NUMERIC, expiry DATE, fees NUMERIC,
+                    slippage NUMERIC, reason_code TEXT
+                )
+                """
+            )
+        )
+        session.execute(
+            text(
+                """
+                CREATE TABLE bt_signals (
+                    run_id INTEGER, signal_code TEXT, accepted BOOLEAN
+                )
+                """
+            )
+        )
+        session.execute(
+            text(
+                """
+                CREATE TABLE bars1m_option (
+                    symbol TEXT, "right" TEXT, strike NUMERIC, expiry DATE,
+                    ts_end TIMESTAMP, bid NUMERIC, ask NUMERIC,
+                    mid NUMERIC, last NUMERIC
+                )
+                """
+            )
+        )
+        trade_ts = datetime(2025, 1, 2, 15, 0, tzinfo=timezone.utc)
+        expiry = date(2025, 1, 17)
+        session.execute(
+            text(
+                """
+                INSERT INTO bt_trades (
+                    run_id, symbol, side, quantity, price, trade_ts,
+                    option_right, strike, expiry, fees, slippage, reason_code
+                ) VALUES
+                    (1, 'AAPL', 'BUY', 1, 2.00, :entry_ts,
+                     'CALL', 100, :expiry, 1, 0.05, 'SIG_AM_BOTTOM_A1'),
+                    (1, 'AAPL', 'SELL', -1, 2.50, :exit_ts,
+                     'CALL', 100, :expiry, 1, 0.05, 'SIG_EXIT_TEST')
+                """
+            ),
+            {
+                "entry_ts": trade_ts,
+                "exit_ts": trade_ts + timedelta(minutes=3),
+                "expiry": expiry,
+            },
+        )
+        session.execute(
+            text(
+                """
+                INSERT INTO bt_signals (run_id, signal_code, accepted)
+                VALUES (1, 'SIG_AM_BOTTOM_A1', TRUE)
+                """
+            )
+        )
+        session.commit()
+
+        metrics = _writer(session)._build_signal_metrics()
+
+    by_code = {row["metric_code"]: row["metric_value"] for row in metrics}
+    assert by_code["PNL_USD_SIG_AM_BOTTOM_A1_MEAN"] == pytest.approx(48.0)
+    assert by_code["RETURN_DECIMAL_SIG_AM_BOTTOM_A1_REALIZED_MEAN"] == pytest.approx(48.0 / 201.0)
