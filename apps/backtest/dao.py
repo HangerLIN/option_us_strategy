@@ -135,8 +135,12 @@ class BacktestRunRow:
     started_at: datetime
     completed_at: datetime | None
     status: str
-    parameters: Mapping[str, Any] | None
-    notes: str | None
+    strategy_version: str | None = None
+    calibration_version: str | None = None
+    data_window_start: datetime | None = None
+    data_window_end: datetime | None = None
+    parameters: Mapping[str, Any] | None = None
+    notes: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,12 +297,17 @@ class BacktestDAO:
         )
 
     def ensure_tables(self, tables: Sequence[str]) -> None:
+        if "bt_order_events" in tables:
+            self.ensure_order_event_table()
         sql = text(self._sql("check_table_exists"))
         for table in tables:
             regclass = table if "." in table else f"public.{table}"
             exists = self._session.execute(sql, {"table_name": regclass}).scalar()
             if not exists:
                 raise RuntimeError(f"Required table missing: {table}")
+
+    def ensure_order_event_table(self) -> None:
+        self._session.execute(text(self._sql("ensure_bt_order_events")))
 
     # ------------------------------------------------------------------
     # Reads
@@ -415,6 +424,46 @@ class BacktestDAO:
         )
         rows = result.mappings().all()
         return [self._map_option_candidate(row) for row in rows]
+
+    def fetch_latest_option_quotes_for_symbol(
+        self,
+        *,
+        underlying_symbol: str,
+        option_right: str,
+        start_ts,
+        end_ts,
+    ) -> list[OptionBarRow]:
+        sql = text(self._sql("select_latest_option_quotes_for_symbol"))
+        result = self._session.execute(
+            sql,
+            {
+                "underlying_symbol": underlying_symbol,
+                "option_right": option_right,
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+            },
+        )
+        return [self._map_option_bar(row) for row in result.mappings().all()]
+
+    def fetch_latest_option_quote_by_conid(
+        self,
+        *,
+        conid: int,
+        start_ts,
+        end_ts,
+    ) -> OptionBarRow | None:
+        sql = text(self._sql("select_latest_option_quote_by_conid"))
+        row = self._session.execute(
+            sql,
+            {
+                "conid": conid,
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+            },
+        ).mappings().first()
+        if row is None:
+            return None
+        return self._map_option_bar(row)
 
     def fetch_runs(
         self,
@@ -813,6 +862,22 @@ class BacktestDAO:
                 _ensure_datetime(row["completed_at"]) if row.get("completed_at") is not None else None
             ),
             status=str(row["status"]),
+            strategy_version=(
+                str(row["strategy_version"]) if row.get("strategy_version") is not None else None
+            ),
+            calibration_version=(
+                str(row["calibration_version"]) if row.get("calibration_version") is not None else None
+            ),
+            data_window_start=(
+                _ensure_datetime(row["data_window_start"])
+                if row.get("data_window_start") is not None
+                else None
+            ),
+            data_window_end=(
+                _ensure_datetime(row["data_window_end"])
+                if row.get("data_window_end") is not None
+                else None
+            ),
             parameters=row.get("parameters"),
             notes=row.get("notes"),
         )
@@ -867,6 +932,10 @@ class BacktestDAO:
         strategy_code: str,
         started_at,
         status: str,
+        strategy_version: str | None = None,
+        calibration_version: str | None = None,
+        data_window_start: datetime | None = None,
+        data_window_end: datetime | None = None,
         parameters: Mapping[str, Any] | None = None,
         notes: str | None = None,
     ) -> int:
@@ -875,6 +944,10 @@ class BacktestDAO:
             "strategy_code": strategy_code,
             "started_at": started_at,
             "status": status,
+            "strategy_version": strategy_version,
+            "calibration_version": calibration_version,
+            "data_window_start": data_window_start,
+            "data_window_end": data_window_end,
             "parameters": json.dumps(parameters) if isinstance(parameters, Mapping) else parameters,
             "notes": notes,
         }
@@ -902,9 +975,91 @@ class BacktestDAO:
             },
         )
 
+    def fail_stale_running_runs(
+        self,
+        *,
+        cutoff: datetime,
+        completed_at: datetime | None = None,
+        notes: str | None = None,
+    ) -> int:
+        """Mark RUNNING runs older than ``cutoff`` as FAILED.
+
+        Returns the number of rows that were updated. This is used as an orphan
+        sweep at backtest startup so that a crashed run cannot leave the ledger in
+        a permanently RUNNING state.
+        """
+        sql = text(self._sql("fail_stale_running_runs"))
+        result = self._session.execute(
+            sql,
+            {
+                "cutoff": cutoff,
+                "completed_at": completed_at or datetime.utcnow(),
+                "notes": notes or "Marked FAILED by startup orphan sweep",
+            },
+        )
+        return result.rowcount or 0
+
     def record_trade(self, payload: Mapping[str, Any]) -> None:
         sql = text(self._sql("insert_bt_trade"))
-        self._session.execute(sql, payload)
+        values = dict(payload)
+        values.setdefault("asset_type", "OPTION")
+        self._session.execute(sql, values)
+
+    def record_order_event(self, payload: Mapping[str, Any]) -> None:
+        self.ensure_order_event_table()
+        sql = text(self._sql("insert_bt_order_event"))
+        values = dict(payload)
+        event_fields = [
+            "run_id",
+            "trace_id",
+            "symbol",
+            "asset_type",
+            "signal_code",
+            "side",
+            "event_type",
+            "reason_code",
+            "signal_time",
+            "order_submit_time",
+            "fill_time",
+            "signal_to_fill_seconds",
+            "order_ttl_seconds",
+            "is_stale_fill",
+            "order_attempts",
+            "execution_mode",
+            "original_limit_price",
+            "final_limit_price",
+            "fill_price",
+            "option_bid_at_signal",
+            "option_ask_at_signal",
+            "option_mid_at_signal",
+            "option_bid_at_fill",
+            "option_ask_at_fill",
+            "option_mid_at_fill",
+            "option_spread_abs_at_fill",
+            "option_spread_pct_at_fill",
+            "underlying_price_at_signal",
+            "underlying_price_at_fill",
+            "vwap_at_signal",
+            "vwap_at_fill",
+            "opening_range_high",
+            "opening_range_low",
+            "above_vwap_at_signal",
+            "above_vwap_at_fill",
+            "above_orh_at_signal",
+            "above_orh_at_fill",
+            "stale_reject_reason",
+            "option_right",
+            "strike",
+            "expiry",
+            "quantity",
+            "payload",
+        ]
+        values.setdefault("asset_type", "OPTION")
+        for field in event_fields:
+            values.setdefault(field, None)
+        if isinstance(values.get("payload"), (dict, list)):
+            values["payload"] = json.dumps(values["payload"], default=_json_default)
+        self._session.execute(sql, {field: values.get(field) for field in event_fields})
 
     def record_block(self, payload: Mapping[str, Any]) -> None:
         reason_payload = {
@@ -933,6 +1088,7 @@ class BacktestDAO:
     def record_signal(self, payload: Mapping[str, Any]) -> None:
         sql = text(self._sql("insert_bt_signal"))
         values = dict(payload)
+        values.setdefault("asset_type", "OPTION")
         reason = values.get("reason")
         if isinstance(reason, (dict, list)):
             values["reason"] = json.dumps(reason, default=_json_default)

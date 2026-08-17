@@ -72,6 +72,9 @@ INSERT INTO indicators_eq_1m (
     rsi6,
     rsi12,
     rsi24,
+    boll_mid,
+    boll_up,
+    boll_dn,
     atr14,
     ao,
     stoch_k,
@@ -95,6 +98,9 @@ INSERT INTO indicators_eq_1m (
     :rsi6,
     :rsi12,
     :rsi24,
+    :boll_mid,
+    :boll_up,
+    :boll_dn,
     :atr14,
     :ao,
     :stoch_k,
@@ -117,6 +123,9 @@ DO UPDATE SET
     rsi6 = EXCLUDED.rsi6,
     rsi12 = EXCLUDED.rsi12,
     rsi24 = EXCLUDED.rsi24,
+    boll_mid = EXCLUDED.boll_mid,
+    boll_up = EXCLUDED.boll_up,
+    boll_dn = EXCLUDED.boll_dn,
     atr14 = EXCLUDED.atr14,
     ao = EXCLUDED.ao,
     stoch_k = EXCLUDED.stoch_k,
@@ -198,17 +207,107 @@ WHERE trade_date = :trade_date
   AND dte BETWEEN :dte_min AND :dte_max
 ORDER BY dte ASC, strike ASC;
 
+-- name: select_latest_option_quotes_for_symbol
+WITH ranked AS (
+    SELECT
+        ts_end,
+        conid,
+        underlying_symbol AS symbol,
+        expiry,
+        strike,
+        "right",
+        bid,
+        ask,
+        mid,
+        last,
+        volume,
+        open_interest,
+        implied_vol,
+        delta,
+        gamma,
+        theta,
+        vega,
+        underlying_price,
+        ROW_NUMBER() OVER (PARTITION BY conid ORDER BY ts_end DESC) AS rn
+    FROM {option_bar_table}
+    WHERE underlying_symbol = :underlying_symbol
+      AND "right" = :option_right
+      AND ts_end >= :start_ts
+      AND ts_end <= :end_ts
+      AND bid IS NOT NULL
+      AND ask IS NOT NULL
+)
+SELECT
+    ts_end,
+    conid,
+    symbol,
+    expiry,
+    strike,
+    "right",
+    bid,
+    ask,
+    mid,
+    last,
+    volume,
+    open_interest,
+    implied_vol,
+    delta,
+    gamma,
+    theta,
+    vega,
+    underlying_price
+FROM ranked
+WHERE rn = 1
+ORDER BY ts_end DESC, (volume IS NULL) ASC, volume DESC, conid ASC;
+
+-- name: select_latest_option_quote_by_conid
+SELECT
+    ts_end,
+    conid,
+    underlying_symbol AS symbol,
+    expiry,
+    strike,
+    "right",
+    bid,
+    ask,
+    mid,
+    last,
+    volume,
+    open_interest,
+    implied_vol,
+    delta,
+    gamma,
+    theta,
+    vega,
+    underlying_price
+FROM {option_bar_table}
+WHERE conid = :conid
+  AND ts_end >= :start_ts
+  AND ts_end <= :end_ts
+  AND bid IS NOT NULL
+  AND ask IS NOT NULL
+ORDER BY ts_end DESC
+LIMIT 1;
+
 -- name: insert_bt_run
 INSERT INTO bt_runs (
     strategy_code,
     started_at,
     status,
+    strategy_version,
+    calibration_version,
+    data_window_start,
+    data_window_end,
     parameters,
     notes
 ) VALUES (
     :strategy_code,
     :started_at,
     :status,
+    :strategy_version,
+    :calibration_version,
+    :data_window_start,
+    :data_window_end,
     :parameters,
     :notes
 ) RETURNING run_id;
@@ -221,10 +320,160 @@ SET
     notes = :notes
 WHERE run_id = :run_id;
 
+-- name: fail_stale_running_runs
+UPDATE bt_runs
+SET
+    status = 'FAILED',
+    completed_at = :completed_at,
+    notes = :notes
+WHERE status = 'RUNNING'
+  AND started_at < :cutoff;
+
+-- name: ensure_bt_order_events
+CREATE TABLE IF NOT EXISTS bt_order_events (
+    event_id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT NOT NULL REFERENCES bt_runs(run_id) ON DELETE CASCADE,
+    trace_id TEXT,
+    symbol TEXT NOT NULL,
+    asset_type TEXT NOT NULL DEFAULT 'OPTION',
+    signal_code TEXT,
+    side TEXT,
+    event_type TEXT NOT NULL,
+    reason_code TEXT,
+    signal_time TIMESTAMPTZ,
+    order_submit_time TIMESTAMPTZ,
+    fill_time TIMESTAMPTZ,
+    signal_to_fill_seconds NUMERIC(18, 6),
+    order_ttl_seconds INTEGER,
+    is_stale_fill BOOLEAN,
+    order_attempts INTEGER,
+    execution_mode TEXT,
+    original_limit_price NUMERIC(18, 6),
+    final_limit_price NUMERIC(18, 6),
+    fill_price NUMERIC(18, 6),
+    option_bid_at_signal NUMERIC(18, 6),
+    option_ask_at_signal NUMERIC(18, 6),
+    option_mid_at_signal NUMERIC(18, 6),
+    option_bid_at_fill NUMERIC(18, 6),
+    option_ask_at_fill NUMERIC(18, 6),
+    option_mid_at_fill NUMERIC(18, 6),
+    option_spread_abs_at_fill NUMERIC(18, 6),
+    option_spread_pct_at_fill NUMERIC(18, 6),
+    underlying_price_at_signal NUMERIC(18, 6),
+    underlying_price_at_fill NUMERIC(18, 6),
+    vwap_at_signal NUMERIC(18, 6),
+    vwap_at_fill NUMERIC(18, 6),
+    opening_range_high NUMERIC(18, 6),
+    opening_range_low NUMERIC(18, 6),
+    above_vwap_at_signal BOOLEAN,
+    above_vwap_at_fill BOOLEAN,
+    above_orh_at_signal BOOLEAN,
+    above_orh_at_fill BOOLEAN,
+    stale_reject_reason TEXT,
+    option_right TEXT,
+    strike NUMERIC(18, 6),
+    expiry DATE,
+    quantity NUMERIC(18, 6),
+    payload JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- name: insert_bt_order_event
+INSERT INTO bt_order_events (
+    run_id,
+    trace_id,
+    symbol,
+    asset_type,
+    signal_code,
+    side,
+    event_type,
+    reason_code,
+    signal_time,
+    order_submit_time,
+    fill_time,
+    signal_to_fill_seconds,
+    order_ttl_seconds,
+    is_stale_fill,
+    order_attempts,
+    execution_mode,
+    original_limit_price,
+    final_limit_price,
+    fill_price,
+    option_bid_at_signal,
+    option_ask_at_signal,
+    option_mid_at_signal,
+    option_bid_at_fill,
+    option_ask_at_fill,
+    option_mid_at_fill,
+    option_spread_abs_at_fill,
+    option_spread_pct_at_fill,
+    underlying_price_at_signal,
+    underlying_price_at_fill,
+    vwap_at_signal,
+    vwap_at_fill,
+    opening_range_high,
+    opening_range_low,
+    above_vwap_at_signal,
+    above_vwap_at_fill,
+    above_orh_at_signal,
+    above_orh_at_fill,
+    stale_reject_reason,
+    option_right,
+    strike,
+    expiry,
+    quantity,
+    payload
+) VALUES (
+    :run_id,
+    :trace_id,
+    :symbol,
+    :asset_type,
+    :signal_code,
+    :side,
+    :event_type,
+    :reason_code,
+    :signal_time,
+    :order_submit_time,
+    :fill_time,
+    :signal_to_fill_seconds,
+    :order_ttl_seconds,
+    :is_stale_fill,
+    :order_attempts,
+    :execution_mode,
+    :original_limit_price,
+    :final_limit_price,
+    :fill_price,
+    :option_bid_at_signal,
+    :option_ask_at_signal,
+    :option_mid_at_signal,
+    :option_bid_at_fill,
+    :option_ask_at_fill,
+    :option_mid_at_fill,
+    :option_spread_abs_at_fill,
+    :option_spread_pct_at_fill,
+    :underlying_price_at_signal,
+    :underlying_price_at_fill,
+    :vwap_at_signal,
+    :vwap_at_fill,
+    :opening_range_high,
+    :opening_range_low,
+    :above_vwap_at_signal,
+    :above_vwap_at_fill,
+    :above_orh_at_signal,
+    :above_orh_at_fill,
+    :stale_reject_reason,
+    :option_right,
+    :strike,
+    :expiry,
+    :quantity,
+    :payload
+);
+
 -- name: insert_bt_trade
 INSERT INTO bt_trades (
     run_id,
     symbol,
+    asset_type,
     side,
     quantity,
     price,
@@ -239,6 +488,7 @@ INSERT INTO bt_trades (
 ) VALUES (
     :run_id,
     :symbol,
+    :asset_type,
     :side,
     :quantity,
     :price,
@@ -257,6 +507,7 @@ INSERT INTO bt_signals (
     run_id,
     ts_end,
     symbol,
+    asset_type,
     signal_code,
     accepted,
     reason
@@ -264,6 +515,7 @@ INSERT INTO bt_signals (
     :run_id,
     :ts_end,
     :symbol,
+    :asset_type,
     :signal_code,
     :accepted,
     :reason
@@ -351,6 +603,10 @@ SELECT
     started_at,
     completed_at,
     status,
+    strategy_version,
+    calibration_version,
+    data_window_start,
+    data_window_end,
     parameters,
     notes
 FROM bt_runs

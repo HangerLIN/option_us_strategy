@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 
 from apps.backtest.bt_runner import run_backtest
 from apps.backtest.dao import BacktestDAO
+from apps.backtest.lifecycle_log import resolve_lifecycle_log_path
 from apps.backtest.pipeline.premarket import PremarketTop5Builder
 from apps.backtest.universe import UniverseResolver
 from apps.signal_svc.top5_source import BacktestTop5Source
@@ -60,7 +61,15 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Optional debug override: restrict universe to these symbols",
     )
     parser.add_argument("--batch-id", default=None, help="Optional batch identifier override")
-    parser.add_argument("--mode", default="logic", help="Reserved for future strategy variants")
+    parser.add_argument(
+        "--mode",
+        default="v1",
+        help=(
+            "Strategy variant: v1 baseline, v2 delayed-entry, v3 ORB-entry, "
+            "v4 stale-fill-guard, v5 separated-exit-policy, v6 combined-v2, "
+            "v7 conservative-execution, v8 10:30 reversal"
+        ),
+    )
     parser.add_argument(
         "--signal-mode",
         default="recompute",
@@ -72,6 +81,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default="option",
         choices=["option", "equity"],
         help="Execution track: option (default) or equity-only (Track A)",
+    )
+    parser.add_argument(
+        "--option-pricing-mode",
+        default="full_feed",
+        choices=["full_feed", "event_time"],
+        help="Option pricing mode: full_feed (existing minute-feed backtest) or event_time",
     )
     parser.add_argument(
         "--metrics-mode",
@@ -87,6 +102,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--paper", type=int, choices=[0, 1], default=1, help="Reserved flag for paper/live modes"
+    )
+    parser.add_argument(
+        "--event-log-file",
+        default=None,
+        help=(
+            "JSONL lifecycle log path. Defaults to logs/backtest/<batch-id>.jsonl; "
+            "all symbols in the batch append to the same file."
+        ),
     )
     args_list = list(argv) if argv is not None else None
     return parser.parse_args(args_list)
@@ -116,6 +139,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     configure_logging(settings)
 
     batch_id = _derive_batch_id(args)
+    event_log_path = resolve_lifecycle_log_path(args.event_log_file, batch_id=batch_id)
     start_et, end_et = _date_range_bounds(args.start, args.end)
 
     LOGGER.info(
@@ -127,7 +151,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         risk_mode=args.risk_mode,
         universe=args.universe or "ref_market_cap:GLOBAL",
         track=args.track,
+        option_pricing_mode=args.option_pricing_mode,
         metrics_mode=args.metrics_mode,
+        event_log_file=str(event_log_path),
     )
 
     engine = create_engine(settings.database_url)
@@ -143,6 +169,17 @@ def main(argv: Iterable[str] | None = None) -> int:
             option_bar_table=settings.option_bar_table,
             option_chain_table=settings.option_chain_table,
         )
+        orphan_sweep = getattr(dao, "fail_stale_running_runs", None)
+        if callable(orphan_sweep):
+            orphan_timeout_hours = getattr(
+                settings, "backtest_orphan_timeout_hours", 24
+            )
+            sweep_cutoff = datetime.utcnow() - timedelta(hours=orphan_timeout_hours)
+            swept_runs = orphan_sweep(cutoff=sweep_cutoff)
+            if swept_runs:
+                session.commit()
+                LOGGER.info("backtest.orphan_sweep", swept_runs=swept_runs)
+
         trade_dates = dao.fetch_trade_dates_between(
             start_date=start_et.date(), end_date=end_et.date()
         )
@@ -220,18 +257,38 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     run_ids: List[int] = []
     for symbol in final_symbols:
-        run_id = run_backtest(
-            symbol=symbol,
-            start=args.start,
-            end=args.end,
-            signal_mode=args.signal_mode,
-            risk_mode=args.risk_mode,
-            track=args.track,
-            top5_source=top5_source,
-            batch_id=batch_id,
-            universe_code=universe_code,
-            trade_dates=trade_dates,
-        )
+        try:
+            run_id = run_backtest(
+                symbol=symbol,
+                start=args.start,
+                end=args.end,
+                signal_mode=args.signal_mode,
+                risk_mode=args.risk_mode,
+                track=args.track,
+                top5_source=top5_source,
+                batch_id=batch_id,
+                universe_code=universe_code,
+                trade_dates=trade_dates,
+                strategy_variant=args.mode,
+                option_pricing_mode=args.option_pricing_mode,
+                event_log_path=event_log_path,
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            if args.track == "option" and (
+                "No option contracts available" in message
+                or "bars1m_option data missing" in message
+                or "No option L1 data" in message
+            ):
+                LOGGER.warning(
+                    "backtest.symbol_skipped",
+                    symbol=symbol,
+                    batch=batch_id,
+                    track=args.track,
+                    reason=message,
+                )
+                continue
+            raise
         run_ids.append(run_id)
         LOGGER.info("backtest.completed", symbol=symbol, run_id=run_id, batch=batch_id)
 
