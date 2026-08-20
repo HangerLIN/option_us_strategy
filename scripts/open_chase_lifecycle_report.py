@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from libs.core import get_settings
+from libs.core import get_settings  # noqa: E402
 
 
 TARGET_SYMBOLS = {"MSFT", "AMD", "NOW", "SHOP"}
@@ -167,7 +167,6 @@ def build_report(batch_id: str, output_dir: Path) -> tuple[Path, Path]:
         buy_events = events_by_trace.get(str(buy.get("trace_id")), [])
         sell_events = events_by_trace.get(str(sell.get("trace_id")), []) if sell else []
         buy_fill = _first_fill(buy_events)
-        sell_fill = _first_fill(sell_events)
         buy_price = _decimal(buy.get("price")) or Decimal("0")
         sell_price = _decimal(sell.get("price")) if sell else None
         qty = abs(_decimal(buy.get("quantity")) or Decimal("0"))
@@ -182,7 +181,6 @@ def build_report(batch_id: str, output_dir: Path) -> tuple[Path, Path]:
             buy_events, "STALE_FILL_REJECTED", "INVALID_FILL_DETECTED"
         )
         rejected = _has_event(buy_events, "STALE_FILL_REJECTED", "INVALID_FILL_DETECTED")
-        guard_reject_reason = fill_event.get("stale_reject_reason")
         stale = _is_timeout_stale(fill_event)
         ttl_failure = _has_event(
             buy_events + sell_events,

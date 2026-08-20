@@ -56,13 +56,13 @@ def _validate_environment() -> None:
 
 def _ensure_tables(dao: BacktestDAO, option_tables: Sequence[str]) -> None:
     required = [
-            "bars1m_equity",
-            "indicators_eq_1m",
-            "bt_runs",
-            "bt_trades",
-            "bt_signals",
-            "bt_metrics_daily",
-            "bt_metrics_total",
+        "bars1m_equity",
+        "indicators_eq_1m",
+        "bt_runs",
+        "bt_trades",
+        "bt_signals",
+        "bt_metrics_daily",
+        "bt_metrics_total",
         "premarket_top5",
         "dim_trading_calendar",
     ]
@@ -71,7 +71,7 @@ def _ensure_tables(dao: BacktestDAO, option_tables: Sequence[str]) -> None:
 
 
 def _latest_trade_session(session: Session, option_chain_table: str) -> TradeSession:
-            sql = text(
+    sql = text(
         f"""
         SELECT trade_date
         FROM {option_chain_table}
@@ -82,9 +82,9 @@ def _latest_trade_session(session: Session, option_chain_table: str) -> TradeSes
           AND volume >= 100
           AND dte BETWEEN 2 AND 7
         ORDER BY trade_date DESC
-                LIMIT 1
-                """
-            )
+        LIMIT 1
+        """
+    )
     trade_date = session.execute(sql).scalar()
     if trade_date is None:
         raise RuntimeError("未找到满足条件的期权链交易日")
@@ -230,9 +230,9 @@ def _select_contracts_for_symbol(
 ) -> List[ContractSelection]:
     contracts: List[ContractSelection] = []
     for option_right in ("CALL", "PUT"):
-            candidates = dao.fetch_option_candidates(
+        candidates = dao.fetch_option_candidates(
             trade_date=session.trade_date,
-                underlying_symbol=symbol,
+            underlying_symbol=symbol,
             option_right=option_right,
             dte_min=2,
             dte_max=7,
@@ -504,7 +504,7 @@ def main() -> int:
         print(summary_line)
 
     LOGGER.info("smoke.completed", run_ids=run_ids)
-        return 0
+    return 0
 
 
 if __name__ == "__main__":

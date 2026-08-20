@@ -13,7 +13,7 @@ import csv
 import math
 import sys
 from dataclasses import dataclass, replace
-from datetime import date, datetime, time, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from statistics import median
 from typing import Iterable, Mapping, Sequence

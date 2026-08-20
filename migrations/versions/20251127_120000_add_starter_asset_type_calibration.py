@@ -59,6 +59,44 @@ def upgrade() -> None:
     )
     op.execute(
         """
+        DO $$
+        BEGIN
+            IF to_regclass('public.positions') IS NOT NULL THEN
+                ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_pkey;
+                ALTER TABLE positions
+                    ADD CONSTRAINT positions_pkey
+                    PRIMARY KEY (strategy_code, asset_type, symbol);
+            END IF;
+
+            IF to_regclass('public.pnl_intraday') IS NOT NULL THEN
+                ALTER TABLE pnl_intraday DROP CONSTRAINT IF EXISTS pnl_intraday_pkey;
+                ALTER TABLE pnl_intraday
+                    ADD CONSTRAINT pnl_intraday_pkey
+                    PRIMARY KEY (ts, strategy_code, asset_type, symbol);
+            END IF;
+
+            IF to_regclass('public.pnl_daily') IS NOT NULL THEN
+                ALTER TABLE pnl_daily DROP CONSTRAINT IF EXISTS pnl_daily_pkey;
+                ALTER TABLE pnl_daily
+                    ADD CONSTRAINT pnl_daily_pkey
+                    PRIMARY KEY (trade_date, strategy_code, asset_type, symbol);
+            END IF;
+        END $$;
+        """
+    )
+    op.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_strategy_positions_instrument
+            ON strategy_positions (
+                strategy_code,
+                symbol,
+                asset_type,
+                COALESCE(option_right::text, '')
+            );
+        """
+    )
+    op.execute(
+        """
         CREATE TABLE IF NOT EXISTS calibration_runs (
             calibration_id BIGSERIAL PRIMARY KEY,
             strategy_code TEXT NOT NULL,
@@ -140,6 +178,31 @@ def downgrade() -> None:
             DROP COLUMN IF EXISTS data_window_start,
             DROP COLUMN IF EXISTS calibration_version,
             DROP COLUMN IF EXISTS strategy_version;
+        """
+    )
+    op.execute("DROP INDEX IF EXISTS ux_strategy_positions_instrument;")
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF to_regclass('public.positions') IS NOT NULL THEN
+                ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_pkey;
+                ALTER TABLE positions
+                    ADD CONSTRAINT positions_pkey PRIMARY KEY (strategy_code, symbol);
+            END IF;
+
+            IF to_regclass('public.pnl_intraday') IS NOT NULL THEN
+                ALTER TABLE pnl_intraday DROP CONSTRAINT IF EXISTS pnl_intraday_pkey;
+                ALTER TABLE pnl_intraday
+                    ADD CONSTRAINT pnl_intraday_pkey PRIMARY KEY (strategy_code, symbol, ts);
+            END IF;
+
+            IF to_regclass('public.pnl_daily') IS NOT NULL THEN
+                ALTER TABLE pnl_daily DROP CONSTRAINT IF EXISTS pnl_daily_pkey;
+                ALTER TABLE pnl_daily
+                    ADD CONSTRAINT pnl_daily_pkey PRIMARY KEY (trade_date, strategy_code, symbol);
+            END IF;
+        END $$;
         """
     )
     for table_name in (

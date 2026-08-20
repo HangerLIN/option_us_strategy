@@ -13,7 +13,7 @@ import csv
 import math
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from statistics import median
 from typing import Iterable, Mapping, Sequence
@@ -848,7 +848,7 @@ def _write_report(
         "",
         "## Parameters",
         "",
-        f"- entry_window: `10:25-10:45 ET`",
+        "- entry_window: `10:25-10:45 ET`",
         f"- deadline: `{args.deadline} ET`",
         f"- target_pct: `{args.target_pct:.2f}%`",
         f"- protect_trigger_pct: `{args.protect_trigger_pct:.2f}%`",

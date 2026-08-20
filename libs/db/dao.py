@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, Iterable, List, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .models import (
@@ -13,10 +12,6 @@ from .models import (
     BacktestMetricTotal,
     BacktestRun,
     BacktestTop5,
-    CalibrationArtifact,
-    CalibrationMetric,
-    CalibrationParam,
-    CalibrationRun,
     ComplianceWhitelistLargecap,
     Fill,
     Order,
@@ -30,8 +25,9 @@ from .models import (
     StrategyPosition,
     BacktestSignal,
 )
-from libs.core.constants import EASTERN
-from libs.db.dim_trading_calendar import get_trading_session
+
+
+_OPTION_MULTIPLIER = Decimal("100")
 
 
 class StrategyPositionDAO:
@@ -171,7 +167,8 @@ class StrategyPositionDAO:
         else:
             closing_qty = min(abs(qty_old), abs(signed_qty_dec))
             direction = Decimal("1") if qty_old > 0 else Decimal("-1")
-            realized = closing_qty * (price - avg_old) * direction
+            multiplier = _OPTION_MULTIPLIER if asset_type_value == "OPTION" else Decimal("1")
+            realized = closing_qty * (price - avg_old) * direction * multiplier
             qty_new = qty_old + signed_qty_dec
             if qty_new == 0:
                 avg_new = Decimal("0")
@@ -566,20 +563,25 @@ class PnLDAO:
         fees: Decimal,
         filled_at: datetime,
     ) -> tuple[Decimal, Position]:
-        quantity = Decimal(quantity)
-        price = Decimal(price)
-        fees = Decimal(fees)
+        asset_type_value = StrategyPositionDAO._asset_type_value(asset_type)
+        quantity = Decimal(str(quantity))
+        price = Decimal(str(price))
+        fees = Decimal(str(fees))
         signed_qty = quantity if side.upper() == "BUY" else -quantity
 
         position = self._session.get(
             Position,
-            {"strategy_code": strategy_code, "asset_type": asset_type, "symbol": symbol},
+            {
+                "strategy_code": strategy_code,
+                "asset_type": asset_type_value,
+                "symbol": symbol,
+            },
         )
         if position is None:
             position = Position(
                 strategy_code=strategy_code,
                 symbol=symbol,
-                asset_type=asset_type,
+                asset_type=asset_type_value,
                 quantity=Decimal("0"),
                 avg_price=Decimal("0"),
                 unrealized_pnl=Decimal("0"),
@@ -602,7 +604,8 @@ class PnLDAO:
         else:
             closing_qty = min(abs(existing_qty), abs(signed_qty))
             direction = Decimal("1") if existing_qty > 0 else Decimal("-1")
-            realized = closing_qty * (price - avg_price) * direction
+            multiplier = _OPTION_MULTIPLIER if asset_type_value == "OPTION" else Decimal("1")
+            realized = closing_qty * (price - avg_price) * direction * multiplier
             if new_qty == 0:
                 position.avg_price = Decimal("0")
             elif existing_qty > 0 and new_qty < 0:
@@ -620,8 +623,8 @@ class PnLDAO:
             ts=filled_at,
             strategy_code=strategy_code,
             symbol=symbol,
-            asset_type=asset_type,
-            realized=net_realized,
+            asset_type=asset_type_value,
+            realized=realized,
             unrealized=Decimal("0"),
             fees=fees,
         )
@@ -629,8 +632,8 @@ class PnLDAO:
             ts=filled_at,
             strategy_code=strategy_code,
             symbol=symbol,
-            asset_type=asset_type,
-            realized=net_realized,
+            asset_type=asset_type_value,
+            realized=realized,
             unrealized=Decimal("0"),
             fees=fees,
         )

@@ -485,7 +485,12 @@ class SignalEngine:
                     signal.signal_code in BUY_SIGNALS
                     and not item.force
                 ):
-                    df = self._load_history(session, signal.symbol, ts_end, self._history_window)
+                    df = self._load_history(
+                        session,
+                        signal.symbol,
+                        ts_end,
+                        limit=self._history_window,
+                    )
                     allowed, _ = self._can_open_position(signal.symbol, df, session, ts_end)
                 else:
                     allowed = True
@@ -2640,12 +2645,12 @@ class SignalEngine:
     ) -> Optional[SignalEnvelope]:
         """
         S2: 两根回踩上轨 - 严格三根形态判断
-        
+
         核心逻辑：先在上轨之上，然后连续两根回到上轨内
         - t-2: close > boll_up  (先在上轨之上)
         - t-1: close < boll_up  (第一根回到上轨内)
         - t:   close < boll_up  (第二根仍在上轨内)
-        
+
         修复说明：
         之前只检查"连续两根 < 上轨"，导致价格一直在上轨下方时也会触发。
         现在要求"从上轨上方回落"，才算真正的"回踩"。

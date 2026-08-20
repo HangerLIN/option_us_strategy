@@ -13,7 +13,15 @@ from libs.calibration import (
     WalkForwardSplit,
     persist_calibration_result,
 )
-from libs.db import Base, CalibrationMetric, CalibrationParam, CalibrationRun, StrategyPositionDAO
+from libs.db import (
+    Base,
+    CalibrationMetric,
+    CalibrationParam,
+    CalibrationRun,
+    PnLDAO,
+    StrategyPositionDAO,
+)
+from libs.db.models import PnLIntraday
 from libs.portfolio import AllocationBudget, Candidate, EqualWeightPortfolioConstructor
 from libs.schemas.assets import AssetType, InstrumentRef
 from libs.schemas.exec import ExecutionMode, ExecutionRequest, OrderSide
@@ -142,6 +150,73 @@ def test_strategy_position_dao_supports_equity_positions(session) -> None:
     assert position.option_right is None
     assert position.open_quantity == 10
     assert dao.get_position("starter-equity", "SPY", None, asset_type="ETF") is not None
+
+
+def test_strategy_position_dao_applies_option_contract_multiplier(session) -> None:
+    dao = StrategyPositionDAO(session)
+    filled_at = datetime(2026, 5, 22, 13, 40, tzinfo=timezone.utc)
+    common = {
+        "strategy_code": "starter-option",
+        "symbol": "AAPL",
+        "asset_type": AssetType.OPTION.value,
+        "option_right": "CALL",
+        "fees": Decimal("1"),
+        "filled_at": filled_at,
+    }
+    dao.apply_fill(side="BUY", quantity=Decimal("2"), price=Decimal("3"), **common)
+    realized, _ = dao.apply_fill(
+        side="SELL",
+        quantity=Decimal("2"),
+        price=Decimal("4"),
+        **{**common, "filled_at": filled_at.replace(minute=41)},
+    )
+
+    assert realized == Decimal("200")
+
+
+def test_pnl_dao_separates_assets_and_stores_gross_realized_pnl(session) -> None:
+    dao = PnLDAO(session)
+    entry_time = datetime(2026, 5, 22, 13, 40, tzinfo=timezone.utc)
+    exit_time = entry_time.replace(minute=41)
+
+    for asset_type, price in (("EQUITY", Decimal("100")), ("OPTION", Decimal("2"))):
+        dao.apply_fill(
+            strategy_code="multi-asset",
+            symbol="AAPL",
+            asset_type=asset_type,
+            side="BUY",
+            quantity=Decimal("1"),
+            price=price,
+            fees=Decimal("0.25"),
+            filled_at=entry_time,
+        )
+
+    net_realized, _ = dao.apply_fill(
+        strategy_code="multi-asset",
+        symbol="AAPL",
+        asset_type="option",
+        side="SELL",
+        quantity=Decimal("1"),
+        price=Decimal("3"),
+        fees=Decimal("0.50"),
+        filled_at=exit_time,
+    )
+    session.flush()
+
+    assert net_realized == Decimal("99.50")
+    assert {position.asset_type for position in dao.list_positions()} == {"EQUITY", "OPTION"}
+    exit_pnl = session.get(
+        PnLIntraday,
+        {
+            "ts": exit_time,
+            "strategy_code": "multi-asset",
+            "asset_type": "OPTION",
+            "symbol": "AAPL",
+        },
+    )
+    assert exit_pnl is not None
+    assert exit_pnl.realized == Decimal("100")
+    assert exit_pnl.fees == Decimal("0.50")
 
 
 def test_exec_local_precheck_skips_option_rules_for_equity() -> None:

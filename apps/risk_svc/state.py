@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 from uuid import uuid4
 
 from sqlalchemy import select, text

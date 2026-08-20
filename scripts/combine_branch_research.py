@@ -315,7 +315,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         skipped_rows.append({"combined_version": combo_name, "skipped_count": len(skipped)})
 
     combined = pd.concat(combined_frames, ignore_index=True)
-    trade_fields = list(combined.columns)
     combined.to_csv(output_dir / "combined_trade_level.csv", index=False)
 
     summary_rows = _summary(combined, ["combined_version"])

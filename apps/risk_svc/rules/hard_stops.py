@@ -8,7 +8,6 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from uuid import uuid4
 
 import pandas as pd
-import statistics
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -291,7 +290,7 @@ class HardStopRules:
         vix_value = self._current_vix_value(session)
 
         for symbol_upper, symbol_positions in call_positions.items():
-            outcome, detail = self._assess_overnight_symbol(
+            outcome, detail = await self._assess_overnight_symbol(
                 session=session,
                 ts_end=ts_end,
                 trade_date=trade_date,
@@ -357,7 +356,7 @@ class HardStopRules:
         except (InvalidOperation, TypeError):
             return None
 
-    def _assess_overnight_symbol(
+    async def _assess_overnight_symbol(
         self,
         session: Session,
         ts_end: datetime,
@@ -411,7 +410,7 @@ class HardStopRules:
             and vix_value is not None
             and vix_value >= vix_gate_threshold
         ):
-            self._log_overnight_event(
+            await self._log_overnight_event(
                 session,
                 symbol,
                 OvernightDecision.RECORD_VIX,

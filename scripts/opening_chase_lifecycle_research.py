@@ -25,9 +25,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from libs.core import EASTERN
-from libs.core.config import get_settings
-from scripts.opening_momentum_research import (
+from libs.core import EASTERN  # noqa: E402
+from libs.core.config import get_settings  # noqa: E402
+from scripts.opening_momentum_research import (  # noqa: E402
     RunInfo,
     _bar_shadow_ratio,
     _daily_groups,
@@ -42,7 +42,6 @@ from scripts.opening_momentum_research import (
     _prev_rth_close,
     _safe_float,
     _safe_ratio,
-    _utc_timestamp,
 )
 
 

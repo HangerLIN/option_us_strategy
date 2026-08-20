@@ -284,7 +284,13 @@ def test_push_signals_passes_context_to_can_open_position() -> None:
 
     engine._session_factory = lambda: session
     engine._history_window = 180
-    engine._load_history = lambda *args: df
+    history_calls = []
+
+    def load_history(*args, **kwargs):
+        history_calls.append((args, kwargs))
+        return df
+
+    engine._load_history = load_history
 
     def can_open(symbol, passed_df=None, passed_session=None, passed_ts=None):
         calls.append((symbol, passed_df, passed_session, passed_ts))
@@ -309,3 +315,4 @@ def test_push_signals_passes_context_to_can_open_position() -> None:
     assert calls[0][1] is df
     assert calls[0][2] is session
     assert calls[0][3] == ts_end
+    assert history_calls[0][1] == {"limit": 180}

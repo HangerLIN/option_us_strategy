@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import time as time_module
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timezone
 from typing import Iterable, Sequence
 
 from sqlalchemy import text
